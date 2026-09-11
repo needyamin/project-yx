@@ -1,0 +1,14 @@
+[package]
+name = "yx-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFmpeg probe/decode/encode helpers for Project YX"
+
+[dependencies]
+yx-detect = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

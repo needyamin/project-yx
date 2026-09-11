@@ -1,0 +1,10 @@
+{
+  "name": "project-yx-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "npm --prefix apps/desktop run tauri dev",
+    "tauri": "npm --prefix apps/desktop run tauri",
+    "build": "npm --prefix apps/desktop run tauri build"
+  }
+}

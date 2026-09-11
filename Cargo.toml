@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yx-detect",
+    "crates/yx-timeline",
+    "crates/yx-media",
+    "crates/yx-compositor",
+    "crates/yx-proxy",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Project YX Contributors"]
+repository = "https://github.com/example/project-yx"
+
+[workspace.dependencies]
+yx-detect = { path = "crates/yx-detect" }
+yx-timeline = { path = "crates/yx-timeline" }
+yx-media = { path = "crates/yx-media" }
+yx-compositor = { path = "crates/yx-compositor" }
+yx-proxy = { path = "crates/yx-proxy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+tracing = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

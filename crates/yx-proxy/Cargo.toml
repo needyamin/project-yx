@@ -1,0 +1,16 @@
+[package]
+name = "yx-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background proxy transcode jobs for smooth editing on weak CPUs"
+
+[dependencies]
+yx-detect = { workspace = true }
+yx-media = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }

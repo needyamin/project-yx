@@ -1,0 +1,16 @@
+[package]
+name = "yx-timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure timeline model: tracks, clips, cuts, undo (no I/O)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

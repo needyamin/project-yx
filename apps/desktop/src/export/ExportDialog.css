@@ -1,0 +1,221 @@
+.export-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background: rgba(4, 6, 10, 0.72);
+  backdrop-filter: blur(4px);
+}
+
+.export-modal {
+  width: min(720px, 100%);
+  max-height: min(90vh, 860px);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: #12151c;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.export-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.15rem 0.85rem;
+  border-bottom: 1px solid var(--line);
+  background: #161a24;
+}
+
+.export-modal-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.export-modal-head p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.export-close {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.export-close:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text);
+}
+
+.export-modal-body {
+  overflow: auto;
+  padding: 1rem 1.15rem;
+  display: grid;
+  gap: 1.15rem;
+}
+
+.export-modal-body h3 {
+  margin: 0 0 0.55rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.export-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.export-preset {
+  display: grid;
+  gap: 0.15rem;
+  text-align: left;
+  padding: 0.55rem 0.65rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #0d1016;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.export-preset strong {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.export-preset span {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.export-preset:hover:not(:disabled) {
+  border-color: rgba(46, 230, 168, 0.35);
+}
+
+.export-preset.active {
+  border-color: rgba(46, 230, 168, 0.65);
+  background: rgba(46, 230, 168, 0.1);
+}
+
+.export-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem 0.85rem;
+}
+
+.export-grid label {
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.export-grid select,
+.export-grid input[type="range"] {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #0b0d12;
+  color: var(--text);
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.export-grid input[type="range"] {
+  padding: 0.35rem 0;
+  accent-color: #2ee6a8;
+}
+
+.export-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.15rem;
+  border-top: 1px solid var(--line);
+  background: #101218;
+}
+
+.export-progress {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.export-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.export-progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #0b0d12;
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.export-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2ee6a8, #3d6cff);
+  transition: width 0.15s ease-out;
+}
+
+.export-progress-hint {
+  margin: 0;
+  font-size: 0.65rem;
+  color: var(--muted);
+}
+
+.export-summary {
+  margin: 0;
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  color: var(--muted);
+  max-width: 55%;
+}
+
+.export-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+@media (max-width: 640px) {
+  .export-preset-grid,
+  .export-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .export-modal-foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .export-summary {
+    max-width: none;
+  }
+
+  .export-actions {
+    justify-content: flex-end;
+  }
+}
