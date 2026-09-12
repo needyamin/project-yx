@@ -7,15 +7,19 @@ import type { PreviewAspect } from "./ProjectMonitor";
 type Props = {
   media: LibraryItem | null;
   aspect: PreviewAspect;
+  onClose?: () => void;
 };
 
-export function ClipMonitor({ media, aspect }: Props) {
+export function ClipMonitor({ media, aspect, onClose }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [volume, setVolume] = useState(1);
+  const [muted, setMuted] = useState(false);
+  const [fullView, setFullView] = useState(false);
 
   const mode =
     media?.has_video ? ("video" as const) : media?.has_audio ? ("audio" as const) : ("empty" as const);
@@ -90,6 +94,30 @@ export function ClipMonitor({ media, aspect }: Props) {
     };
   }, [mode, src]);
 
+  useEffect(() => {
+    const gain = muted ? 0 : volume;
+    if (videoRef.current) {
+      videoRef.current.volume = gain;
+      videoRef.current.muted = muted;
+    }
+    if (audioRef.current) {
+      audioRef.current.volume = gain;
+      audioRef.current.muted = muted;
+    }
+  }, [volume, muted, mode, src]);
+
+  useEffect(() => {
+    if (!fullView) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setFullView(false);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullView]);
+
   function togglePlay() {
     const el = mode === "video" ? videoRef.current : mode === "audio" ? audioRef.current : null;
     if (!el || !src) return;
@@ -105,10 +133,37 @@ export function ClipMonitor({ media, aspect }: Props) {
   }
 
   return (
-    <div className={`monitor clip-monitor aspect-${aspect} ${dragOver ? "bin-drag-over" : ""}`}>
+    <div
+      className={`monitor clip-monitor aspect-${aspect} ${dragOver ? "bin-drag-over" : ""} ${fullView ? "full-view" : ""}`}
+    >
       <div className="monitor-label">
         <span>Clip Monitor</span>
         {media && <span className="monitor-sub">{media.name}</span>}
+        <div className="monitor-fs">
+          <button
+            type="button"
+            className={`monitor-fs-btn ${fullView ? "active" : ""}`}
+            title={fullView ? "Exit full view" : "Full view"}
+            aria-label={fullView ? "Exit full view" : "Full view"}
+            onClick={() => setFullView((v) => !v)}
+          >
+            <span className={`fs-icon ${fullView ? "exit" : ""}`} aria-hidden />
+          </button>
+          {onClose && (
+            <button
+              type="button"
+              className="monitor-close-btn"
+              title="Hide Clip Monitor"
+              aria-label="Hide Clip Monitor"
+              onClick={() => {
+                setFullView(false);
+                onClose();
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
       </div>
       <div className="monitor-stage">
         <div className={`monitor-frame ${aspect === "tiktok" ? "phone" : "wide"}`}>
@@ -151,6 +206,31 @@ export function ClipMonitor({ media, aspect }: Props) {
           onChange={(e) => seekRatio(Number(e.target.value) / 1000)}
         />
         <span className="timecode muted-tc">{formatTime(media?.duration ?? 0)}</span>
+        <button
+          type="button"
+          className={`vol-btn sm ${muted || volume === 0 ? "is-muted" : ""}`}
+          title={muted || volume === 0 ? "Unmute" : "Mute"}
+          aria-label={muted || volume === 0 ? "Unmute" : "Mute"}
+          disabled={!src}
+          onClick={() => setMuted((m) => !m)}
+        >
+          {muted || volume === 0 ? "×" : "♪"}
+        </button>
+        <input
+          className="vol-scrub"
+          type="range"
+          min={0}
+          max={100}
+          value={Math.round((muted ? 0 : volume) * 100)}
+          disabled={!src}
+          title="Volume"
+          aria-label="Clip monitor volume"
+          onChange={(e) => {
+            const next = Number(e.target.value) / 100;
+            setVolume(next);
+            if (next > 0) setMuted(false);
+          }}
+        />
       </div>
     </div>
   );

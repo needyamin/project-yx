@@ -322,7 +322,7 @@ export function TimelinePanel({
 
   function trackHeight(track: (typeof timeline.tracks)[0]) {
     if (track.hidden) return 22;
-    return track.kind === "video" ? 56 : 40;
+    return track.kind === "video" ? 64 : 48;
   }
 
   return (

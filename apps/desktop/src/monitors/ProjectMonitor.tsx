@@ -1,4 +1,4 @@
-import { useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { formatTime } from "../timeline/types";
 import "./ProjectMonitor.css";
 
@@ -20,6 +20,10 @@ type Props = {
   audioRef: RefObject<HTMLAudioElement | null>;
   onTogglePlay: () => void;
   onSeekRatio: (ratio: number) => void;
+  volume: number;
+  muted: boolean;
+  onVolume: (v: number) => void;
+  onMuted: (m: boolean) => void;
   /** Live CSS preview matching export effects. */
   videoStyle?: {
     filter: string;
@@ -33,6 +37,8 @@ type Props = {
   onCropCommit?: (crop: CropRect) => void;
   chromakeyActive?: boolean;
   onEyedropColor?: (hex: string) => void;
+  /** When Clip Monitor is hidden, show a control to restore it. */
+  onShowClipMonitor?: () => void;
 };
 
 export function ProjectMonitor({
@@ -48,6 +54,10 @@ export function ProjectMonitor({
   audioRef,
   onTogglePlay,
   onSeekRatio,
+  volume,
+  muted,
+  onVolume,
+  onMuted,
   videoStyle,
   cropTool = false,
   onCropTool,
@@ -55,6 +65,7 @@ export function ProjectMonitor({
   onCropCommit,
   chromakeyActive = false,
   onEyedropColor,
+  onShowClipMonitor,
 }: Props) {
   const safeDur = Math.max(0.001, duration);
   const tiktok = aspect === "tiktok";
@@ -65,6 +76,19 @@ export function ProjectMonitor({
     x1: number;
     y1: number;
   } | null>(null);
+  const [fullView, setFullView] = useState(false);
+
+  useEffect(() => {
+    if (!fullView) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setFullView(false);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullView]);
 
   function clientToNorm(clientX: number, clientY: number) {
     const el = frameRef.current;
@@ -133,10 +157,20 @@ export function ProjectMonitor({
     : cropDraft;
 
   return (
-    <div className={`monitor project-monitor aspect-${aspect}`}>
+    <div className={`monitor project-monitor aspect-${aspect} ${fullView ? "full-view" : ""}`}>
       <div className="monitor-label">
         <span>Project Monitor</span>
         <div className="monitor-tools">
+          {onShowClipMonitor && (
+            <button
+              type="button"
+              title="Show Clip Monitor"
+              aria-label="Show Clip Monitor"
+              onClick={onShowClipMonitor}
+            >
+              Clip
+            </button>
+          )}
           <button
             type="button"
             className={cropTool ? "active" : ""}
@@ -163,6 +197,17 @@ export function ProjectMonitor({
               9:16
             </button>
           </div>
+        </div>
+        <div className="monitor-fs">
+          <button
+            type="button"
+            className={`monitor-fs-btn ${fullView ? "active" : ""}`}
+            title={fullView ? "Exit full view" : "Full view"}
+            aria-label={fullView ? "Exit full view" : "Full view"}
+            onClick={() => setFullView((v) => !v)}
+          >
+            <span className={`fs-icon ${fullView ? "exit" : ""}`} aria-hidden />
+          </button>
         </div>
       </div>
       <div className="monitor-stage">
@@ -234,6 +279,29 @@ export function ProjectMonitor({
           onChange={(e) => onSeekRatio(Number(e.target.value) / 1000)}
         />
         <span className="timecode muted-tc">{formatTime(duration)}</span>
+        <button
+          type="button"
+          className={`vol-btn sm ${muted || volume === 0 ? "is-muted" : ""}`}
+          title={muted || volume === 0 ? "Unmute" : "Mute"}
+          aria-label={muted || volume === 0 ? "Unmute" : "Mute"}
+          onClick={() => onMuted(!muted)}
+        >
+          {muted || volume === 0 ? "×" : "♪"}
+        </button>
+        <input
+          className="vol-scrub"
+          type="range"
+          min={0}
+          max={100}
+          value={Math.round((muted ? 0 : volume) * 100)}
+          title="Volume"
+          aria-label="Project monitor volume"
+          onChange={(e) => {
+            const next = Number(e.target.value) / 100;
+            onVolume(next);
+            if (next > 0) onMuted(false);
+          }}
+        />
       </div>
     </div>
   );

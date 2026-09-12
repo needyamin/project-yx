@@ -93,6 +93,9 @@ function App() {
   const [exportProgress, setExportProgress] = useState(0);
   const [cropTool, setCropTool] = useState(false);
   const [snapOn, setSnapOn] = useState(true);
+  const [monitorVolume, setMonitorVolume] = useState(1);
+  const [monitorMuted, setMonitorMuted] = useState(false);
+  const [clipMonitorOpen, setClipMonitorOpen] = useState(true);
 
   const refreshBoot = useCallback(async () => {
     const info = await invoke<BootInfo>("get_boot_info");
@@ -912,10 +915,13 @@ function App() {
     }
     if (audio) {
       const fade = audioClip ? clipFadeGain(audioClip, t) : 1;
-      audio.volume = Math.min(
-        1,
-        previewVolumeGain((audioClip?.filters ?? []) as FilterInstance[], fade),
-      );
+      audio.volume = monitorMuted
+        ? 0
+        : Math.min(
+            1,
+            previewVolumeGain((audioClip?.filters ?? []) as FilterInstance[], fade) *
+              monitorVolume,
+          );
     }
   }
 
@@ -927,7 +933,7 @@ function App() {
       audioUnderPlayhead?.clip ?? null,
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playhead, videoUnderPlayhead, audioUnderPlayhead]);
+  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, monitorVolume, monitorMuted]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -1033,6 +1039,7 @@ function App() {
                 void addMediaToTimeline(item, start);
               }}
               onDropToClipMonitor={(item) => {
+                setClipMonitorOpen(true);
                 setSelectedMediaId(item.id);
                 setLibrary((prev) =>
                   prev.some((m) => m.id === item.id) ? prev : [item, ...prev],
@@ -1067,7 +1074,13 @@ function App() {
           </div>
         }
         clipMonitor={
-          <ClipMonitor media={selectedMedia} aspect={previewAspect} />
+          clipMonitorOpen ? (
+            <ClipMonitor
+              media={selectedMedia}
+              aspect={previewAspect}
+              onClose={() => setClipMonitorOpen(false)}
+            />
+          ) : null
         }
         projectMonitor={
           <ProjectMonitor
@@ -1083,6 +1096,10 @@ function App() {
             audioRef={audioRef}
             onTogglePlay={togglePlay}
             onSeekRatio={(ratio) => seekTimeline(ratio * projectDuration)}
+            volume={monitorVolume}
+            muted={monitorMuted}
+            onVolume={setMonitorVolume}
+            onMuted={setMonitorMuted}
             cropTool={cropTool}
             onCropTool={setCropTool}
             cropDraft={
@@ -1106,6 +1123,9 @@ function App() {
               const f = selectedClip?.clip.filters?.find((x) => x.kind === "chromakey");
               if (f) void updateFilterParams(f.id, { ...(f.params as object), color: hex });
             }}
+            onShowClipMonitor={
+              clipMonitorOpen ? undefined : () => setClipMonitorOpen(true)
+            }
           />
         }
         timeline={

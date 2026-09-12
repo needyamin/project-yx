@@ -23,6 +23,10 @@
   grid-template-columns: 1fr 1fr;
 }
 
+.monitors-row.solo {
+  grid-template-columns: 1fr;
+}
+
 .timeline-resize-handle {
   height: 5px;
   cursor: ns-resize;

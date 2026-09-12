@@ -4,14 +4,14 @@ import "./EditorShell.css";
 type Props = {
   topbar: ReactNode;
   bin: ReactNode;
-  clipMonitor: ReactNode;
+  clipMonitor: ReactNode | null;
   projectMonitor: ReactNode;
   timeline: ReactNode;
 };
 
 const TIMELINE_MIN = 240;
 const TIMELINE_MAX_VH = 0.62;
-const TIMELINE_DEFAULT_VH = 0.38;
+const TIMELINE_DEFAULT_VH = 0.44;
 
 export function EditorShell({
   topbar,
@@ -68,7 +68,7 @@ export function EditorShell({
       {topbar}
       <div className="editor-mid">
         {bin}
-        <section className="monitors-row dual">
+        <section className={`monitors-row ${clipMonitor ? "dual" : "solo"}`}>
           {clipMonitor}
           {projectMonitor}
         </section>

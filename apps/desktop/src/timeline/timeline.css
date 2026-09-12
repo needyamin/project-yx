@@ -199,7 +199,7 @@
     rgba(0, 0, 0, 0.55),
     rgba(0, 0, 0, 0)
   );
-  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+  clip-path: polygon(0 0, 100% 0, 100% 100%);
 }
 
 .tl-fade-handle {

@@ -497,7 +497,6 @@ button:disabled {
 .monitor-label {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 0.4rem;
   padding: 0.2rem 0.45rem;
   font-size: 0.68rem;
@@ -514,6 +513,102 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.monitor-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.monitor-tools > button {
+  font-size: 0.65rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.monitor-tools > button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.monitor-tools > button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.monitor-fs {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.monitor-fs-btn,
+.monitor-close-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.monitor-fs-btn:hover,
+.monitor-close-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.monitor-fs-btn.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.monitor-close-btn {
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+.fs-icon {
+  display: block;
+  width: 11px;
+  height: 11px;
+  background:
+    linear-gradient(currentColor, currentColor) left top / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) left top / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) right top / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) right top / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) left bottom / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) left bottom / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) right bottom / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) right bottom / 1.5px 4px no-repeat;
+}
+
+.fs-icon.exit {
+  background:
+    linear-gradient(currentColor, currentColor) left 3px top 0 / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) left 0 top 3px / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) right 3px top 0 / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) right 0 top 3px / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) left 3px bottom 0 / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) left 0 bottom 3px / 4px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) right 3px bottom 0 / 1.5px 4px no-repeat,
+    linear-gradient(currentColor, currentColor) right 0 bottom 3px / 4px 1.5px no-repeat;
 }
 
 .aspect-toggle {
@@ -588,6 +683,33 @@ button:disabled {
   aspect-ratio: 9 / 16;
   border-radius: 0;
   border: 1px solid var(--line);
+}
+
+.monitor.full-view {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: #0a0a0c;
+}
+
+.monitor.full-view .monitor-stage {
+  padding: 0.75rem;
+}
+
+.monitor.full-view .monitor-frame.wide {
+  width: auto;
+  height: auto;
+  max-width: min(96vw, calc(96vh * 16 / 9));
+  max-height: 96%;
+  aspect-ratio: 16 / 9;
+}
+
+.monitor.full-view .monitor-frame.phone {
+  width: auto;
+  height: auto;
+  max-height: min(92vh, calc(96vw * 16 / 9));
+  max-width: 96%;
+  aspect-ratio: 9 / 16;
 }
 
 .monitor.aspect-tiktok .monitor-video {
@@ -697,6 +819,35 @@ button:disabled {
 
 .scrub {
   flex: 1;
+  accent-color: var(--accent);
+  height: 3px;
+}
+
+.vol-btn.sm {
+  width: 26px;
+  height: 26px;
+  font-size: 0.7rem;
+  line-height: 1;
+  border-radius: var(--radius);
+  background: var(--panel-3);
+  border: 1px solid var(--line);
+  flex: 0 0 auto;
+  color: var(--text);
+  padding: 0;
+}
+
+.vol-btn.sm:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.vol-btn.sm.is-muted {
+  color: var(--muted);
+}
+
+.vol-scrub {
+  width: 52px;
+  flex: 0 0 auto;
   accent-color: var(--accent);
   height: 3px;
 }
