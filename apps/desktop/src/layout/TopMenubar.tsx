@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./TopMenubar.css";
 
@@ -11,15 +12,25 @@ type Props = {
   canExport: boolean;
   playing: boolean;
   snap: boolean;
+  hasSelection: boolean;
+  clipLinked: boolean;
+  clipMonitorOpen: boolean;
   onImport: () => void;
   onExport: () => void;
   onUndo: () => void;
   onRedo: () => void;
+  onDelete: () => void;
+  onRippleDelete: () => void;
+  onSplitPlayhead: () => void;
+  onToggleLink: () => void;
+  onLiftZone: () => void;
+  onExtractZone: () => void;
   onAspect: (a: "landscape" | "tiktok") => void;
   onZoomFit: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onToggleSnap: () => void;
+  onToggleClipMonitor: () => void;
   onTogglePlay: () => void;
   onCheckUpdates: () => void;
 };
@@ -33,25 +44,56 @@ export function TopMenubar({
   canExport,
   playing,
   snap,
+  hasSelection,
+  clipLinked,
+  clipMonitorOpen,
   onImport,
   onExport,
   onUndo,
   onRedo,
+  onDelete,
+  onRippleDelete,
+  onSplitPlayhead,
+  onToggleLink,
+  onLiftZone,
+  onExtractZone,
   onAspect,
   onZoomFit,
   onZoomIn,
   onZoomOut,
   onToggleSnap,
+  onToggleClipMonitor,
   onTogglePlay,
   onCheckUpdates,
 }: Props) {
   const [open, setOpen] = useState<MenuId>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [version, setVersion] = useState("…");
+  const [whiteGui, setWhiteGui] = useState(false);
+  const [fullScreen, setFullScreen] = useState(false);
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion("0.1.0"));
   }, []);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("theme-white", whiteGui);
+    return () => document.documentElement.classList.remove("theme-white");
+  }, [whiteGui]);
+
+  useEffect(() => {
+    if (!fullScreen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      void getCurrentWindow()
+        .setFullscreen(false)
+        .then(() => setFullScreen(false))
+        .catch(() => setFullScreen(false));
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullScreen]);
 
   useEffect(() => {
     if (!open && !aboutOpen) return;
@@ -75,6 +117,32 @@ export function TopMenubar({
     };
   }
 
+  async function toggleFullScreen() {
+    const next = !fullScreen;
+    try {
+      await getCurrentWindow().setFullscreen(next);
+      setFullScreen(next);
+    } catch {
+      setFullScreen(false);
+    }
+  }
+
+  async function hideToTray() {
+    try {
+      await getCurrentWindow().hide();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function quitApp() {
+    try {
+      await getCurrentWindow().close();
+    } catch {
+      /* ignore */
+    }
+  }
+
   return (
     <header className="topbar">
       <div className="menubar">
@@ -95,6 +163,13 @@ export function TopMenubar({
           <button type="button" role="menuitem" onClick={item(onCheckUpdates)}>
             Check for Updates…
           </button>
+          <hr className="menu-sep" />
+          <button type="button" role="menuitem" onClick={item(() => void hideToTray())}>
+            Hide to Tray
+          </button>
+          <button type="button" role="menuitem" onClick={item(() => void quitApp())}>
+            Quit
+          </button>
         </Menu>
 
         <Menu label="Edit" id="edit" open={open} onToggle={toggle}>
@@ -103,6 +178,36 @@ export function TopMenubar({
           </button>
           <button type="button" role="menuitem" onClick={item(onRedo)}>
             Redo
+          </button>
+          <hr className="menu-sep" />
+          <button type="button" role="menuitem" disabled={!hasSelection} onClick={item(onDelete)}>
+            Delete
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!hasSelection}
+            onClick={item(onRippleDelete)}
+          >
+            Ripple Delete
+          </button>
+          <button type="button" role="menuitem" onClick={item(onSplitPlayhead)}>
+            Split at Playhead
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!hasSelection}
+            onClick={item(onToggleLink)}
+          >
+            {clipLinked ? "Unlink A/V" : "Link A/V"}
+          </button>
+          <hr className="menu-sep" />
+          <button type="button" role="menuitem" onClick={item(onLiftZone)}>
+            Lift Zone
+          </button>
+          <button type="button" role="menuitem" onClick={item(onExtractZone)}>
+            Extract Zone
           </button>
         </Menu>
 
@@ -126,6 +231,24 @@ export function TopMenubar({
           <hr className="menu-sep" />
           <button type="button" role="menuitem" onClick={item(onToggleSnap)}>
             Snap {snap ? "Off" : "On"}
+          </button>
+          <button type="button" role="menuitem" onClick={item(onToggleClipMonitor)}>
+            {clipMonitorOpen ? "Hide Clip Monitor" : "Show Clip Monitor"}
+          </button>
+          <hr className="menu-sep" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={item(() => setWhiteGui((v) => !v))}
+          >
+            {whiteGui ? "Dark Interface" : "White Interface"}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={item(() => void toggleFullScreen())}
+          >
+            {fullScreen ? "Exit Full Screen" : "Full Screen"}
           </button>
         </Menu>
 

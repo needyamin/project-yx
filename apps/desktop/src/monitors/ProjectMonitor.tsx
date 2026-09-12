@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { formatTime } from "../timeline/types";
+import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import "./ProjectMonitor.css";
 
 export type PreviewMode = "video" | "audio" | "empty";
@@ -77,6 +78,7 @@ export function ProjectMonitor({
     y1: number;
   } | null>(null);
   const [fullView, setFullView] = useState(false);
+  const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!fullView) return;
@@ -156,8 +158,54 @@ export function ProjectMonitor({
       }
     : cropDraft;
 
+  const ctxItems: ContextMenuItem[] = [
+    {
+      type: "item",
+      label: playing ? "Pause" : "Play",
+      disabled: !previewSrc,
+      action: () => onTogglePlay(),
+    },
+    {
+      type: "item",
+      label: cropTool ? "Disable crop tool" : "Crop tool",
+      action: () => onCropTool?.(!cropTool),
+    },
+    { type: "sep" },
+    {
+      type: "item",
+      label: "Aspect 16:9",
+      action: () => onAspect("landscape"),
+    },
+    {
+      type: "item",
+      label: "Aspect 9:16",
+      action: () => onAspect("tiktok"),
+    },
+    { type: "sep" },
+    {
+      type: "item",
+      label: fullView ? "Exit full view" : "Full view",
+      action: () => setFullView((v) => !v),
+    },
+    ...(onShowClipMonitor
+      ? ([
+          {
+            type: "item" as const,
+            label: "Show Clip Monitor",
+            action: () => onShowClipMonitor(),
+          },
+        ] as ContextMenuItem[])
+      : []),
+  ];
+
   return (
-    <div className={`monitor project-monitor aspect-${aspect} ${fullView ? "full-view" : ""}`}>
+    <div
+      className={`monitor project-monitor aspect-${aspect} ${fullView ? "full-view" : ""}`}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setCtx({ x: e.clientX, y: e.clientY });
+      }}
+    >
       <div className="monitor-label">
         <span>Project Monitor</span>
         <div className="monitor-tools">
@@ -303,6 +351,14 @@ export function ProjectMonitor({
           }}
         />
       </div>
+      {ctx && (
+        <ContextMenuPopup
+          x={ctx.x}
+          y={ctx.y}
+          items={ctxItems}
+          onClose={() => setCtx(null)}
+        />
+      )}
     </div>
   );
 }

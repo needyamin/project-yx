@@ -1,20 +1,24 @@
-import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { effectMeta, effectShortLabel } from "../effects/effects";
 import { formatTime, type LibraryItem } from "../timeline/types";
+import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import {
   activateBinPointerDrag,
   endBinPointerDrag,
   hitBinDropTarget,
   startBinPointerDrag,
+  subscribeBinDrag,
   updateBinPointerDrag,
 } from "./binDrag";
 
-export type BinFilter = "media" | "audio" | "effects";
+export type BinFilter = "media" | "audio" | "effects" | "applied";
 
 export type EffectItem = {
   id: string;
   label: string;
   heavy?: boolean;
+  roles?: ("video" | "audio")[];
 };
 
 type Props = {
@@ -29,6 +33,11 @@ type Props = {
   onDropToTimeline: (item: LibraryItem, clientX: number) => void;
   /** Drop onto Clip Monitor for source preview. */
   onDropToClipMonitor: (item: LibraryItem) => void;
+  onRemoveFromBin: (item: LibraryItem) => void;
+  onAdvancedAudio?: (
+    item: LibraryItem,
+    tab?: "overview" | "waveform" | "effects",
+  ) => void;
   busy: boolean;
   dragOver?: boolean;
   effects?: EffectItem[];
@@ -40,6 +49,11 @@ type Props = {
 
 const DRAG_THRESHOLD_PX = 5;
 
+type BinCtx =
+  | { x: number; y: number; kind: "item"; item: LibraryItem }
+  | { x: number; y: number; kind: "empty" }
+  | { x: number; y: number; kind: "effect"; effectId: string; label: string };
+
 export function ProjectBin({
   library,
   selectedMediaId,
@@ -50,6 +64,8 @@ export function ProjectBin({
   onAddToTimeline,
   onDropToTimeline,
   onDropToClipMonitor,
+  onRemoveFromBin,
+  onAdvancedAudio,
   busy,
   dragOver = false,
   effects = [],
@@ -76,7 +92,19 @@ export function ProjectBin({
     x: number;
     y: number;
   } | null>(null);
+  const [ctx, setCtx] = useState<BinCtx | null>(null);
+  const [ghostOverTimeline, setGhostOverTimeline] = useState(false);
   const didDragRef = useRef(false);
+
+  useEffect(() => {
+    return subscribeBinDrag((session) => {
+      if (!session?.active) {
+        setGhostOverTimeline(false);
+        return;
+      }
+      setGhostOverTimeline(hitBinDropTarget(session.clientX, session.clientY) === "timeline");
+    });
+  }, []);
 
   function beginItemPointer(e: ReactPointerEvent, item: LibraryItem) {
     if (e.button !== 0 || busy) return;
@@ -139,16 +167,84 @@ export function ProjectBin({
     window.addEventListener("keydown", onKey);
   }
 
+  function revealInFolder(path: string) {
+    const normalized = path.replace(/\\/g, "/");
+    const slash = normalized.lastIndexOf("/");
+    const dir = slash >= 0 ? normalized.slice(0, slash) : normalized;
+    const url = dir.match(/^[A-Za-z]:/) ? `file:///${dir}` : `file://${dir}`;
+    void openUrl(url).catch(() => undefined);
+  }
+
+  function binMenuItems(): ContextMenuItem[] {
+    if (!ctx) return [];
+    if (ctx.kind === "empty") {
+      return [
+        {
+          type: "item",
+          label: "Import…",
+          disabled: busy,
+          action: () => onImport(),
+        },
+      ];
+    }
+    if (ctx.kind === "effect") {
+      return [
+        {
+          type: "item",
+          label: `Apply ${ctx.label}`,
+          disabled: !effectsEnabled,
+          action: () => onApplyEffect?.(ctx.effectId),
+        },
+      ];
+    }
+    const item = ctx.item;
+    const items: ContextMenuItem[] = [
+      {
+        type: "item",
+        label: "Add to timeline",
+        action: () => onAddToTimeline(item),
+      },
+      {
+        type: "item",
+        label: "Preview in Clip Monitor",
+        action: () => onDropToClipMonitor(item),
+      },
+      { type: "sep" },
+      {
+        type: "item",
+        label: "Reveal in folder",
+        action: () => revealInFolder(item.path),
+      },
+      {
+        type: "item",
+        label: "Remove from bin",
+        danger: true,
+        action: () => onRemoveFromBin(item),
+      },
+    ];
+    if (item.has_audio && !item.has_video) {
+      items.splice(
+        2,
+        0,
+        { type: "sep" },
+        {
+          type: "item",
+          label: "Advanced Audio…",
+          action: () => onAdvancedAudio?.(item, "overview"),
+        },
+        {
+          type: "item",
+          label: "Open Waveform Editor…",
+          action: () => onAdvancedAudio?.(item, "waveform"),
+        },
+      );
+    }
+    return items;
+  }
+
   return (
     <aside className={`project-bin ${dragOver ? "drag-over" : ""}`}>
-      <div className="bin-header">
-        <strong>Project Bin</strong>
-        <button className="bin-import" disabled={busy} onClick={onImport} title="Import media">
-          Import
-        </button>
-      </div>
-
-      <nav className="bin-tabs three">
+      <nav className="bin-tabs four">
         <button
           type="button"
           className={filter === "media" ? "active" : ""}
@@ -170,10 +266,24 @@ export function ProjectBin({
         >
           Effects
         </button>
+        <button
+          type="button"
+          className={filter === "applied" ? "active" : ""}
+          onClick={() => onFilter("applied")}
+        >
+          Applied
+        </button>
       </nav>
 
-      {filter === "effects" ? (
-        <div className="bin-list effects-list">
+      {filter === "applied" ? null : filter === "effects" ? (
+        <div
+          className="bin-list effects-list"
+          onContextMenu={(e) => {
+            if ((e.target as HTMLElement).closest(".effect-card")) return;
+            e.preventDefault();
+            setCtx({ x: e.clientX, y: e.clientY, kind: "empty" });
+          }}
+        >
           {!effectsEnabled && (
             <p className="empty-hint">Select a timeline clip to apply effects.</p>
           )}
@@ -187,6 +297,17 @@ export function ProjectBin({
                   className={`effect-card ${f.heavy && !effectsAllowHeavy ? "heavy" : ""}`}
                   disabled={!effectsEnabled}
                   onClick={() => onApplyEffect?.(f.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setCtx({
+                      x: e.clientX,
+                      y: e.clientY,
+                      kind: "effect",
+                      effectId: f.id,
+                      label: f.label,
+                    });
+                  }}
                   title={f.label}
                   style={{ ["--effect-hue" as string]: meta.hue }}
                 >
@@ -204,7 +325,14 @@ export function ProjectBin({
         </div>
       ) : (
         <>
-          <div className="bin-list">
+          <div
+            className="bin-list"
+            onContextMenu={(e) => {
+              if ((e.target as HTMLElement).closest(".bin-item")) return;
+              e.preventDefault();
+              setCtx({ x: e.clientX, y: e.clientY, kind: "empty" });
+            }}
+          >
             {items.length === 0 && (
               <div className="bin-drop-hint">
                 <p>Drop media here</p>
@@ -228,6 +356,12 @@ export function ProjectBin({
                 }}
                 onDoubleClick={() => onAddToTimeline(item)}
                 onPointerDown={(e) => beginItemPointer(e, item)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onSelect(item.id);
+                  setCtx({ x: e.clientX, y: e.clientY, kind: "item", item });
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
@@ -289,7 +423,7 @@ export function ProjectBin({
         </>
       )}
 
-      {ghost && (
+      {ghost && !ghostOverTimeline && (
         <div
           className="bin-drag-ghost"
           style={{ left: ghost.x + 12, top: ghost.y + 12 }}
@@ -306,6 +440,15 @@ export function ProjectBin({
           </div>
           <strong>{ghost.item.name}</strong>
         </div>
+      )}
+
+      {ctx && (
+        <ContextMenuPopup
+          x={ctx.x}
+          y={ctx.y}
+          items={binMenuItems()}
+          onClose={() => setCtx(null)}
+        />
       )}
     </aside>
   );

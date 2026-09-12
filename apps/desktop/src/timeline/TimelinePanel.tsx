@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { subscribeBinDrag } from "../bin/binDrag";
 import { ClipBlock } from "./ClipBlock";
@@ -13,15 +13,23 @@ import {
   formatTime,
   formatRulerTime,
   findLinkPartner,
+  clipTimelineDuration,
   timelineDuration,
   type Clip,
   type EditMode,
+  type LibraryItem,
   type PerformanceTier,
   type Timeline,
   type TimelineTool,
 } from "./types";
 import { useTimelineView } from "./useTimelineView";
 import "./timeline.css";
+
+const HEADER_MIN = 72;
+const HEADER_DEFAULT = 88;
+/** Max width = default + 10% of default. */
+const HEADER_MAX = Math.round(HEADER_DEFAULT * 1.1);
+const HEADER_HANDLE_PX = 5;
 
 type Props = {
   timeline: Timeline;
@@ -55,6 +63,8 @@ type Props = {
       snap: boolean;
     } | null,
   ) => void;
+  onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
+  onAdvancedVideo?: (clipId: string) => void;
 };
 
 export function TimelinePanel({
@@ -79,11 +89,21 @@ export function TimelinePanel({
   onRedo,
   onRegisterDropResolver,
   onRegisterViewControls,
+  onAdvancedAudio,
+  onAdvancedVideo,
 }: Props) {
+  const panelRef = useRef<HTMLElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const suppressClickRef = useRef(false);
+  const headerDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   const [binDragOver, setBinDragOver] = useState(false);
+  const [binDropPreview, setBinDropPreview] = useState<{
+    item: LibraryItem;
+    start: number;
+    trackId: string;
+  } | null>(null);
+  const [headerPx, setHeaderPx] = useState(HEADER_DEFAULT);
   /** Live start shared by linked A/V while one partner is moved. */
   const [dragPreview, setDragPreview] = useState<{
     clipIds: string[];
@@ -91,6 +111,36 @@ export function TimelinePanel({
   } | null>(null);
   const duration = timelineDuration(timeline, 10);
   const view = useTimelineView(duration);
+
+  const clampHeader = useCallback((w: number) => {
+    return Math.max(HEADER_MIN, Math.min(HEADER_MAX, w));
+  }, []);
+
+  useEffect(() => {
+    function onResize() {
+      setHeaderPx((w) => clampHeader(w));
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [clampHeader]);
+
+  useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!headerDragRef.current) return;
+      const delta = e.clientX - headerDragRef.current.startX;
+      setHeaderPx(clampHeader(headerDragRef.current.startW + delta));
+    }
+    function onUp() {
+      headerDragRef.current = null;
+      document.body.classList.remove("resizing-tl-headers");
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [clampHeader]);
 
   const selectedClip = useMemo(() => {
     for (const track of timeline.tracks) {
@@ -105,7 +155,7 @@ export function TimelinePanel({
     for (const track of timeline.tracks) {
       if (track.hidden) continue;
       for (const clip of track.clips) {
-        pts.push(clip.start, clip.start + (clip.out_point - clip.in_point));
+        pts.push(clip.start, clip.start + clipTimelineDuration(clip));
       }
     }
     return pts;
@@ -210,10 +260,16 @@ export function TimelinePanel({
     return view.applySnap(view.xToTime(x), anchors);
   }
 
+  const timeFromClientXRef = useRef(timeFromClientX);
+  timeFromClientXRef.current = timeFromClientX;
+  const timelineRef = useRef(timeline);
+  timelineRef.current = timeline;
+
   useEffect(() => {
     return subscribeBinDrag((session) => {
       if (!session?.active) {
         setBinDragOver(false);
+        setBinDropPreview(null);
         return;
       }
       const el = document.elementFromPoint(session.clientX, session.clientY);
@@ -221,6 +277,29 @@ export function TimelinePanel({
         Boolean(el?.closest(".timeline-panel")) ||
         Boolean(el?.closest(".tl-scroller"));
       setBinDragOver(over);
+      if (!over) {
+        setBinDropPreview(null);
+        return;
+      }
+
+      const item = session.item;
+      const preferKind: "video" | "audio" = item.has_video ? "video" : "audio";
+      const tl = timelineRef.current;
+      const lane = el?.closest(".tl-lane") as HTMLElement | null;
+      const hoverId = lane?.dataset.trackId ?? null;
+      const hoverTrack = hoverId ? tl.tracks.find((t) => t.id === hoverId) : null;
+      const track =
+        hoverTrack && !hoverTrack.hidden
+          ? hoverTrack
+          : tl.tracks.find((t) => t.kind === preferKind && !t.hidden) ??
+            tl.tracks.find((t) => !t.hidden) ??
+            tl.tracks[0];
+      if (!track) {
+        setBinDropPreview(null);
+        return;
+      }
+      const start = Math.max(0, timeFromClientXRef.current(session.clientX));
+      setBinDropPreview({ item, start, trackId: track.id });
     });
   }, []);
 
@@ -326,7 +405,10 @@ export function TimelinePanel({
   }
 
   return (
-    <section className={`timeline-panel ${binDragOver ? "bin-drag-over" : ""}`}>
+    <section
+      ref={panelRef}
+      className={`timeline-panel ${binDragOver ? "bin-drag-over" : ""}`}
+    >
       <TimelineToolbar
         tool={tool}
         onTool={onTool}
@@ -369,13 +451,13 @@ export function TimelinePanel({
           const clip =
             selectedClip &&
             playhead > selectedClip.start &&
-            playhead < selectedClip.start + (selectedClip.out_point - selectedClip.in_point)
+            playhead < selectedClip.start + clipTimelineDuration(selectedClip)
               ? selectedClip
               : timeline.tracks
                   .flatMap((t) => t.clips.map((c) => ({ track: t, clip: c })))
                   .find(({ track, clip: c }) => {
                     if (track.locked) return false;
-                    const end = c.start + (c.out_point - c.in_point);
+                    const end = c.start + clipTimelineDuration(c);
                     return playhead > c.start && playhead < end;
                   })?.clip;
           if (!clip) {
@@ -418,7 +500,12 @@ export function TimelinePanel({
         pxPerSec={view.pxPerSec}
       />
 
-      <div className="tl-body">
+      <div
+        className="tl-body"
+        style={{
+          gridTemplateColumns: `${headerPx}px ${HEADER_HANDLE_PX}px minmax(0, 1fr)`,
+        }}
+      >
         <div className="tl-headers">
           <div className="tl-corner" />
           {timeline.tracks.map((track) => {
@@ -463,10 +550,12 @@ export function TimelinePanel({
               }}
               onContextMenu={(e) => {
                 openContext(e, {
-                  kind: "lane",
+                  kind: "track",
                   trackId: track.id,
                   trackKind: track.kind,
-                  at: playhead,
+                  muted: track.muted,
+                  locked: track.locked,
+                  hidden: Boolean(track.hidden),
                   canDelete: sameKind > 1 && !track.locked,
                 });
               }}
@@ -474,6 +563,17 @@ export function TimelinePanel({
             );
           })}
         </div>
+
+        <div
+          className="tl-header-resize-handle"
+          title="Drag to resize track headers"
+          aria-label="Drag to resize track headers"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            headerDragRef.current = { startX: e.clientX, startW: headerPx };
+            document.body.classList.add("resizing-tl-headers");
+          }}
+        />
 
         <div
           className={`tl-scroller ${binDragOver ? "bin-drag-over" : ""}`}
@@ -538,6 +638,7 @@ export function TimelinePanel({
                   <div
                     key={track.id}
                     className={`tl-lane track-${track.kind} collapsed`}
+                    data-track-id={track.id}
                     style={{ height: h }}
                     onClick={onLanePointer}
                     onPointerDown={beginScrub}
@@ -548,6 +649,7 @@ export function TimelinePanel({
                 <div
                   key={track.id}
                   className={`tl-lane track-${track.kind} ${track.muted ? "muted" : ""} ${track.locked ? "locked" : ""} ${tool === "spacer" ? "spacer-tool" : ""}`}
+                  data-track-id={track.id}
                   style={{ height: h }}
                   onClick={onLanePointer}
                   onPointerDown={(e) => {
@@ -559,16 +661,32 @@ export function TimelinePanel({
                   }}
                   onContextMenu={(e) => {
                     if ((e.target as HTMLElement).closest(".tl-clip")) return;
-                    const sameKind = timeline.tracks.filter((t) => t.kind === track.kind).length;
                     openContext(e, {
                       kind: "lane",
                       trackId: track.id,
                       trackKind: track.kind,
                       at: timeFromClientX(e.clientX),
-                      canDelete: sameKind > 1 && !track.locked,
                     });
                   }}
                 >
+                  {binDropPreview?.trackId === track.id && (
+                    <div
+                      className={`tl-bin-drop-preview role-${binDropPreview.item.has_video ? "video" : "audio"}`}
+                      style={{
+                        left: view.timeToX(binDropPreview.start),
+                        width: Math.max(
+                          12,
+                          view.timeToX(Math.max(0.05, binDropPreview.item.duration)),
+                        ),
+                      }}
+                      aria-hidden
+                    >
+                      <div className="tl-clip-body">
+                        <span className="tl-clip-name">{binDropPreview.item.name}</span>
+                        <small>{formatTime(binDropPreview.item.duration)}</small>
+                      </div>
+                    </div>
+                  )}
                   {track.clips.map((clip: Clip) => (
                     <ClipBlock
                       key={clip.id}
@@ -580,17 +698,18 @@ export function TimelinePanel({
                       anchors={anchors.filter(
                         (a) =>
                           a !== clip.start &&
-                          a !== clip.start + (clip.out_point - clip.in_point),
+                          a !== clip.start + clipTimelineDuration(clip),
                       )}
                       onSelect={() => onSelectClip(clip.id)}
                       onContextMenu={(e) => {
                         const at = timeFromClientX(e.clientX);
-                        const end = clip.start + (clip.out_point - clip.in_point);
+                        const end = clip.start + clipTimelineDuration(clip);
                         openContext(e, {
                           kind: "clip",
                           clipId: clip.id,
                           trackId: track.id,
                           linked: Boolean(clip.linked_clip_id),
+                          role: clip.role,
                           at: Math.min(Math.max(at, clip.start + 0.05), end - 0.05),
                           clipStart: clip.start,
                           clipEnd: end,
@@ -704,11 +823,7 @@ export function TimelinePanel({
       {ctxMenu && (
         <TimelineContextMenu
           menu={ctxMenu}
-          tool={tool}
-          editMode={timeline.edit_mode ?? "normal"}
           onClose={() => setCtxMenu(null)}
-          onTool={onTool}
-          onEditMode={onEditMode}
           onSplitAt={(clipId, at) => {
             onSelectClip(clipId);
             void run(
@@ -727,11 +842,11 @@ export function TimelinePanel({
             const clip =
               ctxMenu.target.kind === "clip"
                 ? timeline.tracks
-                    .flatMap((t) => t.clips)
+                    .flatMap((tr) => tr.clips)
                     .find((c) => c.id === clipId)
                 : selectedClip;
             if (!clip) return;
-            const end = clip.start + (clip.out_point - clip.in_point);
+            const end = clip.start + clipTimelineDuration(clip);
             if (playhead <= clip.start || playhead >= end) {
               onStatus("Playhead must be inside the clip");
               return;
@@ -762,7 +877,7 @@ export function TimelinePanel({
           onToggleLink={(clipId) => {
             onSelectClip(clipId);
             const clip = timeline.tracks
-              .flatMap((t) => t.clips)
+              .flatMap((tr) => tr.clips)
               .find((c) => c.id === clipId);
             if (!clip) return;
             if (clip.linked_clip_id) {
@@ -802,27 +917,33 @@ export function TimelinePanel({
             );
           }}
           onSeek={onSeek}
-          onSetZoneIn={() => void setZoneAt("in", ctxMenu.target.at)}
-          onSetZoneOut={() => void setZoneAt("out", ctxMenu.target.at)}
-          onLiftZone={onLiftZone}
-          onExtractZone={onExtractZone}
+          onSetZoneIn={() => {
+            if (ctxMenu.target.kind === "ruler") void setZoneAt("in", ctxMenu.target.at);
+          }}
+          onSetZoneOut={() => {
+            if (ctxMenu.target.kind === "ruler") void setZoneAt("out", ctxMenu.target.at);
+          }}
           onAddMarker={() => {
-            onSeek(ctxMenu.target.at);
+            const at =
+              ctxMenu.target.kind === "ruler" || ctxMenu.target.kind === "lane"
+                ? ctxMenu.target.at
+                : playhead;
+            onSeek(at);
             void run(
               "add_marker",
               {
-                time: ctxMenu.target.at,
+                time: at,
                 label: `M${(timeline.markers?.length ?? 0) + 1}`,
               },
-              `Marker @ ${formatTime(ctxMenu.target.at)}`,
+              `Marker @ ${formatTime(at)}`,
             );
           }}
           onAddVideoTrack={() => void run("add_track", { kind: "video" }, "Video track added")}
           onAddAudioTrack={() => void run("add_track", { kind: "audio" }, "Audio track added")}
           onRemoveTrack={(trackId) => {
-            const track = timeline.tracks.find((t) => t.id === trackId);
+            const track = timeline.tracks.find((tr) => tr.id === trackId);
             if (!track) return;
-            const sameKind = timeline.tracks.filter((t) => t.kind === track.kind).length;
+            const sameKind = timeline.tracks.filter((tr) => tr.kind === track.kind).length;
             if (sameKind <= 1) {
               onStatus(`Keep at least one ${track.kind} track`);
               return;
@@ -840,16 +961,21 @@ export function TimelinePanel({
             }
             void run("remove_track", { trackId }, `Deleted ${track.name}`);
           }}
-          canDeleteTrack={(trackId) => {
-            const track = timeline.tracks.find((t) => t.id === trackId);
-            if (!track || track.locked) return false;
-            return timeline.tracks.filter((t) => t.kind === track.kind).length > 1;
+          onMuteTrack={(trackId, muted) => {
+            void run("set_track_mute", { trackId, muted });
           }}
-          onZoomFit={doZoomFit}
-          onZoomIn={view.zoomIn}
-          onZoomOut={view.zoomOut}
-          onUndo={onUndo}
-          onRedo={onRedo}
+          onLockTrack={(trackId, locked) => {
+            void run("set_track_lock", { trackId, locked });
+          }}
+          onHideTrack={(trackId, hidden) => {
+            void run(
+              "set_track_hidden",
+              { trackId, hidden },
+              hidden ? "Track hidden" : "Track shown",
+            );
+          }}
+          onAdvancedAudio={onAdvancedAudio}
+          onAdvancedVideo={onAdvancedVideo}
         />
       )}
     </section>

@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-import type { EditMode, TimelineTool } from "./types";
 
 export type ContextTarget =
   | {
@@ -7,6 +6,7 @@ export type ContextTarget =
       clipId: string;
       trackId: string;
       linked: boolean;
+      role: "video" | "audio";
       at: number;
       clipStart: number;
       clipEnd: number;
@@ -16,6 +16,14 @@ export type ContextTarget =
       trackId: string;
       trackKind: "video" | "audio";
       at: number;
+    }
+  | {
+      kind: "track";
+      trackId: string;
+      trackKind: "video" | "audio";
+      muted: boolean;
+      locked: boolean;
+      hidden: boolean;
       canDelete: boolean;
     }
   | {
@@ -35,11 +43,7 @@ type Item =
 
 type Props = {
   menu: ContextMenuState;
-  tool: TimelineTool;
-  editMode: EditMode;
   onClose: () => void;
-  onTool: (t: TimelineTool) => void;
-  onEditMode: (m: EditMode) => void;
   onSplitAt: (clipId: string, at: number) => void;
   onSplitPlayhead: () => void;
   onDelete: (clipId: string) => void;
@@ -51,27 +55,20 @@ type Props = {
   onSeek: (t: number) => void;
   onSetZoneIn: () => void;
   onSetZoneOut: () => void;
-  onLiftZone: () => void;
-  onExtractZone: () => void;
   onAddMarker: () => void;
   onAddVideoTrack: () => void;
   onAddAudioTrack: () => void;
   onRemoveTrack: (trackId: string) => void;
-  canDeleteTrack?: (trackId: string) => boolean;
-  onZoomFit: () => void;
-  onZoomIn: () => void;
-  onZoomOut: () => void;
-  onUndo: () => void;
-  onRedo: () => void;
+  onMuteTrack: (trackId: string, muted: boolean) => void;
+  onLockTrack: (trackId: string, locked: boolean) => void;
+  onHideTrack: (trackId: string, hidden: boolean) => void;
+  onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
+  onAdvancedVideo?: (clipId: string) => void;
 };
 
 export function TimelineContextMenu({
   menu,
-  tool,
-  editMode,
   onClose,
-  onTool,
-  onEditMode,
   onSplitAt,
   onSplitPlayhead,
   onDelete,
@@ -83,18 +80,15 @@ export function TimelineContextMenu({
   onSeek,
   onSetZoneIn,
   onSetZoneOut,
-  onLiftZone,
-  onExtractZone,
   onAddMarker,
   onAddVideoTrack,
   onAddAudioTrack,
   onRemoveTrack,
-  canDeleteTrack,
-  onZoomFit,
-  onZoomIn,
-  onZoomOut,
-  onUndo,
-  onRedo,
+  onMuteTrack,
+  onLockTrack,
+  onHideTrack,
+  onAdvancedAudio,
+  onAdvancedVideo,
 }: Props) {
   const ref = useRef<HTMLDivElement | null>(null);
 
@@ -115,10 +109,6 @@ export function TimelineContextMenu({
 
   const items = buildItems({
     menu,
-    tool,
-    editMode,
-    onTool,
-    onEditMode,
     onSplitAt,
     onSplitPlayhead,
     onDelete,
@@ -130,24 +120,19 @@ export function TimelineContextMenu({
     onSeek,
     onSetZoneIn,
     onSetZoneOut,
-    onLiftZone,
-    onExtractZone,
     onAddMarker,
     onAddVideoTrack,
     onAddAudioTrack,
     onRemoveTrack,
-    canDeleteTrack,
-    onZoomFit,
-    onZoomIn,
-    onZoomOut,
-    onUndo,
-    onRedo,
-    onClose,
+    onMuteTrack,
+    onLockTrack,
+    onHideTrack,
+    onAdvancedAudio,
+    onAdvancedVideo,
   });
 
-  // Keep menu on screen
   const left = Math.min(menu.x, window.innerWidth - 220);
-  const top = Math.min(menu.y, window.innerHeight - Math.min(480, items.length * 28));
+  const top = Math.min(menu.y, window.innerHeight - Math.min(360, items.length * 28 + 16));
 
   return (
     <div
@@ -183,10 +168,6 @@ export function TimelineContextMenu({
 
 function buildItems(p: {
   menu: ContextMenuState;
-  tool: TimelineTool;
-  editMode: EditMode;
-  onTool: (t: TimelineTool) => void;
-  onEditMode: (m: EditMode) => void;
   onSplitAt: (clipId: string, at: number) => void;
   onSplitPlayhead: () => void;
   onDelete: (clipId: string) => void;
@@ -198,27 +179,60 @@ function buildItems(p: {
   onSeek: (t: number) => void;
   onSetZoneIn: () => void;
   onSetZoneOut: () => void;
-  onLiftZone: () => void;
-  onExtractZone: () => void;
   onAddMarker: () => void;
   onAddVideoTrack: () => void;
   onAddAudioTrack: () => void;
   onRemoveTrack: (trackId: string) => void;
-  onZoomFit: () => void;
-  onZoomIn: () => void;
-  onZoomOut: () => void;
-  onUndo: () => void;
-  onRedo: () => void;
-  onClose: () => void;
-  canDeleteTrack?: (trackId: string) => boolean;
+  onMuteTrack: (trackId: string, muted: boolean) => void;
+  onLockTrack: (trackId: string, locked: boolean) => void;
+  onHideTrack: (trackId: string, hidden: boolean) => void;
+  onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
+  onAdvancedVideo?: (clipId: string) => void;
 }): Item[] {
   const { menu } = p;
-  const items: Item[] = [];
+  const t = menu.target;
 
-  if (menu.target.kind === "clip") {
-    const t = menu.target;
-    const canDeleteTrack = p.canDeleteTrack?.(t.trackId) ?? false;
-    items.push(
+  if (t.kind === "track") {
+    return [
+      {
+        type: "item",
+        label: t.muted ? "Unmute" : "Mute",
+        action: () => p.onMuteTrack(t.trackId, !t.muted),
+      },
+      {
+        type: "item",
+        label: t.locked ? "Unlock" : "Lock",
+        action: () => p.onLockTrack(t.trackId, !t.locked),
+      },
+      {
+        type: "item",
+        label: t.hidden ? "Show track" : "Hide track",
+        action: () => p.onHideTrack(t.trackId, !t.hidden),
+      },
+      { type: "sep" },
+      {
+        type: "item",
+        label: "Add video track",
+        action: () => p.onAddVideoTrack(),
+      },
+      {
+        type: "item",
+        label: "Add audio track",
+        action: () => p.onAddAudioTrack(),
+      },
+      { type: "sep" },
+      {
+        type: "item",
+        label: `Delete ${t.trackKind} track`,
+        danger: true,
+        disabled: !t.canDelete,
+        action: () => p.onRemoveTrack(t.trackId),
+      },
+    ];
+  }
+
+  if (t.kind === "clip") {
+    const items: Item[] = [
       {
         type: "item",
         label: "Split at cursor",
@@ -261,18 +275,34 @@ function buildItems(p: {
         danger: true,
         action: () => p.onRippleDelete(t.clipId),
       },
-      {
-        type: "item",
-        label: "Delete track",
-        danger: true,
-        disabled: !canDeleteTrack,
-        action: () => p.onRemoveTrack(t.trackId),
-      },
-      { type: "sep" },
-    );
-  } else if (menu.target.kind === "lane") {
-    const t = menu.target;
-    items.push(
+    ];
+    if (t.role === "audio" || t.role === "video") {
+      items.push({ type: "sep" });
+      if (t.role === "video") {
+        items.push({
+          type: "item",
+          label: "Advanced Video…",
+          action: () => p.onAdvancedVideo?.(t.clipId),
+        });
+      }
+      items.push(
+        {
+          type: "item",
+          label: t.role === "video" ? "Advanced Audio (linked)…" : "Advanced Audio…",
+          action: () => p.onAdvancedAudio?.(t.clipId, "overview"),
+        },
+        {
+          type: "item",
+          label: "Open Waveform Editor…",
+          action: () => p.onAdvancedAudio?.(t.clipId, "waveform"),
+        },
+      );
+    }
+    return items;
+  }
+
+  if (t.kind === "lane") {
+    return [
       {
         type: "item",
         label: "Seek here",
@@ -298,90 +328,41 @@ function buildItems(p: {
         label: "Remove All Spaces After Cursor",
         action: () => p.onFillGapsFrom(t.at, t.trackId),
       },
-      {
-        type: "item",
-        label: `Delete ${t.trackKind} track`,
-        danger: true,
-        disabled: !t.canDelete,
-        action: () => p.onRemoveTrack(t.trackId),
-      },
       { type: "sep" },
-    );
-  } else {
-    items.push(
       {
         type: "item",
-        label: "Seek here",
-        action: () => p.onSeek(menu.target.at),
+        label: "Add video track",
+        action: () => p.onAddVideoTrack(),
       },
       {
         type: "item",
-        label: "Insert Space",
-        action: () => p.onInsertSpaceAt(menu.target.at, null),
+        label: "Add audio track",
+        action: () => p.onAddAudioTrack(),
       },
-      {
-        type: "item",
-        label: "Remove Space in All Tracks",
-        action: () => p.onCloseGapAt(menu.target.at, null),
-      },
-      {
-        type: "item",
-        label: "Remove All Spaces After Cursor",
-        action: () => p.onFillGapsFrom(menu.target.at, null),
-      },
-      { type: "sep" },
-    );
+    ];
   }
 
-  const mark = (active: boolean, label: string) =>
-    active ? `✓ ${label}` : label;
-
-  items.push(
+  // ruler
+  return [
     {
       type: "item",
-      label: mark(p.tool === "select", "Select tool"),
-      hint: "S",
-      action: () => p.onTool("select"),
+      label: "Seek here",
+      action: () => p.onSeek(t.at),
     },
     {
       type: "item",
-      label: mark(p.tool === "razor", "Cut tool"),
-      hint: "X",
-      action: () => p.onTool("razor"),
+      label: "Insert Space",
+      action: () => p.onInsertSpaceAt(t.at, null),
     },
     {
       type: "item",
-      label: mark(p.tool === "spacer", "Spacer tool"),
-      hint: "M",
-      action: () => p.onTool("spacer"),
+      label: "Remove Space in All Tracks",
+      action: () => p.onCloseGapAt(t.at, null),
     },
     {
       type: "item",
-      label: mark(p.tool === "slip", "Slip tool"),
-      hint: "Y",
-      action: () => p.onTool("slip"),
-    },
-    {
-      type: "item",
-      label: mark(p.tool === "ripple", "Ripple tool"),
-      hint: "R",
-      action: () => p.onTool("ripple"),
-    },
-    { type: "sep" },
-    {
-      type: "item",
-      label: mark(p.editMode === "normal", "Mode: Normal"),
-      action: () => p.onEditMode("normal"),
-    },
-    {
-      type: "item",
-      label: mark(p.editMode === "insert", "Mode: Insert"),
-      action: () => p.onEditMode("insert"),
-    },
-    {
-      type: "item",
-      label: mark(p.editMode === "overwrite", "Mode: Overwrite"),
-      action: () => p.onEditMode("overwrite"),
+      label: "Remove All Spaces After Cursor",
+      action: () => p.onFillGapsFrom(t.at, null),
     },
     { type: "sep" },
     {
@@ -398,63 +379,11 @@ function buildItems(p: {
     },
     {
       type: "item",
-      label: "Lift zone",
-      action: () => p.onLiftZone(),
-    },
-    {
-      type: "item",
-      label: "Extract zone",
-      action: () => p.onExtractZone(),
-    },
-    {
-      type: "item",
       label: "Add marker",
       action: () => {
-        p.onSeek(menu.target.at);
+        p.onSeek(t.at);
         p.onAddMarker();
       },
     },
-    { type: "sep" },
-    {
-      type: "item",
-      label: "Add video track",
-      action: () => p.onAddVideoTrack(),
-    },
-    {
-      type: "item",
-      label: "Add audio track",
-      action: () => p.onAddAudioTrack(),
-    },
-    { type: "sep" },
-    {
-      type: "item",
-      label: "Zoom fit",
-      action: () => p.onZoomFit(),
-    },
-    {
-      type: "item",
-      label: "Zoom in",
-      action: () => p.onZoomIn(),
-    },
-    {
-      type: "item",
-      label: "Zoom out",
-      action: () => p.onZoomOut(),
-    },
-    { type: "sep" },
-    {
-      type: "item",
-      label: "Undo",
-      hint: "Ctrl+Z",
-      action: () => p.onUndo(),
-    },
-    {
-      type: "item",
-      label: "Redo",
-      hint: "Ctrl+Y",
-      action: () => p.onRedo(),
-    },
-  );
-
-  return items;
+  ];
 }

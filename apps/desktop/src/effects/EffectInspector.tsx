@@ -1,11 +1,35 @@
-import { useEffect, useState } from "react";
-import { effectMeta, effectShortLabel, type FilterInstance } from "./effects";
+import { useEffect, useRef, useState } from "react";
+import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
+import {
+  defaultParams,
+  effectLabel,
+  effectMeta,
+  effectShortLabel,
+  type FilterInstance,
+} from "./effects";
 import "./EffectInspector.css";
+
+/** Effects that are not heard in the Project Monitor preview. */
+const EXPORT_ONLY = new Set([
+  "denoise",
+  "equalizer",
+  "compressor",
+  "highpass",
+  "lowpass",
+  "gate",
+  "limiter",
+  "reverb",
+  "invert",
+]);
 
 type Props = {
   clipId: string | null;
+  clipName?: string | null;
   clipRole: "video" | "audio" | null;
   filters: FilterInstance[];
+  /** Expand this filter when set (e.g. after Apply). */
+  focusFilterId?: string | null;
+  fill?: boolean;
   onUpdate: (filterId: string, params: Record<string, unknown>) => void;
   onToggle: (filterId: string, enabled: boolean) => void;
   onRemove: (filterId: string) => void;
@@ -13,17 +37,41 @@ type Props = {
 
 export function EffectInspector({
   clipId,
+  clipName = null,
   clipRole,
   filters,
+  focusFilterId = null,
+  fill = false,
   onUpdate,
   onToggle,
   onRemove,
 }: Props) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [ctx, setCtx] = useState<{
+    x: number;
+    y: number;
+    filter: FilterInstance;
+  } | null>(null);
+  /** One-shot: only auto-expand when focusFilterId newly changes. */
+  const lastFocusIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     setExpandedId(null);
+    lastFocusIdRef.current = null;
   }, [clipId]);
+
+  useEffect(() => {
+    if (!focusFilterId) {
+      lastFocusIdRef.current = null;
+      return;
+    }
+    // Only auto-expand when focus id newly changes — not on every filters[] identity churn.
+    if (focusFilterId === lastFocusIdRef.current) return;
+    if (!filters.some((f) => f.id === focusFilterId)) return;
+    lastFocusIdRef.current = focusFilterId;
+    setExpandedId(focusFilterId);
+    // Intentionally depends on filters so a late-arriving filter can still open once.
+  }, [focusFilterId, filters]);
 
   useEffect(() => {
     if (expandedId && !filters.some((f) => f.id === expandedId)) {
@@ -31,109 +79,152 @@ export function EffectInspector({
     }
   }, [filters, expandedId]);
 
-  const expanded = filters.find((f) => f.id === expandedId) ?? null;
-
   if (!clipId) {
     return (
-      <aside className="effect-inspector">
+      <aside className={`effect-inspector ${fill ? "fill" : ""}`}>
         <header className="ei-header">
-          <span className="ei-title">Applied</span>
+          <span className="ei-title">Effect Controls</span>
         </header>
-        <p className="ei-hint">Select a clip to edit effects.</p>
+        <p className="ei-hint">Select a timeline clip to edit applied effects.</p>
       </aside>
     );
   }
 
+  const ctxItems: ContextMenuItem[] = ctx
+    ? [
+        {
+          type: "item",
+          label: ctx.filter.enabled ? "Disable" : "Enable",
+          action: () => onToggle(ctx.filter.id, !ctx.filter.enabled),
+        },
+          {
+            type: "item",
+            label: "Reset to default",
+            action: () => onUpdate(ctx.filter.id, defaultParams(ctx.filter.kind)),
+          },
+        { type: "sep" },
+        {
+          type: "item",
+          label: "Remove",
+          danger: true,
+          action: () => onRemove(ctx.filter.id),
+        },
+      ]
+    : [];
+
   return (
-    <aside className="effect-inspector">
+    <aside className={`effect-inspector ${fill ? "fill" : ""}`}>
       <header className="ei-header">
-        <span className="ei-title">Applied</span>
+        <span className="ei-title">Effect Controls</span>
         <span className="ei-count" aria-label={`${filters.length} effects`}>
           {filters.length}
         </span>
         {clipRole && <span className="ei-role">{clipRole}</span>}
       </header>
+      {clipName && <p className="ei-clip-name" title={clipName}>{clipName}</p>}
 
       {filters.length === 0 ? (
         <div className="ei-empty">
-          <p>Drop / pick from Effects</p>
+          <p>No effects on this clip.</p>
+          <p className="ei-hint">Add from the Effects tab or Advanced Audio.</p>
         </div>
       ) : (
         <div className="ei-body">
-          <div className="ei-chip-grid">
+          <ul className="ei-stack">
             {filters.map((f) => {
               const meta = effectMeta(f.kind);
               const active = f.id === expandedId;
+              const exportOnly = EXPORT_ONLY.has(f.kind);
               return (
-                <div
+                <li
                   key={f.id}
-                  className={`ei-chip ${f.enabled ? "on" : "off"} ${active ? "active" : ""}`}
+                  className={`ei-row ${f.enabled ? "on" : "off"} ${active ? "active" : ""}`}
                   style={{ ["--effect-hue" as string]: meta.hue }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setCtx({ x: e.clientX, y: e.clientY, filter: f });
+                  }}
                 >
-                  <button
-                    type="button"
-                    className="ei-chip-main"
-                    onClick={() => setExpandedId(active ? null : f.id)}
-                    title={effectShortLabel(f.kind)}
-                  >
-                    <span className="ei-chip-icon" aria-hidden>
-                      {meta.glyph}
-                    </span>
-                    <span className="ei-chip-name">{effectShortLabel(f.kind)}</span>
-                  </button>
-                  <div className="ei-chip-actions">
-                    <label className="ei-chip-toggle" title={f.enabled ? "On" : "Off"}>
-                      <input
-                        type="checkbox"
-                        checked={f.enabled}
-                        onChange={(e) => onToggle(f.id, e.target.checked)}
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    </label>
+                  <div className="ei-row-head">
+                    <button
+                      type="button"
+                      className={`ei-eye ${f.enabled ? "on" : ""}`}
+                      title={f.enabled ? "Enabled" : "Disabled"}
+                      onClick={() => onToggle(f.id, !f.enabled)}
+                    >
+                      {f.enabled ? "●" : "○"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ei-row-main"
+                      onClick={() => setExpandedId(active ? null : f.id)}
+                    >
+                      <span className="ei-row-name">{effectLabel(f.kind)}</span>
+                      {exportOnly && (
+                        <span className="ei-badge" title="Heard on export, not in monitor preview">
+                          Export
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="ei-reset"
+                      title="Reset to default"
+                      onClick={() => onUpdate(f.id, defaultParams(f.kind))}
+                    >
+                      ↺
+                    </button>
                     <button
                       type="button"
                       className="ei-remove"
                       title="Remove"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onRemove(f.id);
-                      }}
+                      onClick={() => onRemove(f.id)}
                     >
                       ✕
                     </button>
                   </div>
-                </div>
+                  {active && (
+                    <div className="ei-row-params">
+                      {exportOnly && (
+                        <p className="ei-hint ei-export-hint">
+                          Export only — not heard in Play/monitor.
+                        </p>
+                      )}
+                      <div className="ei-param-actions">
+                        <button
+                          type="button"
+                          className="ei-reset-full"
+                          onClick={() => onUpdate(f.id, defaultParams(f.kind))}
+                        >
+                          Reset to default
+                        </button>
+                      </div>
+                      <ParamEditors
+                        kind={f.kind}
+                        params={
+                          f.kind === "denoise"
+                            ? { ...defaultParams("denoise"), ...(f.params ?? {}) }
+                            : (f.params ?? {})
+                        }
+                        onChange={(p) => onUpdate(f.id, p)}
+                      />
+                    </div>
+                  )}
+                </li>
               );
             })}
-          </div>
-
-          {expanded && (
-            <section
-              className={`ei-detail ${expanded.enabled ? "on" : "off"}`}
-              style={{ ["--effect-hue" as string]: effectMeta(expanded.kind).hue }}
-            >
-              <div className="ei-detail-head">
-                <span className="ei-chip-icon" aria-hidden>
-                  {effectMeta(expanded.kind).glyph}
-                </span>
-                <strong>{effectShortLabel(expanded.kind)}</strong>
-                <button
-                  type="button"
-                  className="ei-collapse"
-                  onClick={() => setExpandedId(null)}
-                  title="Collapse"
-                >
-                  ▴
-                </button>
-              </div>
-              <ParamEditors
-                kind={expanded.kind}
-                params={expanded.params ?? {}}
-                onChange={(p) => onUpdate(expanded.id, p)}
-              />
-            </section>
-          )}
+          </ul>
         </div>
+      )}
+
+      {ctx && (
+        <ContextMenuPopup
+          x={ctx.x}
+          y={ctx.y}
+          items={ctxItems}
+          onClose={() => setCtx(null)}
+        />
       )}
     </aside>
   );
@@ -233,8 +324,118 @@ function ParamEditors({
           <Slider label="Gain" min={0} max={2} step={0.01} value={num("gain", 1)} onChange={(v) => set("gain", v)} />
         </div>
       );
+    case "equalizer":
+      return (
+        <div className="ei-params">
+          <Slider label="Bass" min={-12} max={12} step={0.5} value={num("bass", 0)} onChange={(v) => set("bass", v)} />
+          <Slider label="Mid" min={-12} max={12} step={0.5} value={num("mid", 0)} onChange={(v) => set("mid", v)} />
+          <Slider label="Treble" min={-12} max={12} step={0.5} value={num("treble", 0)} onChange={(v) => set("treble", v)} />
+        </div>
+      );
+    case "compressor":
+      return (
+        <div className="ei-params">
+          <Slider label="Threshold" min={-60} max={0} step={1} value={num("threshold", -20)} onChange={(v) => set("threshold", v)} />
+          <Slider label="Ratio" min={1} max={20} step={0.1} value={num("ratio", 4)} onChange={(v) => set("ratio", v)} />
+          <Slider label="Attack" min={1} max={200} step={1} value={num("attack", 20)} onChange={(v) => set("attack", v)} />
+          <Slider label="Release" min={10} max={1000} step={10} value={num("release", 250)} onChange={(v) => set("release", v)} />
+        </div>
+      );
+    case "highpass":
+      return (
+        <div className="ei-params">
+          <Slider label="Freq" min={20} max={4000} step={10} value={num("freq", 120)} onChange={(v) => set("freq", v)} />
+        </div>
+      );
+    case "lowpass":
+      return (
+        <div className="ei-params">
+          <Slider label="Freq" min={500} max={20000} step={50} value={num("freq", 12000)} onChange={(v) => set("freq", v)} />
+        </div>
+      );
+    case "gate":
+      return (
+        <div className="ei-params">
+          <Slider label="Threshold" min={-80} max={0} step={1} value={num("threshold", -40)} onChange={(v) => set("threshold", v)} />
+          <Slider label="Ratio" min={1} max={50} step={0.5} value={num("ratio", 10)} onChange={(v) => set("ratio", v)} />
+          <Slider label="Attack" min={1} max={100} step={1} value={num("attack", 10)} onChange={(v) => set("attack", v)} />
+          <Slider label="Release" min={10} max={500} step={5} value={num("release", 100)} onChange={(v) => set("release", v)} />
+        </div>
+      );
+    case "denoise":
+      return (
+        <div className="ei-params">
+          <Slider label="Noise floor" min={-80} max={-20} step={1} value={num("nf", -25)} onChange={(v) => set("nf", v)} />
+          <Slider label="Reduction" min={0.01} max={97} step={0.5} value={num("nr", 12)} onChange={(v) => set("nr", v)} />
+        </div>
+      );
+    case "limiter":
+      return (
+        <div className="ei-params">
+          <Slider label="Limit" min={0.1} max={1} step={0.01} value={num("limit", 0.95)} onChange={(v) => set("limit", v)} />
+        </div>
+      );
+    case "reverb":
+      return (
+        <div className="ei-params">
+          <Slider label="Delay ms" min={1} max={200} step={1} value={num("delay", 40)} onChange={(v) => set("delay", v)} />
+          <Slider label="Decay" min={0} max={0.9} step={0.05} value={num("decay", 0.3)} onChange={(v) => set("decay", v)} />
+        </div>
+      );
+    case "invert":
+      return <p className="ei-hint">Inverts polarity (phase flip). No parameters.</p>;
+    case "pitch":
+      return (
+        <div className="ei-params">
+          <div className="ei-preset-row">
+            {(
+              [
+                { id: "male", label: "Male", st: -4 },
+                { id: "female", label: "Female", st: 4 },
+                { id: "child", label: "Child", st: 7 },
+              ] as const
+            ).map((p) => {
+              const active =
+                (typeof params.preset === "string" && params.preset === p.id) ||
+                Math.abs(num("semitones", 0) - p.st) < 0.05;
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={active ? "active" : ""}
+                  onClick={() => onChange({ ...params, semitones: p.st, preset: p.id })}
+                >
+                  {p.label}
+                </button>
+              );
+            })}
+          </div>
+          <Slider
+            label="Semitones"
+            min={-8}
+            max={8}
+            step={0.5}
+            value={num("semitones", 0)}
+            onChange={(v) =>
+              onChange({
+                ...params,
+                semitones: v,
+                preset:
+                  Math.abs(v + 4) < 0.05
+                    ? "male"
+                    : Math.abs(v - 4) < 0.05
+                      ? "female"
+                      : Math.abs(v - 7) < 0.05
+                        ? "child"
+                        : "custom",
+              })
+            }
+          />
+          <p className="ei-hint">Heard on export. Preview voice in Advanced Audio → Play.</p>
+        </div>
+      );
     default:
-      return null;
+      return <p className="ei-hint">{effectShortLabel(kind)} — no editable params.</p>;
   }
 }
 

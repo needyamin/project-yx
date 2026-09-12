@@ -345,9 +345,44 @@ fn remove_track(track_id: String, state: State<'_, AppState>) -> Result<Timeline
 }
 
 #[tauri::command]
+fn debug_agent_log(line: String) -> Result<(), String> {
+    use std::io::Write;
+    let mut paths = Vec::new();
+    if let Ok(root) = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()
+    {
+        paths.push(root.join("debug-75f279.log"));
+    }
+    paths.push(PathBuf::from(r"Y:\Project YX\debug-75f279.log"));
+    paths.push(PathBuf::from(
+        r"C:\Users\needy\.cursor\projects\y-Project-YX\debug-75f279.log",
+    ));
+    let mut last_err = String::from("no paths");
+    for path in paths {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{line}") {
+                    last_err = e.to_string();
+                    continue;
+                }
+                return Ok(());
+            }
+            Err(e) => last_err = format!("{}: {e}", path.display()),
+        }
+    }
+    Err(last_err)
+}
+
+#[tauri::command]
 fn add_filter(
     clip_id: String,
     kind: String,
+    params: Option<serde_json::Value>,
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
@@ -357,7 +392,7 @@ fn add_filter(
         .apply(EditCommand::AddFilter {
             clip_id,
             kind,
-            params: serde_json::json!({}),
+            params: params.unwrap_or_else(|| serde_json::json!({})),
         })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
@@ -432,10 +467,19 @@ fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
         "flip" => FilterKind::Flip,
         "chromakey" => FilterKind::Chromakey,
         "volume" => FilterKind::Volume,
+        "equalizer" => FilterKind::Equalizer,
+        "compressor" => FilterKind::Compressor,
+        "highpass" => FilterKind::Highpass,
+        "lowpass" => FilterKind::Lowpass,
+        "gate" => FilterKind::Gate,
+        "denoise" => FilterKind::Denoise,
+        "limiter" => FilterKind::Limiter,
+        "reverb" => FilterKind::Reverb,
+        "invert" => FilterKind::Invert,
+        "pitch" => FilterKind::Pitch,
         "lut" => FilterKind::Lut,
         "fade" => FilterKind::Fade,
         "text" => FilterKind::Text,
-        "denoise" => FilterKind::Denoise,
         other => return Err(format!("unknown filter: {other}")),
     })
 }
@@ -455,6 +499,34 @@ fn set_clip_fades(
             fade_in,
             fade_out,
         })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn set_clip_reverse(
+    clip_id: String,
+    reverse: bool,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::SetClipReverse { clip_id, reverse })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn set_clip_speed(
+    clip_id: String,
+    speed: f64,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::SetClipSpeed { clip_id, speed })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
 }
@@ -490,17 +562,27 @@ fn collect_export_segments(
     kind: TrackKind,
     proxies: &ProxyManager,
 ) -> Vec<ExportSegment> {
-    let Some(track) = timeline
+    // Video: first unmuted/visible track only (preserve prior overlay model).
+    // Audio: all unmuted/visible tracks so FX on A2+ still export.
+    let tracks: Vec<_> = timeline
         .tracks
         .iter()
-        .find(|t| t.kind == kind && !t.muted && !t.hidden && !t.clips.is_empty())
-    else {
-        return Vec::new();
+        .filter(|t| t.kind == kind && !t.muted && !t.hidden && !t.clips.is_empty())
+        .collect();
+
+    let selected: Vec<_> = if kind == TrackKind::Video {
+        tracks.into_iter().take(1).collect()
+    } else {
+        tracks
     };
 
-    let mut clips: Vec<_> = track
-        .clips
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let mut clips: Vec<_> = selected
         .iter()
+        .flat_map(|track| track.clips.iter())
         .filter(|c| c.out_point > c.in_point)
         .collect();
     clips.sort_by(|a, b| {
@@ -523,6 +605,8 @@ fn collect_export_segments(
                 start: c.start.max(0.0),
                 fade_in: c.fade_in.max(0.0),
                 fade_out: c.fade_out.max(0.0),
+                reverse: c.reverse,
+                speed: c.clamped_speed(),
                 filters: c
                     .filters
                     .iter()
@@ -537,10 +621,19 @@ fn collect_export_segments(
                             FilterKind::Flip => "flip",
                             FilterKind::Chromakey => "chromakey",
                             FilterKind::Volume => "volume",
+                            FilterKind::Equalizer => "equalizer",
+                            FilterKind::Compressor => "compressor",
+                            FilterKind::Highpass => "highpass",
+                            FilterKind::Lowpass => "lowpass",
+                            FilterKind::Gate => "gate",
+                            FilterKind::Denoise => "denoise",
+                            FilterKind::Limiter => "limiter",
+                            FilterKind::Reverb => "reverb",
+                            FilterKind::Invert => "invert",
+                            FilterKind::Pitch => "pitch",
                             FilterKind::Lut => "lut",
                             FilterKind::Fade => "fade",
                             FilterKind::Text => "text",
-                            FilterKind::Denoise => "denoise",
                         }
                         .into(),
                         enabled: f.enabled,
@@ -913,6 +1006,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(state)
         .setup(|app| {
+            let _ = debug_agent_log(
+                "{\"sessionId\":\"75f279\",\"message\":\"yx-desktop setup\",\"hypothesisId\":\"H2\",\"timestamp\":0}"
+                    .into(),
+            );
             #[cfg(desktop)]
             {
                 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -1003,6 +1100,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_boot_info,
             get_timeline,
+            debug_agent_log,
             reprobe_hardware,
             import_media,
             add_media_to_timeline,
@@ -1024,6 +1122,8 @@ pub fn run() {
             set_filter_enabled,
             remove_filter,
             set_clip_fades,
+            set_clip_reverse,
+            set_clip_speed,
             set_edit_mode,
             slip_clip,
             spacer_shift,

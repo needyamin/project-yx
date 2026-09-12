@@ -9,7 +9,17 @@ export type EffectKind =
   | "blur"
   | "flip"
   | "chromakey"
-  | "volume";
+  | "volume"
+  | "equalizer"
+  | "compressor"
+  | "highpass"
+  | "lowpass"
+  | "gate"
+  | "denoise"
+  | "limiter"
+  | "reverb"
+  | "invert"
+  | "pitch";
 
 export type FilterInstance = {
   id: string;
@@ -33,6 +43,16 @@ export const EFFECT_CATALOG: {
   { id: "flip", label: "Flip", roles: ["video"] },
   { id: "chromakey", label: "Chroma Key (BG remove)", heavy: true, roles: ["video"] },
   { id: "volume", label: "Volume", roles: ["audio"] },
+  { id: "equalizer", label: "Equalizer", roles: ["audio"] },
+  { id: "compressor", label: "Compressor", roles: ["audio"] },
+  { id: "highpass", label: "High-pass", roles: ["audio"] },
+  { id: "lowpass", label: "Low-pass", roles: ["audio"] },
+  { id: "gate", label: "Noise gate", roles: ["audio"] },
+  { id: "denoise", label: "Noise remove", heavy: true, roles: ["audio"] },
+  { id: "limiter", label: "Limiter", roles: ["audio"] },
+  { id: "reverb", label: "Reverb", roles: ["audio"] },
+  { id: "invert", label: "Invert phase", roles: ["audio"] },
+  { id: "pitch", label: "Change voice", roles: ["audio"] },
 ];
 
 export function defaultParams(kind: string): Record<string, unknown> {
@@ -55,6 +75,26 @@ export function defaultParams(kind: string): Record<string, unknown> {
       return { color: "#00ff00", similarity: 0.3, blend: 0.1 };
     case "volume":
       return { gain: 1 };
+    case "equalizer":
+      return { bass: 0, mid: 0, treble: 0 };
+    case "compressor":
+      return { threshold: -20, ratio: 4, attack: 20, release: 250 };
+    case "highpass":
+      return { freq: 120 };
+    case "lowpass":
+      return { freq: 12000 };
+    case "gate":
+      return { threshold: -40, ratio: 10, attack: 10, release: 100 };
+    case "denoise":
+      return { nf: -25, nr: 12 };
+    case "limiter":
+      return { limit: 0.95 };
+    case "reverb":
+      return { delay: 40, decay: 0.3 };
+    case "invert":
+      return {};
+    case "pitch":
+      return { semitones: 0, preset: "custom" };
     default:
       return {};
   }
@@ -79,6 +119,26 @@ export function effectShortLabel(kind: string): string {
       return "Contrast";
     case "volume":
       return "Volume";
+    case "equalizer":
+      return "EQ";
+    case "compressor":
+      return "Compress";
+    case "highpass":
+      return "High-pass";
+    case "lowpass":
+      return "Low-pass";
+    case "gate":
+      return "Gate";
+    case "denoise":
+      return "Denoise";
+    case "limiter":
+      return "Limiter";
+    case "reverb":
+      return "Reverb";
+    case "invert":
+      return "Invert";
+    case "pitch":
+      return "Voice";
     case "blur":
       return "Blur";
     case "crop":
@@ -111,6 +171,26 @@ export function effectMeta(kind: string): { glyph: string; hue: string } {
       return { glyph: "◆", hue: "#3dd68c" };
     case "volume":
       return { glyph: "♪", hue: "#f0a35e" };
+    case "equalizer":
+      return { glyph: "▥", hue: "#6ec6ff" };
+    case "compressor":
+      return { glyph: "⇕", hue: "#9b7bff" };
+    case "highpass":
+      return { glyph: "↗", hue: "#4ecdc4" };
+    case "lowpass":
+      return { glyph: "↘", hue: "#3dd68c" };
+    case "gate":
+      return { glyph: "▣", hue: "#e85d75" };
+    case "denoise":
+      return { glyph: "⌀", hue: "#8ab4f8" };
+    case "limiter":
+      return { glyph: "⊤", hue: "#f0a35e" };
+    case "reverb":
+      return { glyph: "≋", hue: "#9b7bff" };
+    case "invert":
+      return { glyph: "⇅", hue: "#4ecdc4" };
+    case "pitch":
+      return { glyph: "♫", hue: "#f0a35e" };
     default:
       return { glyph: "✦", hue: "#9a9aa4" };
   }
@@ -220,6 +300,17 @@ export function previewVolumeGain(filters: FilterInstance[], fadeGain: number): 
     g *= n(f.params ?? {}, "gain", 1);
   }
   return Math.max(0, Math.min(4, g));
+}
+
+/** Monitor pitch preview via HTMLMediaElement.playbackRate (same approach as Advanced Audio). */
+export function previewPitchRate(filters: FilterInstance[]): number {
+  for (const f of filters) {
+    if (!f.enabled || f.kind !== "pitch") continue;
+    const st = n(f.params ?? {}, "semitones", 0);
+    if (Math.abs(st) < 0.05) return 1;
+    return Math.pow(2, Math.max(-12, Math.min(12, st)) / 12);
+  }
+  return 1;
 }
 
 /** Apply chromakey on a canvas frame (simple distance key). */

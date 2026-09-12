@@ -7,7 +7,7 @@
 .editor-mid {
   min-height: 0;
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: 260px 5px minmax(0, 1fr);
   border-bottom: 1px solid var(--line);
 }
 
@@ -25,6 +25,51 @@
 
 .monitors-row.solo {
   grid-template-columns: 1fr;
+}
+
+.bin-resize-handle {
+  width: 5px;
+  cursor: ew-resize;
+  background: var(--panel-2);
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  position: relative;
+  z-index: 5;
+}
+
+.bin-resize-handle::before,
+.bin-resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2px;
+  height: 14px;
+  border-radius: 1px;
+  background: var(--muted);
+  opacity: 0.65;
+  transform: translate(-50%, -50%);
+}
+
+.bin-resize-handle::before {
+  margin-left: -3px;
+}
+
+.bin-resize-handle::after {
+  margin-left: 3px;
+}
+
+.bin-resize-handle:hover,
+body.resizing-bin .bin-resize-handle {
+  background: var(--accent-soft);
+}
+
+.bin-resize-handle:hover::before,
+.bin-resize-handle:hover::after,
+body.resizing-bin .bin-resize-handle::before,
+body.resizing-bin .bin-resize-handle::after {
+  background: var(--accent);
+  opacity: 1;
 }
 
 .timeline-resize-handle {
@@ -67,10 +112,19 @@ body.resizing-timeline {
   user-select: none;
 }
 
+body.resizing-bin {
+  cursor: ew-resize;
+  user-select: none;
+}
+
 @media (max-width: 900px) {
   .editor-mid {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr !important;
     grid-template-rows: 140px minmax(160px, 1fr);
+  }
+
+  .bin-resize-handle {
+    display: none;
   }
 
   .monitors-row.dual {

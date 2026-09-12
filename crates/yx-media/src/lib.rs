@@ -98,6 +98,12 @@ pub struct ExportSegment {
     /// Fade-out duration before segment end (seconds).
     #[serde(default)]
     pub fade_out: f64,
+    /// Play segment media backward (FFmpeg `reverse` after trim / setpts).
+    #[serde(default)]
+    pub reverse: bool,
+    /// Playback rate (1.0 = normal). Timeline/export duration is `(out-in)/speed`.
+    #[serde(default = "default_export_speed")]
+    pub speed: f64,
     /// Ordered effect stack copied from the clip (WYSIWYG with preview).
     #[serde(default)]
     pub filters: Vec<ExportFilter>,
@@ -116,9 +122,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_export_speed() -> f64 {
+    1.0
+}
+
 impl ExportSegment {
+    pub fn clamped_speed(&self) -> f64 {
+        if self.speed.is_finite() {
+            self.speed.clamp(0.25, 4.0)
+        } else {
+            1.0
+        }
+    }
+
     pub fn duration(&self) -> f64 {
-        (self.out_point - self.in_point).max(0.0)
+        let media = (self.out_point - self.in_point).max(0.0);
+        media / self.clamped_speed()
     }
 
     pub fn end(&self) -> f64 {
@@ -233,6 +252,15 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
         }
     }
 
+    // Speed then reverse (plan): setpts compresses/expands, reverse plays that buffer backward.
+    let speed = seg.clamped_speed();
+    if (speed - 1.0).abs() > 1e-4 {
+        parts.push(format!("setpts=PTS/{speed:.6}"));
+    }
+    if seg.reverse {
+        parts.push("reverse".into());
+    }
+
     let fi = seg.fade_in.max(0.0);
     let fo = seg.fade_out.max(0.0);
     let dur = seg.duration();
@@ -253,11 +281,105 @@ fn build_audio_effect_chain(seg: &ExportSegment) -> String {
         if !f.enabled {
             continue;
         }
-        if f.kind == "volume" {
-            let gain = num(&f.params, "gain", 1.0).clamp(0.0, 4.0);
-            if (gain - 1.0).abs() > 1e-4 {
-                parts.push(format!("volume={gain:.4}"));
+        match f.kind.as_str() {
+            "volume" => {
+                let gain = num(&f.params, "gain", 1.0).clamp(0.0, 4.0);
+                if (gain - 1.0).abs() > 1e-4 {
+                    parts.push(format!("volume={gain:.4}"));
+                }
             }
+            "equalizer" => {
+                let bass = num(&f.params, "bass", 0.0).clamp(-12.0, 12.0);
+                let mid = num(&f.params, "mid", 0.0).clamp(-12.0, 12.0);
+                let treble = num(&f.params, "treble", 0.0).clamp(-12.0, 12.0);
+                if bass.abs() > 0.05 {
+                    parts.push(format!("equalizer=f=100:t=q:w=1:g={bass:.2}"));
+                }
+                if mid.abs() > 0.05 {
+                    parts.push(format!("equalizer=f=1000:t=q:w=1:g={mid:.2}"));
+                }
+                if treble.abs() > 0.05 {
+                    parts.push(format!("equalizer=f=8000:t=q:w=1:g={treble:.2}"));
+                }
+            }
+            "compressor" => {
+                let thr = num(&f.params, "threshold", -20.0);
+                let ratio = num(&f.params, "ratio", 4.0).clamp(1.0, 20.0);
+                let attack = num(&f.params, "attack", 20.0).clamp(1.0, 200.0);
+                let release = num(&f.params, "release", 250.0).clamp(10.0, 2000.0);
+                parts.push(format!(
+                    "acompressor=threshold={thr:.1}dB:ratio={ratio:.2}:attack={attack:.1}:release={release:.1}"
+                ));
+            }
+            "highpass" => {
+                let freq = num(&f.params, "freq", 120.0).clamp(20.0, 8000.0);
+                parts.push(format!("highpass=f={freq:.1}"));
+            }
+            "lowpass" => {
+                let freq = num(&f.params, "freq", 12000.0).clamp(200.0, 20000.0);
+                parts.push(format!("lowpass=f={freq:.1}"));
+            }
+            "gate" => {
+                let thr = num(&f.params, "threshold", -40.0);
+                let ratio = num(&f.params, "ratio", 10.0).clamp(1.0, 50.0);
+                let attack = num(&f.params, "attack", 10.0).clamp(1.0, 200.0);
+                let release = num(&f.params, "release", 100.0).clamp(10.0, 2000.0);
+                parts.push(format!(
+                    "agate=threshold={thr:.1}dB:ratio={ratio:.2}:attack={attack:.1}:release={release:.1}"
+                ));
+            }
+            "denoise" => {
+                let nf = num(&f.params, "nf", -25.0).clamp(-80.0, -20.0);
+                let nr = num(&f.params, "nr", 12.0).clamp(0.01, 97.0);
+                parts.push(format!("afftdn=nf={nf:.1}:nr={nr:.1}"));
+            }
+            "limiter" => {
+                let limit = num(&f.params, "limit", 0.95).clamp(0.1, 1.0);
+                parts.push(format!("alimiter=limit={limit:.3}:level=disabled"));
+            }
+            "reverb" => {
+                let delay = num(&f.params, "delay", 40.0).clamp(1.0, 500.0);
+                let decay = num(&f.params, "decay", 0.3).clamp(0.0, 0.9);
+                parts.push(format!("aecho=0.8:0.9:{delay:.1}:{decay:.2}"));
+            }
+            "invert" => {
+                parts.push("volume=-1".to_string());
+            }
+            "pitch" => {
+                let st = num(&f.params, "semitones", 0.0).clamp(-12.0, 12.0);
+                if st.abs() > 0.05 {
+                    let factor = (2.0_f64).powf(st / 12.0);
+                    let rate = 48000.0 * factor;
+                    let mut tempo = 1.0 / factor;
+                    let mut chain = format!("asetrate={rate:.4},aresample=48000");
+                    while tempo > 2.0 + 1e-9 {
+                        chain.push_str(",atempo=2.0");
+                        tempo /= 2.0;
+                    }
+                    while tempo < 0.5 - 1e-9 {
+                        chain.push_str(",atempo=0.5");
+                        tempo /= 0.5;
+                    }
+                    chain.push_str(&format!(",atempo={tempo:.6}"));
+                    parts.push(chain);
+                }
+            }
+            _ => {}
+        }
+    }
+    let speed = seg.clamped_speed();
+    if (speed - 1.0).abs() > 1e-4 {
+        let mut tempo = speed;
+        while tempo > 2.0 + 1e-9 {
+            parts.push("atempo=2.0".into());
+            tempo /= 2.0;
+        }
+        while tempo < 0.5 - 1e-9 {
+            parts.push("atempo=0.5".into());
+            tempo /= 0.5;
+        }
+        if (tempo - 1.0).abs() > 1e-4 {
+            parts.push(format!("atempo={tempo:.6}"));
         }
     }
     let fi = seg.fade_in.max(0.0);
@@ -960,7 +1082,7 @@ mod tests {
                     start: 0.0,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                filters: vec![],
+                reverse: false, speed: 1.0, filters: vec![],
                 },
                 ExportSegment {
                     path: PathBuf::from("a.mp4"),
@@ -969,7 +1091,7 @@ mod tests {
                     start: 2.5,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                filters: vec![],
+                reverse: false, speed: 1.0, filters: vec![],
                 },
             ],
             audio: vec![
@@ -980,7 +1102,7 @@ mod tests {
                     start: 0.0,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                filters: vec![],
+                reverse: false, speed: 1.0, filters: vec![],
                 },
                 ExportSegment {
                     path: PathBuf::from("a.mp4"),
@@ -989,7 +1111,7 @@ mod tests {
                     start: 2.5,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                filters: vec![],
+                reverse: false, speed: 1.0, filters: vec![],
                 },
             ],
             output_path: PathBuf::from("out.mp4"),
@@ -1031,7 +1153,7 @@ mod tests {
                 start: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-            filters: vec![],
+            reverse: false, speed: 1.0, filters: vec![],
             }],
             audio: vec![ExportSegment {
                 path: PathBuf::from("a.mp4"),
@@ -1040,7 +1162,7 @@ mod tests {
                 start: 2.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-            filters: vec![],
+            reverse: false, speed: 1.0, filters: vec![],
             }],
             output_path: PathBuf::from("gap.mp4"),
             width: 1280,
@@ -1075,7 +1197,7 @@ mod tests {
                 start: 0.0,
                 fade_in: 0.5,
                 fade_out: 1.0,
-            filters: vec![],
+            reverse: false, speed: 1.0, filters: vec![],
             }],
             audio: vec![ExportSegment {
                 path: PathBuf::from("a.mp4"),
@@ -1084,7 +1206,7 @@ mod tests {
                 start: 0.0,
                 fade_in: 0.25,
                 fade_out: 0.75,
-            filters: vec![],
+            reverse: false, speed: 1.0, filters: vec![],
             }],
             output_path: PathBuf::from("fade.mp4"),
             width: 1280,
@@ -1116,7 +1238,7 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
-            filters: vec![
+            reverse: false, speed: 1.0, filters: vec![
                 ExportFilter {
                     kind: "crop".into(),
                     enabled: true,
@@ -1144,6 +1266,108 @@ mod tests {
         assert!(chain.contains("eq=brightness"), "{chain}");
         assert!(chain.contains("boxblur="), "{chain}");
         assert!(chain.contains("chromakey="), "{chain}");
+    }
+
+    #[test]
+    fn video_effect_chain_includes_reverse() {
+        let seg = ExportSegment {
+            path: PathBuf::from("v.mp4"),
+            in_point: 1.0,
+            out_point: 3.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: true,
+            speed: 1.0,
+            filters: vec![],
+        };
+        let chain = build_video_effect_chain(&seg, 1280, 720);
+        assert!(chain.contains("reverse"), "{chain}");
+    }
+
+    #[test]
+    fn video_effect_chain_includes_setpts_for_speed() {
+        let seg = ExportSegment {
+            path: PathBuf::from("v.mp4"),
+            in_point: 0.0,
+            out_point: 4.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false,
+            speed: 2.0,
+            filters: vec![],
+        };
+        assert!((seg.duration() - 2.0).abs() < 1e-9);
+        let chain = build_video_effect_chain(&seg, 1280, 720);
+        assert!(chain.contains("setpts=PTS/2"), "{chain}");
+    }
+
+    #[test]
+    fn video_effect_chain_speed_then_reverse() {
+        let seg = ExportSegment {
+            path: PathBuf::from("v.mp4"),
+            in_point: 0.0,
+            out_point: 2.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: true,
+            speed: 2.0,
+            filters: vec![],
+        };
+        let chain = build_video_effect_chain(&seg, 1280, 720);
+        let setpts = chain.find("setpts=").expect("setpts");
+        let rev = chain.find("reverse").expect("reverse");
+        assert!(setpts < rev, "setpts before reverse: {chain}");
+    }
+
+    #[test]
+    fn audio_effect_chain_includes_denoise_and_pitch() {
+        let seg = ExportSegment {
+            path: PathBuf::from("a.wav"),
+            in_point: 0.0,
+            out_point: 2.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false, speed: 1.0, filters: vec![
+                ExportFilter {
+                    kind: "denoise".into(),
+                    enabled: true,
+                    params: serde_json::json!({"nf": -25.0, "nr": 12.0}),
+                },
+                ExportFilter {
+                    kind: "pitch".into(),
+                    enabled: true,
+                    params: serde_json::json!({"semitones": 3.0}),
+                },
+            ],
+        };
+        let chain = build_audio_effect_chain(&seg);
+        assert!(chain.contains("afftdn="), "{chain}");
+        assert!(chain.contains("nf=-25"), "{chain}");
+        assert!(chain.contains("asetrate="), "{chain}");
+        assert!(chain.contains("atempo="), "{chain}");
+    }
+
+    #[test]
+    fn denoise_nf_clamped_to_ffmpeg_max() {
+        let seg = ExportSegment {
+            path: PathBuf::from("a.wav"),
+            in_point: 0.0,
+            out_point: 1.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false, speed: 1.0, filters: vec![ExportFilter {
+                kind: "denoise".into(),
+                enabled: true,
+                params: serde_json::json!({"nf": -5.0, "nr": 10.0}),
+            }],
+        };
+        let chain = build_audio_effect_chain(&seg);
+        assert!(chain.contains("nf=-20"), "{chain}");
     }
 }
 

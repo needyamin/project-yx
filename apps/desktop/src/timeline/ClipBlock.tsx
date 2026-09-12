@@ -1,6 +1,6 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { Clip, TimelineTool } from "./types";
-import { fileName, formatTime } from "./types";
+import { clipTimelineDuration, fileName, formatTime } from "./types";
 import type { TimelineView } from "./useTimelineView";
 
 type Props = {
@@ -63,7 +63,9 @@ export function ClipBlock({
   const outPoint = draft?.out_point ?? clip.out_point;
   const fadeIn = draft?.fade_in ?? clip.fade_in ?? 0;
   const fadeOut = draft?.fade_out ?? clip.fade_out ?? 0;
-  const dur = Math.max(0.05, outPoint - inPoint);
+  const speedRaw = clip.speed ?? 1;
+  const speed = Number.isFinite(speedRaw) ? Math.min(4, Math.max(0.25, speedRaw)) : 1;
+  const dur = Math.max(0.05, (outPoint - inPoint) / speed);
   const left = view.timeToX(start);
   const width = Math.max(12, view.timeToX(dur));
   const previewing = !draft && previewStart != null;
@@ -107,7 +109,11 @@ export function ClipBlock({
     const originOut = clip.out_point;
     const originFadeIn = clip.fade_in ?? 0;
     const originFadeOut = clip.fade_out ?? 0;
-    const originDur = Math.max(0.05, originOut - originIn);
+    const originSpeedRaw = clip.speed ?? 1;
+    const originSpeed = Number.isFinite(originSpeedRaw)
+      ? Math.min(4, Math.max(0.25, originSpeedRaw))
+      : 1;
+    const originDur = Math.max(0.05, (originOut - originIn) / originSpeed);
     let latest = {
       start: originStart,
       in_point: originIn,
@@ -127,11 +133,11 @@ export function ClipBlock({
       const dt = dx / view.pxPerSec;
 
       if (resolved === "slip") {
-        slipDelta = dt;
+        slipDelta = dt * originSpeed;
         latest = {
           start: originStart,
-          in_point: Math.max(0, originIn + dt),
-          out_point: Math.max(0.05, originOut + dt),
+          in_point: Math.max(0, originIn + slipDelta),
+          out_point: Math.max(0.05, originOut + slipDelta),
           fade_in: originFadeIn,
           fade_out: originFadeOut,
         };
@@ -182,12 +188,12 @@ export function ClipBlock({
       }
 
       if (resolved === "trim-left") {
-        const maxIn = originOut - 0.05;
-        const newIn = Math.min(maxIn, Math.max(0, originIn + dt));
-        const oldDur = originOut - originIn;
-        const newDur = originOut - newIn;
+        const maxIn = originOut - 0.05 * originSpeed;
+        const newIn = Math.min(maxIn, Math.max(0, originIn + dt * originSpeed));
+        const oldMedia = originOut - originIn;
+        const newMedia = originOut - newIn;
         latest = {
-          start: Math.max(0, originStart + (oldDur - newDur)),
+          start: Math.max(0, originStart + (oldMedia - newMedia) / originSpeed),
           in_point: newIn,
           out_point: originOut,
           fade_in: originFadeIn,
@@ -197,8 +203,8 @@ export function ClipBlock({
         return;
       }
 
-      const minOut = originIn + 0.05;
-      const newOut = Math.max(minOut, originOut + dt);
+      const minOut = originIn + 0.05 * originSpeed;
+      const newOut = Math.max(minOut, originOut + dt * originSpeed);
       latest = {
         start: originStart,
         in_point: originIn,
@@ -249,7 +255,7 @@ export function ClipBlock({
           const newEdgeTime =
             edge === "left"
               ? latest.start
-              : latest.start + (latest.out_point - latest.in_point);
+              : latest.start + clipTimelineDuration({ ...latest, speed: originSpeed });
           onRippleTrim(edge, newEdgeTime);
         } else if (resolved === "trim-left") {
           onTrim(latest.in_point, latest.out_point, true);

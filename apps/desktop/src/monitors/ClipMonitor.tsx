@@ -2,15 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { subscribeBinDrag } from "../bin/binDrag";
 import { formatTime, type LibraryItem } from "../timeline/types";
+import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import type { PreviewAspect } from "./ProjectMonitor";
 
 type Props = {
   media: LibraryItem | null;
   aspect: PreviewAspect;
   onClose?: () => void;
+  onAddToTimeline?: (media: LibraryItem) => void;
 };
 
-export function ClipMonitor({ media, aspect, onClose }: Props) {
+export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -20,6 +22,7 @@ export function ClipMonitor({ media, aspect, onClose }: Props) {
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [fullView, setFullView] = useState(false);
+  const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
 
   const mode =
     media?.has_video ? ("video" as const) : media?.has_audio ? ("audio" as const) : ("empty" as const);
@@ -132,9 +135,49 @@ export function ClipMonitor({ media, aspect, onClose }: Props) {
     setTime(el.currentTime);
   }
 
+  const ctxItems: ContextMenuItem[] = [
+    {
+      type: "item",
+      label: playing ? "Pause" : "Play",
+      disabled: !src,
+      action: () => togglePlay(),
+    },
+    {
+      type: "item",
+      label: fullView ? "Exit full view" : "Full view",
+      action: () => setFullView((v) => !v),
+    },
+    ...(media && onAddToTimeline
+      ? ([
+          {
+            type: "item" as const,
+            label: "Add to timeline",
+            action: () => onAddToTimeline(media),
+          },
+        ] as ContextMenuItem[])
+      : []),
+    ...(onClose
+      ? ([
+          { type: "sep" as const },
+          {
+            type: "item" as const,
+            label: "Hide Clip Monitor",
+            action: () => {
+              setFullView(false);
+              onClose();
+            },
+          },
+        ] as ContextMenuItem[])
+      : []),
+  ];
+
   return (
     <div
       className={`monitor clip-monitor aspect-${aspect} ${dragOver ? "bin-drag-over" : ""} ${fullView ? "full-view" : ""}`}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setCtx({ x: e.clientX, y: e.clientY });
+      }}
     >
       <div className="monitor-label">
         <span>Clip Monitor</span>
@@ -232,6 +275,14 @@ export function ClipMonitor({ media, aspect, onClose }: Props) {
           }}
         />
       </div>
+      {ctx && (
+        <ContextMenuPopup
+          x={ctx.x}
+          y={ctx.y}
+          items={ctxItems}
+          onClose={() => setCtx(null)}
+        />
+      )}
     </div>
   );
 }

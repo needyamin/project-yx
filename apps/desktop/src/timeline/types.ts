@@ -34,15 +34,29 @@ export type Clip = {
   fade_in?: number;
   /** Fade-out duration before clip end (seconds). */
   fade_out?: number;
+  /** Play media backward within in/out (video export). */
+  reverse?: boolean;
+  /** Playback rate (1 = normal). Timeline length is (out-in)/speed. */
+  speed?: number;
   filters: { id: string; kind: string; enabled: boolean; params?: Record<string, unknown> }[];
 };
 
+/** Timeline duration for a clip, accounting for speed. */
+export function clipTimelineDuration(
+  clip: Pick<Clip, "in_point" | "out_point" | "speed">,
+): number {
+  const media = Math.max(0, (clip.out_point ?? 0) - (clip.in_point ?? 0));
+  const raw = clip.speed ?? 1;
+  const speed = Number.isFinite(raw) ? Math.min(4, Math.max(0.25, raw)) : 1;
+  return media / speed;
+}
+
 /** Linear 0..1 gain at timeline time for clip fades. */
 export function clipFadeGain(
-  clip: Pick<Clip, "start" | "in_point" | "out_point" | "fade_in" | "fade_out">,
+  clip: Pick<Clip, "start" | "in_point" | "out_point" | "fade_in" | "fade_out" | "speed">,
   time: number,
 ): number {
-  const dur = Math.max(0, (clip.out_point ?? 0) - (clip.in_point ?? 0));
+  const dur = clipTimelineDuration(clip);
   const local = time - clip.start;
   if (local < 0 || local >= dur) return 0;
   const fadeIn = Math.max(0, clip.fade_in ?? 0);
@@ -144,7 +158,7 @@ export function fileName(path: string): string {
 
 export function timelineDuration(timeline: Timeline, fallback = 10): number {
   const ends = timeline.tracks.flatMap((t) =>
-    t.clips.map((c) => c.start + (c.out_point - c.in_point)),
+    t.clips.map((c) => c.start + clipTimelineDuration(c)),
   );
   if (ends.length === 0) return fallback;
   return Math.max(1, ...ends);
@@ -154,7 +168,7 @@ export function clipAtPlayhead(timeline: Timeline, playhead: number, kind: "vide
   for (const track of timeline.tracks) {
     if (track.kind !== kind || track.muted || track.hidden) continue;
     for (const clip of track.clips) {
-      const end = clip.start + (clip.out_point - clip.in_point);
+      const end = clip.start + clipTimelineDuration(clip);
       if (playhead >= clip.start && playhead < end) {
         return { track, clip };
       }
@@ -197,7 +211,7 @@ export function findLinkPartner(
   for (const track of timeline.tracks) {
     if (track.kind !== wantKind || track.locked) continue;
     for (const c of track.clips) {
-      const end = c.start + (c.out_point - c.in_point);
+      const end = c.start + clipTimelineDuration(c);
       if (playhead >= c.start && playhead < end) return c;
     }
   }

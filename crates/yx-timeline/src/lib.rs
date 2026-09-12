@@ -91,12 +91,31 @@ pub struct Clip {
     /// Fade-out duration before clip end (seconds).
     #[serde(default)]
     pub fade_out: f64,
+    /// Play media backward within in/out (video export uses FFmpeg `reverse`).
+    #[serde(default)]
+    pub reverse: bool,
+    /// Playback rate (1.0 = normal). Timeline duration is `(out-in)/speed`.
+    #[serde(default = "default_clip_speed")]
+    pub speed: f64,
     pub filters: Vec<FilterInstance>,
 }
 
+fn default_clip_speed() -> f64 {
+    1.0
+}
+
 impl Clip {
+    pub fn clamped_speed(&self) -> f64 {
+        if self.speed.is_finite() {
+            self.speed.clamp(0.25, 4.0)
+        } else {
+            1.0
+        }
+    }
+
     pub fn duration(&self) -> f64 {
-        (self.out_point - self.in_point).max(0.0)
+        let media = (self.out_point - self.in_point).max(0.0);
+        media / self.clamped_speed()
     }
 
     pub fn end(&self) -> f64 {
@@ -153,11 +172,21 @@ pub enum FilterKind {
     Flip,
     Chromakey,
     Volume,
+    Equalizer,
+    Compressor,
+    Highpass,
+    Lowpass,
+    Gate,
+    /// Audio broadband noise reduction (FFmpeg afftdn).
+    Denoise,
+    Limiter,
+    Reverb,
+    Invert,
+    Pitch,
     /// Legacy / deferred stubs (kept for serde compatibility).
     Lut,
     Fade,
     Text,
-    Denoise,
 }
 
 impl FilterKind {
@@ -191,7 +220,31 @@ impl FilterKind {
                 "blend": 0.1
             }),
             Self::Volume => serde_json::json!({ "gain": 1.0 }),
-            Self::Lut | Self::Fade | Self::Text | Self::Denoise => serde_json::json!({}),
+            Self::Equalizer => serde_json::json!({
+                "bass": 0.0,
+                "mid": 0.0,
+                "treble": 0.0
+            }),
+            Self::Compressor => serde_json::json!({
+                "threshold": -20.0,
+                "ratio": 4.0,
+                "attack": 20.0,
+                "release": 250.0
+            }),
+            Self::Highpass => serde_json::json!({ "freq": 120.0 }),
+            Self::Lowpass => serde_json::json!({ "freq": 12000.0 }),
+            Self::Gate => serde_json::json!({
+                "threshold": -40.0,
+                "ratio": 10.0,
+                "attack": 10.0,
+                "release": 100.0
+            }),
+            Self::Denoise => serde_json::json!({ "nf": -25.0, "nr": 12.0 }),
+            Self::Limiter => serde_json::json!({ "limit": 0.95 }),
+            Self::Reverb => serde_json::json!({ "delay": 40.0, "decay": 0.3 }),
+            Self::Invert => serde_json::json!({}),
+            Self::Pitch => serde_json::json!({ "semitones": 0.0, "preset": "custom" }),
+            Self::Lut | Self::Fade | Self::Text => serde_json::json!({}),
         }
     }
 }
@@ -443,6 +496,16 @@ pub enum EditCommand {
         clip_id: ClipId,
         fade_in: f64,
         fade_out: f64,
+    },
+    /// Toggle reverse playback for a clip (video picture; export uses FFmpeg reverse).
+    SetClipReverse {
+        clip_id: ClipId,
+        reverse: bool,
+    },
+    /// Set playback speed (0.25–4.0). Retimes timeline duration to `(out-in)/speed`.
+    SetClipSpeed {
+        clip_id: ClipId,
+        speed: f64,
     },
     /// Slide source in/out by `delta` while keeping duration and timeline start fixed.
     SlipClip {
@@ -981,6 +1044,34 @@ impl TimelineEditor {
                     secondary_clip_id: None,
                 })
             }
+            EditCommand::SetClipReverse { clip_id, reverse } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                track.clips[idx].reverse = reverse;
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::SetClipSpeed { clip_id, speed } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let clip = &mut track.clips[idx];
+                clip.speed = if speed.is_finite() {
+                    speed.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                };
+                clip.clamp_fades();
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
             EditCommand::SlipClip {
                 clip_id,
                 delta,
@@ -1226,6 +1317,8 @@ impl TimelineEditor {
             linked_clip_id,
             fade_in: 0.0,
             fade_out: 0.0,
+            reverse: false,
+            speed: 1.0,
             filters: Vec::new(),
         });
         Timeline::sort_track(track);
@@ -1725,9 +1818,10 @@ impl TimelineEditor {
             });
         }
         let offset = at - left.start;
-        let split_source = left.in_point + offset;
+        let speed = left.clamped_speed();
+        let split_source = left.in_point + offset * speed;
         let left_dur = offset;
-        let right_dur = left.out_point - split_source;
+        let right_dur = (left.duration() - offset).max(0.0);
         // Left keeps fade_in; right keeps fade_out; clear the fade that no longer applies.
         track.clips[idx].out_point = split_source;
         track.clips[idx].linked_clip_id = left.linked_clip_id;
@@ -1745,6 +1839,8 @@ impl TimelineEditor {
             linked_clip_id: None,
             fade_in: 0.0,
             fade_out: left.fade_out.min(right_dur),
+            reverse: left.reverse,
+            speed: left.speed,
             filters: left.filters,
         };
         let right_id = right.id;
