@@ -2,6 +2,8 @@
 
 Open-source desktop video editor focused on **smooth editing on weak CPUs** and **4K / vertical export**, with a **minimal sticky UI** (bin, project monitor, timeline) and advanced tools tucked into menus.
 
+<img width="800" height="450" alt="Image" src="https://github.com/user-attachments/assets/28e1372d-7ab1-4865-ad84-99419bbb729e" />
+
 ## Stack
 
 - **Tauri 2** app shell
