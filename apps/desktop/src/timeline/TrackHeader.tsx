@@ -1,4 +1,5 @@
 import type { Track } from "./types";
+import { IconDelete, IconHide, IconLock, IconMute } from "./icons";
 
 type Props = {
   track: Track;
@@ -34,28 +35,32 @@ export function TrackHeader({
       <strong>{track.name}</strong>
       <div className="tl-header-actions">
         <button
-          className={track.muted ? "active danger" : ""}
+          type="button"
+          className={`tl-icon-btn xs ${track.muted ? "active danger" : ""}`}
           title={track.muted ? "Unmute" : "Mute"}
           onClick={onMute}
         >
-          M
+          <IconMute size={12} />
         </button>
         <button
-          className={`tl-header-extra ${track.locked ? "active" : ""}`}
+          type="button"
+          className={`tl-icon-btn xs ${track.locked ? "active" : ""}`}
           title={track.locked ? "Unlock" : "Lock"}
           onClick={onLock}
         >
-          L
+          <IconLock size={12} />
         </button>
         <button
-          className={`tl-header-extra ${track.hidden ? "active" : ""}`}
+          type="button"
+          className={`tl-icon-btn xs ${track.hidden ? "active" : ""}`}
           title={track.hidden ? "Show track" : "Hide track"}
           onClick={onHide}
         >
-          H
+          <IconHide size={12} />
         </button>
         <button
-          className="danger tl-header-extra"
+          type="button"
+          className="tl-icon-btn xs danger"
           title={
             canDelete
               ? `Delete ${track.kind} track`
@@ -64,7 +69,7 @@ export function TrackHeader({
           disabled={!canDelete || track.locked}
           onClick={onDelete}
         >
-          ×
+          <IconDelete size={12} />
         </button>
       </div>
     </div>

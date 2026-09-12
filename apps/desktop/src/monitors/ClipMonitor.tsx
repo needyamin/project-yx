@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { subscribeBinDrag } from "../bin/binDrag";
 import { formatTime, type LibraryItem } from "../timeline/types";
 import type { PreviewAspect } from "./ProjectMonitor";
 
@@ -14,9 +15,12 @@ export function ClipMonitor({ media, aspect }: Props) {
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   const mode =
     media?.has_video ? ("video" as const) : media?.has_audio ? ("audio" as const) : ("empty" as const);
+
+  const duration = Math.max(0.001, media?.duration ?? 0);
 
   const src = (() => {
     if (!media?.path) return null;
@@ -26,6 +30,17 @@ export function ClipMonitor({ media, aspect }: Props) {
       return null;
     }
   })();
+
+  useEffect(() => {
+    return subscribeBinDrag((session) => {
+      if (!session?.active) {
+        setDragOver(false);
+        return;
+      }
+      const el = document.elementFromPoint(session.clientX, session.clientY);
+      setDragOver(Boolean(el?.closest(".clip-monitor")));
+    });
+  }, []);
 
   useEffect(() => {
     setPlaying(false);
@@ -82,9 +97,19 @@ export function ClipMonitor({ media, aspect }: Props) {
     else el.pause();
   }
 
+  function seekRatio(ratio: number) {
+    const el = mode === "video" ? videoRef.current : mode === "audio" ? audioRef.current : null;
+    if (!el || !src) return;
+    el.currentTime = ratio * duration;
+    setTime(el.currentTime);
+  }
+
   return (
-    <div className={`monitor clip-monitor aspect-${aspect}`}>
-      <div className="monitor-label">Clip Monitor</div>
+    <div className={`monitor clip-monitor aspect-${aspect} ${dragOver ? "bin-drag-over" : ""}`}>
+      <div className="monitor-label">
+        <span>Clip Monitor</span>
+        {media && <span className="monitor-sub">{media.name}</span>}
+      </div>
       <div className="monitor-stage">
         <div className={`monitor-frame ${aspect === "tiktok" ? "phone" : "wide"}`}>
           <video
@@ -104,20 +129,28 @@ export function ClipMonitor({ media, aspect }: Props) {
           </div>
           {mode === "empty" && (
             <div className="monitor-empty">
-              <p>Select a clip in the Project Bin</p>
+              <p>Select or drop a clip from the Project Bin</p>
             </div>
           )}
+          {dragOver && <div className="monitor-drop-hint">Drop to preview</div>}
         </div>
         {error && <div className="preview-error">{error}</div>}
       </div>
       <div className="monitor-transport">
-        <button className="play-btn sm" onClick={togglePlay} disabled={!src}>
+        <button type="button" className="play-btn sm" onClick={togglePlay} disabled={!src}>
           {playing ? "❚❚" : "▶"}
         </button>
         <span className="timecode">{formatTime(time)}</span>
-        <span className="timecode muted-tc">
-          / {formatTime(media?.duration ?? 0)}
-        </span>
+        <input
+          className="scrub"
+          type="range"
+          min={0}
+          max={1000}
+          value={Math.round((time / duration) * 1000)}
+          disabled={!src}
+          onChange={(e) => seekRatio(Number(e.target.value) / 1000)}
+        />
+        <span className="timecode muted-tc">{formatTime(media?.duration ?? 0)}</span>
       </div>
     </div>
   );

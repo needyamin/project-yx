@@ -22,6 +22,12 @@ pub enum TimelineError {
     MediaTrackMismatch,
     #[error("cannot remove the last {0} track")]
     LastTrack(&'static str),
+    #[error("cannot link: need one video and one audio clip")]
+    InvalidLink,
+    #[error("no zone set")]
+    NoZone,
+    #[error("no gap at that position")]
+    NoGap,
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("nothing to redo")]
@@ -67,6 +73,9 @@ pub struct Marker {
 pub struct Clip {
     pub id: ClipId,
     pub media_path: String,
+    /// Original source file for export (when `media_path` is a proxy).
+    #[serde(default)]
+    pub source_path: Option<String>,
     /// Position on the timeline (seconds).
     pub start: f64,
     /// Source in-point (seconds).
@@ -76,6 +85,12 @@ pub struct Clip {
     pub role: MediaRole,
     /// Linked partner clip (video↔audio). Kept in sync for move/trim/split.
     pub linked_clip_id: Option<ClipId>,
+    /// Fade-in duration from clip start (seconds).
+    #[serde(default)]
+    pub fade_in: f64,
+    /// Fade-out duration before clip end (seconds).
+    #[serde(default)]
+    pub fade_out: f64,
     pub filters: Vec<FilterInstance>,
 }
 
@@ -86,6 +101,35 @@ impl Clip {
 
     pub fn end(&self) -> f64 {
         self.start + self.duration()
+    }
+
+    /// Clamp fade_in/fade_out so they fit within clip duration.
+    pub fn clamp_fades(&mut self) {
+        let dur = self.duration();
+        self.fade_in = self.fade_in.max(0.0).min(dur);
+        self.fade_out = self.fade_out.max(0.0).min(dur);
+        if self.fade_in + self.fade_out > dur {
+            // Prefer keeping fade_in; shrink fade_out.
+            self.fade_out = (dur - self.fade_in).max(0.0);
+        }
+    }
+
+    /// Linear gain 0..1 at an absolute timeline time.
+    pub fn fade_gain_at(&self, time: f64) -> f64 {
+        let local = time - self.start;
+        let dur = self.duration();
+        if local < 0.0 || local >= dur {
+            return 0.0;
+        }
+        let mut g = 1.0;
+        if self.fade_in > 1e-6 && local < self.fade_in {
+            g = (local / self.fade_in).clamp(0.0, 1.0);
+        }
+        if self.fade_out > 1e-6 && local > dur - self.fade_out {
+            let out_g = ((dur - local) / self.fade_out).clamp(0.0, 1.0);
+            g = g.min(out_g);
+        }
+        g
     }
 }
 
@@ -100,20 +144,55 @@ pub struct FilterInstance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterKind {
+    Transform,
+    Crop,
     Exposure,
     Contrast,
+    Saturation,
+    Blur,
+    Flip,
+    Chromakey,
+    Volume,
+    /// Legacy / deferred stubs (kept for serde compatibility).
     Lut,
-    Crop,
     Fade,
     Text,
-    /// Heavy filters — may be skipped in potato-tier preview.
-    Blur,
     Denoise,
 }
 
 impl FilterKind {
     pub fn is_heavy(self) -> bool {
-        matches!(self, Self::Blur | Self::Denoise | Self::Lut)
+        matches!(self, Self::Blur | Self::Denoise | Self::Lut | Self::Chromakey)
+    }
+
+    pub fn default_params(self) -> serde_json::Value {
+        match self {
+            Self::Transform => serde_json::json!({
+                "x": 0.0,
+                "y": 0.0,
+                "scale": 1.0,
+                "rotation": 0.0,
+                "opacity": 1.0
+            }),
+            Self::Crop => serde_json::json!({
+                "left": 0.0,
+                "top": 0.0,
+                "right": 0.0,
+                "bottom": 0.0
+            }),
+            Self::Exposure => serde_json::json!({ "amount": 0.0 }),
+            Self::Contrast => serde_json::json!({ "amount": 1.0 }),
+            Self::Saturation => serde_json::json!({ "amount": 1.0 }),
+            Self::Blur => serde_json::json!({ "radius": 0.0 }),
+            Self::Flip => serde_json::json!({ "horizontal": false, "vertical": false }),
+            Self::Chromakey => serde_json::json!({
+                "color": "#00ff00",
+                "similarity": 0.3,
+                "blend": 0.1
+            }),
+            Self::Volume => serde_json::json!({ "gain": 1.0 }),
+            Self::Lut | Self::Fade | Self::Text | Self::Denoise => serde_json::json!({}),
+        }
     }
 }
 
@@ -265,6 +344,8 @@ pub enum EditCommand {
     AddClip {
         track_id: TrackId,
         media_path: String,
+        #[serde(default)]
+        source_path: Option<String>,
         start: f64,
         in_point: f64,
         out_point: f64,
@@ -276,6 +357,8 @@ pub enum EditCommand {
         video_track_id: TrackId,
         audio_track_id: TrackId,
         media_path: String,
+        #[serde(default)]
+        source_path: Option<String>,
         start: f64,
         in_point: f64,
         out_point: f64,
@@ -341,6 +424,26 @@ pub enum EditCommand {
         kind: FilterKind,
         params: serde_json::Value,
     },
+    UpdateFilter {
+        clip_id: ClipId,
+        filter_id: Uuid,
+        params: serde_json::Value,
+    },
+    SetFilterEnabled {
+        clip_id: ClipId,
+        filter_id: Uuid,
+        enabled: bool,
+    },
+    RemoveFilter {
+        clip_id: ClipId,
+        filter_id: Uuid,
+    },
+    /// Set Kdenlive-style fade-in / fade-out durations (seconds).
+    SetClipFades {
+        clip_id: ClipId,
+        fade_in: f64,
+        fade_out: f64,
+    },
     /// Slide source in/out by `delta` while keeping duration and timeline start fixed.
     SlipClip {
         clip_id: ClipId,
@@ -348,10 +451,21 @@ pub enum EditCommand {
         sync_linked: bool,
     },
     /// Shift clips with `start >= at` by `delta` on one track, or all unlocked tracks.
+    /// Negative deltas are clamped so clips cannot overlap earlier ones.
     SpacerShift {
         track_id: Option<TrackId>,
         at: f64,
         delta: f64,
+    },
+    /// Close the empty gap under `at` (spacer remover) on one track or all unlocked tracks.
+    CloseGap {
+        track_id: Option<TrackId>,
+        at: f64,
+    },
+    /// Pack clips left from `from`, removing all gaps (space / gap fill).
+    RemoveGaps {
+        track_id: Option<TrackId>,
+        from: f64,
     },
     /// Trim an edge to an absolute timeline time and ripple following clips.
     RippleTrim {
@@ -428,6 +542,7 @@ impl TimelineEditor {
             EditCommand::AddClip {
                 track_id,
                 media_path,
+                source_path,
                 start,
                 in_point,
                 out_point,
@@ -437,6 +552,7 @@ impl TimelineEditor {
                 let id = self.insert_clip(
                     track_id,
                     media_path,
+                    source_path,
                     start,
                     in_point,
                     out_point,
@@ -452,6 +568,7 @@ impl TimelineEditor {
                 video_track_id,
                 audio_track_id,
                 media_path,
+                source_path,
                 start,
                 in_point,
                 out_point,
@@ -462,6 +579,7 @@ impl TimelineEditor {
                     video_track_id,
                     video_id,
                     media_path.clone(),
+                    source_path.clone(),
                     start,
                     in_point,
                     out_point,
@@ -472,6 +590,7 @@ impl TimelineEditor {
                     audio_track_id,
                     audio_id,
                     media_path,
+                    source_path,
                     start,
                     in_point,
                     out_point,
@@ -554,11 +673,12 @@ impl TimelineEditor {
                         // Right trim or free trim: keep start; duration follows out-in.
                         let _ = (old_in, old_out);
                     }
+                    clip.clamp_fades();
                     clip.linked_clip_id
                 };
                 if sync_linked {
                     if let Some(link) = linked {
-                        let _ = self.apply_trim_values(link, in_point, out_point, keep_end);
+                        self.apply_trim_values(link, in_point, out_point, keep_end)?;
                     }
                 }
                 Ok(EditResult {
@@ -571,25 +691,10 @@ impl TimelineEditor {
                 new_start,
                 sync_linked,
             } => {
-                // Insert/Overwrite move ripples are deferred for this phase.
-                let linked = {
-                    let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
-                    if track.locked {
-                        return Err(TimelineError::TrackLocked);
-                    }
-                    let linked = track.clips[idx].linked_clip_id;
-                    track.clips[idx].start = new_start.max(0.0);
-                    Timeline::sort_track(track);
-                    linked
-                };
+                let (_track_id, linked, placed) = self.move_clip_one(clip_id, new_start)?;
                 if sync_linked {
                     if let Some(link) = linked {
-                        if let Ok((track, idx)) = self.timeline.find_clip_mut(link) {
-                            if !track.locked {
-                                track.clips[idx].start = new_start.max(0.0);
-                                Timeline::sort_track(track);
-                            }
-                        }
+                        self.set_clip_start_absolute(link, placed)?;
                     }
                 }
                 Ok(EditResult {
@@ -624,6 +729,35 @@ impl TimelineEditor {
                 })
             }
             EditCommand::LinkClips { clip_a, clip_b } => {
+                if clip_a == clip_b {
+                    return Err(TimelineError::InvalidLink);
+                }
+                let (role_a, prev_a, track_a) = {
+                    let (t, i) = self.timeline.find_clip(clip_a)?;
+                    (t.clips[i].role, t.clips[i].linked_clip_id, t.id)
+                };
+                let (role_b, prev_b, track_b) = {
+                    let (t, i) = self.timeline.find_clip(clip_b)?;
+                    (t.clips[i].role, t.clips[i].linked_clip_id, t.id)
+                };
+                if track_a == track_b {
+                    return Err(TimelineError::InvalidLink);
+                }
+                let ok = matches!(
+                    (role_a, role_b),
+                    (MediaRole::Video, MediaRole::Audio) | (MediaRole::Audio, MediaRole::Video)
+                );
+                if !ok {
+                    return Err(TimelineError::InvalidLink);
+                }
+                // Clear previous partners.
+                for prev in [prev_a, prev_b].into_iter().flatten() {
+                    if prev != clip_a && prev != clip_b {
+                        if let Ok((t, i)) = self.timeline.find_clip_mut(prev) {
+                            t.clips[i].linked_clip_id = None;
+                        }
+                    }
+                }
                 {
                     let (t, i) = self.timeline.find_clip_mut(clip_a)?;
                     t.clips[i].linked_clip_id = Some(clip_b);
@@ -749,12 +883,99 @@ impl TimelineEditor {
                 params,
             } => {
                 let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let mut merged = kind.default_params();
+                if let (Some(obj), Some(def)) = (params.as_object(), merged.as_object_mut()) {
+                    for (k, v) in obj {
+                        def.insert(k.clone(), v.clone());
+                    }
+                }
                 track.clips[idx].filters.push(FilterInstance {
                     id: Uuid::new_v4(),
                     kind,
                     enabled: true,
-                    params,
+                    params: merged,
                 });
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::UpdateFilter {
+                clip_id,
+                filter_id,
+                params,
+            } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let clip = &mut track.clips[idx];
+                let Some(f) = clip.filters.iter_mut().find(|f| f.id == filter_id) else {
+                    return Err(TimelineError::ClipNotFound(clip_id));
+                };
+                if let (Some(incoming), Some(existing)) =
+                    (params.as_object(), f.params.as_object_mut())
+                {
+                    for (k, v) in incoming {
+                        existing.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    f.params = params;
+                }
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::SetFilterEnabled {
+                clip_id,
+                filter_id,
+                enabled,
+            } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let clip = &mut track.clips[idx];
+                let Some(f) = clip.filters.iter_mut().find(|f| f.id == filter_id) else {
+                    return Err(TimelineError::ClipNotFound(clip_id));
+                };
+                f.enabled = enabled;
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::RemoveFilter {
+                clip_id,
+                filter_id,
+            } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                track.clips[idx].filters.retain(|f| f.id != filter_id);
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::SetClipFades {
+                clip_id,
+                fade_in,
+                fade_out,
+            } => {
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let clip = &mut track.clips[idx];
+                clip.fade_in = fade_in;
+                clip.fade_out = fade_out;
+                clip.clamp_fades();
                 Ok(EditResult {
                     primary_clip_id: Some(clip_id),
                     secondary_clip_id: None,
@@ -768,7 +989,7 @@ impl TimelineEditor {
                 let linked = self.slip_one(clip_id, delta)?;
                 if sync_linked {
                     if let Some(link) = linked {
-                        let _ = self.slip_one(link, delta);
+                        self.slip_one(link, delta)?;
                     }
                 }
                 Ok(EditResult {
@@ -787,7 +1008,10 @@ impl TimelineEditor {
                         if track.locked {
                             return Err(TimelineError::TrackLocked);
                         }
-                        self.shift_clips_after(tid, at, delta)?;
+                        let clamped = Self::clamp_spacer_delta(track, at, delta);
+                        if clamped.abs() > 1e-9 {
+                            self.shift_clips_after(tid, at, clamped)?;
+                        }
                     }
                     None => {
                         let ids: Vec<TrackId> = self
@@ -798,7 +1022,56 @@ impl TimelineEditor {
                             .map(|t| t.id)
                             .collect();
                         for tid in ids {
-                            self.shift_clips_after(tid, at, delta)?;
+                            let track = self
+                                .timeline
+                                .tracks
+                                .iter()
+                                .find(|t| t.id == tid)
+                                .ok_or(TimelineError::TrackNotFound(tid))?;
+                            let clamped = Self::clamp_spacer_delta(track, at, delta);
+                            if clamped.abs() > 1e-9 {
+                                self.shift_clips_after(tid, at, clamped)?;
+                            }
+                        }
+                    }
+                }
+                Ok(EditResult {
+                    primary_clip_id: None,
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::CloseGap { track_id, at } => {
+                match track_id {
+                    Some(tid) => {
+                        self.close_gap_on_track(tid, at)?;
+                    }
+                    None => {
+                        let ids = self.unlocked_track_ids();
+                        let mut closed = false;
+                        let mut last_err = TimelineError::NoGap;
+                        for tid in ids {
+                            match self.close_gap_on_track(tid, at) {
+                                Ok(()) => closed = true,
+                                Err(TimelineError::NoGap) => {}
+                                Err(e) => last_err = e,
+                            }
+                        }
+                        if !closed {
+                            return Err(last_err);
+                        }
+                    }
+                }
+                Ok(EditResult {
+                    primary_clip_id: None,
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::RemoveGaps { track_id, from } => {
+                match track_id {
+                    Some(tid) => self.remove_gaps_on_track(tid, from)?,
+                    None => {
+                        for tid in self.unlocked_track_ids() {
+                            self.remove_gaps_on_track(tid, from)?;
                         }
                     }
                 }
@@ -816,7 +1089,7 @@ impl TimelineEditor {
                 let linked = self.ripple_trim_one(clip_id, edge, new_edge_time)?;
                 if sync_linked {
                     if let Some(link) = linked {
-                        let _ = self.ripple_trim_one(link, edge, new_edge_time);
+                        self.ripple_trim_one(link, edge, new_edge_time)?;
                     }
                 }
                 Ok(EditResult {
@@ -875,6 +1148,7 @@ impl TimelineEditor {
         &mut self,
         track_id: TrackId,
         media_path: String,
+        source_path: Option<String>,
         start: f64,
         in_point: f64,
         out_point: f64,
@@ -886,6 +1160,7 @@ impl TimelineEditor {
             track_id,
             id,
             media_path,
+            source_path,
             start,
             in_point,
             out_point,
@@ -901,6 +1176,7 @@ impl TimelineEditor {
         track_id: TrackId,
         id: ClipId,
         media_path: String,
+        source_path: Option<String>,
         start: f64,
         in_point: f64,
         out_point: f64,
@@ -942,11 +1218,14 @@ impl TimelineEditor {
         track.clips.push(Clip {
             id,
             media_path,
+            source_path,
             start,
             in_point,
             out_point,
             role,
             linked_clip_id,
+            fade_in: 0.0,
+            fade_out: 0.0,
             filters: Vec::new(),
         });
         Timeline::sort_track(track);
@@ -999,6 +1278,216 @@ impl TimelineEditor {
         Ok(())
     }
 
+    /// How much empty space sits under `at` (between previous clip end and next start).
+    fn gap_bounds_on_track(track: &Track, at: f64) -> Option<(f64, f64)> {
+        let mut clips: Vec<&Clip> = track.clips.iter().collect();
+        clips.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut prev_end = 0.0_f64;
+        for clip in clips {
+            if at + 1e-9 < clip.start && at + 1e-9 >= prev_end {
+                if clip.start - prev_end > 1e-6 {
+                    return Some((prev_end, clip.start));
+                }
+            }
+            if at + 1e-9 >= clip.start && at < clip.end() - 1e-9 {
+                // Inside a clip — no removable gap at this point.
+                return None;
+            }
+            prev_end = prev_end.max(clip.end());
+        }
+        None
+    }
+
+    fn clamp_spacer_delta(track: &Track, at: f64, delta: f64) -> f64 {
+        if delta >= 0.0 {
+            return delta;
+        }
+        let Some((gap_start, gap_end)) = Self::gap_bounds_on_track(track, at) else {
+            return 0.0;
+        };
+        let avail = (gap_end - gap_start).max(0.0);
+        delta.max(-avail)
+    }
+
+    fn close_gap_on_track(&mut self, track_id: TrackId, at: f64) -> Result<(), TimelineError> {
+        let (gap_start, gap_end) = {
+            let track = self
+                .timeline
+                .tracks
+                .iter()
+                .find(|t| t.id == track_id)
+                .ok_or(TimelineError::TrackNotFound(track_id))?;
+            if track.locked {
+                return Err(TimelineError::TrackLocked);
+            }
+            Self::gap_bounds_on_track(track, at).ok_or(TimelineError::NoGap)?
+        };
+        let gap = gap_end - gap_start;
+        if gap <= 1e-6 {
+            return Err(TimelineError::NoGap);
+        }
+        self.shift_clips_after(track_id, gap_end, -gap)?;
+        Ok(())
+    }
+
+    fn remove_gaps_on_track(&mut self, track_id: TrackId, from: f64) -> Result<(), TimelineError> {
+        let track = self.timeline.track_mut(track_id)?;
+        if track.locked {
+            return Err(TimelineError::TrackLocked);
+        }
+        Timeline::sort_track(track);
+        let from = from.max(0.0);
+        // Cursor starts at `from`, but never before the end of clips that finish before `from`.
+        let mut cursor = from;
+        for clip in track.clips.iter() {
+            if clip.end() <= from + 1e-9 {
+                cursor = cursor.max(clip.end());
+            }
+        }
+        for clip in track.clips.iter_mut() {
+            if clip.start + 1e-9 < from {
+                continue;
+            }
+            let dur = clip.duration();
+            clip.start = cursor;
+            cursor = clip.start + dur;
+        }
+        Timeline::sort_track(track);
+        Ok(())
+    }
+
+    /// Move one clip, respecting edit mode so pieces do not stack on top of each other.
+    /// Returns `(track_id, linked_id, resolved_start)`.
+    fn move_clip_one(
+        &mut self,
+        clip_id: ClipId,
+        new_start: f64,
+    ) -> Result<(TrackId, Option<ClipId>, f64), TimelineError> {
+        let mode = self.timeline.edit_mode;
+        let (track_id, linked, dur, old_start, clip_snapshot) = {
+            let (track, idx) = self.timeline.find_clip(clip_id)?;
+            if track.locked {
+                return Err(TimelineError::TrackLocked);
+            }
+            let clip = track.clips[idx].clone();
+            (
+                track.id,
+                clip.linked_clip_id,
+                clip.duration(),
+                clip.start,
+                clip,
+            )
+        };
+
+        let desired = new_start.max(0.0);
+        if (desired - old_start).abs() < 1e-9 {
+            return Ok((track_id, linked, old_start));
+        }
+
+        // Lift the clip off the track first so collision logic ignores it.
+        {
+            let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+            track.clips.remove(idx);
+        }
+
+        let placed = match mode {
+            EditMode::Normal => {
+                let start = self.resolve_non_overlapping_start(track_id, desired, dur)?;
+                start
+            }
+            EditMode::Insert => {
+                // Close the hole left behind, then open space at the drop point.
+                if desired > old_start {
+                    // Moving right: close old hole, then push at destination.
+                    self.shift_clips_after(track_id, old_start + 1e-9, -dur)?;
+                    self.shift_clips_after(track_id, desired, dur)?;
+                    desired
+                } else {
+                    // Moving left: push at destination first, then close old hole
+                    // (old hole index shifts by +dur for clips that were after old_start).
+                    self.shift_clips_after(track_id, desired, dur)?;
+                    self.shift_clips_after(track_id, old_start + dur + 1e-9, -dur)?;
+                    desired
+                }
+            }
+            EditMode::Overwrite => {
+                self.overwrite_range(track_id, desired, desired + dur)?;
+                desired
+            }
+        };
+
+        let track = self.timeline.track_mut(track_id)?;
+        track.clips.push(Clip {
+            start: placed,
+            ..clip_snapshot
+        });
+        Timeline::sort_track(track);
+        Ok((track_id, linked, placed))
+    }
+
+    /// Force a clip onto an absolute timeline start (used for linked A/V sync).
+    fn set_clip_start_absolute(
+        &mut self,
+        clip_id: ClipId,
+        start: f64,
+    ) -> Result<(), TimelineError> {
+        let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+        if track.locked {
+            return Err(TimelineError::TrackLocked);
+        }
+        track.clips[idx].start = start.max(0.0);
+        Timeline::sort_track(track);
+        Ok(())
+    }
+
+    /// Find a start time near `desired` where `[start, start+dur)` does not overlap others.
+    fn resolve_non_overlapping_start(
+        &self,
+        track_id: TrackId,
+        desired: f64,
+        dur: f64,
+    ) -> Result<f64, TimelineError> {
+        let track = self
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or(TimelineError::TrackNotFound(track_id))?;
+
+        let mut start = desired.max(0.0);
+        for _ in 0..64 {
+            let end = start + dur;
+            let mut conflict: Option<&Clip> = None;
+            for other in &track.clips {
+                let o_end = other.end();
+                let overlaps = start < o_end - 1e-9 && end > other.start + 1e-9;
+                if overlaps {
+                    conflict = Some(other);
+                    break;
+                }
+            }
+            let Some(other) = conflict else {
+                return Ok(start);
+            };
+            let snap_after = other.end();
+            let snap_before = (other.start - dur).max(0.0);
+            let use_before =
+                (desired - snap_before).abs() <= (desired - snap_after).abs() && snap_before >= 0.0;
+            let next = if use_before { snap_before } else { snap_after };
+            if (next - start).abs() < 1e-9 {
+                // Stuck — force after.
+                start = snap_after;
+            } else {
+                start = next;
+            }
+        }
+        Ok(start.max(0.0))
+    }
+
     fn apply_trim_values(
         &mut self,
         clip_id: ClipId,
@@ -1018,6 +1507,7 @@ impl TimelineEditor {
             let new_dur = clip.duration();
             clip.start = (clip.start + (old_dur - new_dur)).max(0.0);
         }
+        clip.clamp_fades();
         Ok(())
     }
 
@@ -1091,6 +1581,11 @@ impl TimelineEditor {
                 }
             }
         };
+
+        // Clamp fades after duration change.
+        if let Ok((track, idx)) = self.timeline.find_clip_mut(clip_id) {
+            track.clips[idx].clamp_fades();
+        }
 
         self.shift_clips_after(track_id, shift_after, shift_delta)?;
         Ok(linked)
@@ -1194,7 +1689,7 @@ impl TimelineEditor {
 
     fn lift_zone(&mut self) -> Result<(), TimelineError> {
         let Some((zone_in, zone_out)) = self.zone_bounds() else {
-            return Ok(());
+            return Err(TimelineError::NoZone);
         };
         for tid in self.unlocked_track_ids() {
             self.overwrite_range(tid, zone_in, zone_out)?;
@@ -1204,10 +1699,13 @@ impl TimelineEditor {
 
     fn extract_zone(&mut self) -> Result<(), TimelineError> {
         let Some((zone_in, zone_out)) = self.zone_bounds() else {
-            return Ok(());
+            return Err(TimelineError::NoZone);
         };
         let zone_dur = zone_out - zone_in;
-        self.lift_zone()?;
+        // Clear zone temporarily so nested lift doesn't fail — we already validated.
+        for tid in self.unlocked_track_ids() {
+            self.overwrite_range(tid, zone_in, zone_out)?;
+        }
         for tid in self.unlocked_track_ids() {
             self.shift_clips_after(tid, zone_out, -zone_dur)?;
         }
@@ -1228,17 +1726,25 @@ impl TimelineEditor {
         }
         let offset = at - left.start;
         let split_source = left.in_point + offset;
+        let left_dur = offset;
+        let right_dur = left.out_point - split_source;
+        // Left keeps fade_in; right keeps fade_out; clear the fade that no longer applies.
         track.clips[idx].out_point = split_source;
-        // Left piece keeps link; right gets new id (relinked by caller if needed).
         track.clips[idx].linked_clip_id = left.linked_clip_id;
+        track.clips[idx].fade_in = left.fade_in.min(left_dur);
+        track.clips[idx].fade_out = 0.0;
+        track.clips[idx].clamp_fades();
         let right = Clip {
             id: Uuid::new_v4(),
             media_path: left.media_path,
+            source_path: left.source_path,
             start: at,
             in_point: split_source,
             out_point: left.out_point,
             role: left.role,
             linked_clip_id: None,
+            fade_in: 0.0,
+            fade_out: left.fade_out.min(right_dur),
             filters: left.filters,
         };
         let right_id = right.id;
@@ -1283,6 +1789,7 @@ mod tests {
                 video_track_id: v1,
                 audio_track_id: a1,
                 media_path: "clip.mp4".into(),
+                source_path: None,
                 start: 0.0,
                 in_point: 0.0,
                 out_point: 10.0,
@@ -1313,6 +1820,7 @@ mod tests {
             .apply(EditCommand::AddClip {
                 track_id: v1,
                 media_path: "song.mp3".into(),
+                source_path: None,
                 start: 0.0,
                 in_point: 0.0,
                 out_point: 5.0,
@@ -1321,6 +1829,58 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, TimelineError::MediaTrackMismatch));
+    }
+
+    #[test]
+    fn move_does_not_overlap_in_normal_mode() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let left = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 5.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 5.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+
+        // Drag left piece onto the right piece — should snap beside it, not stack.
+        ed.apply(EditCommand::MoveClip {
+            clip_id: left,
+            new_start: 7.0,
+            sync_linked: false,
+        })
+        .unwrap();
+
+        let clips = &ed.timeline.tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        let a = clips.iter().find(|c| c.media_path == "a.mp4").unwrap();
+        let b = clips.iter().find(|c| c.media_path == "b.mp4").unwrap();
+        assert!(
+            a.end() <= b.start + 1e-6 || b.end() <= a.start + 1e-6,
+            "clips overlap: a=[{}, {}) b=[{}, {})",
+            a.start,
+            a.end(),
+            b.start,
+            b.end()
+        );
     }
 
     #[test]
@@ -1333,6 +1893,7 @@ mod tests {
                 video_track_id: v1,
                 audio_track_id: a1,
                 media_path: "clip.mp4".into(),
+                source_path: None,
                 start: 0.0,
                 in_point: 0.0,
                 out_point: 8.0,
@@ -1363,6 +1924,7 @@ mod tests {
             .apply(EditCommand::AddClip {
                 track_id: v1,
                 media_path: "clip.mp4".into(),
+                source_path: None,
                 start: 0.0,
                 in_point: 0.0,
                 out_point: 10.0,
@@ -1392,6 +1954,7 @@ mod tests {
             .apply(EditCommand::AddClip {
                 track_id: v1,
                 media_path: "clip.mp4".into(),
+                source_path: None,
                 start: 2.0,
                 in_point: 1.0,
                 out_point: 6.0,
@@ -1435,6 +1998,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "a.mp4".into(),
+            source_path: None,
             start: 0.0,
             in_point: 0.0,
             out_point: 2.0,
@@ -1445,6 +2009,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "b.mp4".into(),
+            source_path: None,
             start: 5.0,
             in_point: 0.0,
             out_point: 3.0,
@@ -1455,6 +2020,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "c.mp4".into(),
+            source_path: None,
             start: 10.0,
             in_point: 0.0,
             out_point: 1.0,
@@ -1484,6 +2050,7 @@ mod tests {
             .apply(EditCommand::AddClip {
                 track_id: v1,
                 media_path: "a.mp4".into(),
+                source_path: None,
                 start: 0.0,
                 in_point: 0.0,
                 out_point: 10.0,
@@ -1496,6 +2063,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "b.mp4".into(),
+            source_path: None,
             start: 10.0,
             in_point: 0.0,
             out_point: 4.0,
@@ -1525,6 +2093,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "long.mp4".into(),
+            source_path: None,
             start: 0.0,
             in_point: 0.0,
             out_point: 20.0,
@@ -1557,6 +2126,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "existing.mp4".into(),
+            source_path: None,
             start: 5.0,
             in_point: 0.0,
             out_point: 4.0,
@@ -1572,6 +2142,7 @@ mod tests {
         ed.apply(EditCommand::AddClip {
             track_id: v1,
             media_path: "insert.mp4".into(),
+            source_path: None,
             start: 5.0,
             in_point: 0.0,
             out_point: 3.0,
@@ -1613,5 +2184,698 @@ mod tests {
             .apply(EditCommand::RemoveTrack { track_id: last })
             .unwrap_err();
         assert!(matches!(err, TimelineError::LastTrack("video")));
+    }
+
+    #[test]
+    fn link_unlink_opposite_roles() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let vid = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "v.mp4".into(),
+                source_path: Some("orig.mp4".into()),
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 5.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        let aid = ed
+            .apply(EditCommand::AddClip {
+                track_id: a1,
+                media_path: "v.mp4".into(),
+                source_path: Some("orig.mp4".into()),
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 5.0,
+                role: MediaRole::Audio,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+
+        ed.apply(EditCommand::LinkClips {
+            clip_a: vid,
+            clip_b: aid,
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips[0].linked_clip_id, Some(aid));
+        let audio = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        assert_eq!(audio.clips[0].linked_clip_id, Some(vid));
+        assert_eq!(
+            ed.timeline.tracks[0].clips[0].source_path.as_deref(),
+            Some("orig.mp4")
+        );
+
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
+            .unwrap();
+        assert!(ed.timeline.tracks[0].clips[0].linked_clip_id.is_none());
+        let audio = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        assert!(audio.clips[0].linked_clip_id.is_none());
+    }
+
+    #[test]
+    fn link_rejects_same_role_and_same_track() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 2.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        let b = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "b.mp4".into(),
+                source_path: None,
+                start: 2.0,
+                in_point: 0.0,
+                out_point: 2.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        let err = ed
+            .apply(EditCommand::LinkClips {
+                clip_a: a,
+                clip_b: b,
+            })
+            .unwrap_err();
+        assert!(matches!(err, TimelineError::InvalidLink));
+    }
+
+    #[test]
+    fn split_syncs_linked_pair() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let res = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "pair.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 10.0,
+            })
+            .unwrap();
+        let vid = res.primary_clip_id.unwrap();
+        ed.apply(EditCommand::SplitClip {
+            clip_id: vid,
+            at: 4.0,
+            sync_linked: true,
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips.len(), 2);
+        let audio = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        assert_eq!(audio.clips.len(), 2);
+        // Right-hand pair re-linked.
+        let v_right = &ed.timeline.tracks[0].clips[1];
+        let a_right = &audio.clips[1];
+        assert_eq!(v_right.linked_clip_id, Some(a_right.id));
+        assert_eq!(a_right.linked_clip_id, Some(v_right.id));
+    }
+
+    #[test]
+    fn lift_and_extract_empty_zone_are_noop_errors() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "x.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        let before = ed.timeline.clone();
+        assert!(matches!(
+            ed.apply(EditCommand::LiftZone).unwrap_err(),
+            TimelineError::NoZone
+        ));
+        assert_eq!(ed.timeline.tracks[0].clips.len(), before.tracks[0].clips.len());
+        assert!((ed.timeline.tracks[0].clips[0].start - before.tracks[0].clips[0].start).abs() < 1e-9);
+
+        assert!(matches!(
+            ed.apply(EditCommand::ExtractZone).unwrap_err(),
+            TimelineError::NoZone
+        ));
+        assert_eq!(ed.timeline.tracks[0].clips.len(), 1);
+    }
+
+    #[test]
+    fn lift_zone_leaves_gap() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "long.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 20.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SetZone {
+            zone_in: Some(5.0),
+            zone_out: Some(12.0),
+        })
+        .unwrap();
+        ed.apply(EditCommand::LiftZone).unwrap();
+        let clips = &ed.timeline.tracks[0].clips;
+        assert_eq!(clips.len(), 2);
+        assert!((clips[0].end() - 5.0).abs() < 1e-9);
+        assert!((clips[1].start - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ripple_delete_closes_gap_and_removes_linked() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let res = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 5.0,
+            })
+            .unwrap();
+        let vid = res.primary_clip_id.unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 5.0,
+            in_point: 0.0,
+            out_point: 3.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::RippleDelete {
+            clip_id: vid,
+            remove_linked: true,
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips.len(), 1);
+        assert!((ed.timeline.tracks[0].clips[0].start - 0.0).abs() < 1e-9);
+        let audio = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        assert!(audio.clips.is_empty());
+    }
+
+    #[test]
+    fn track_mute_lock_hide_flags() {
+        let mut ed = TimelineEditor::new();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        ed.apply(EditCommand::SetTrackMute {
+            track_id: a1,
+            muted: true,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SetTrackLock {
+            track_id: a1,
+            locked: true,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SetTrackHidden {
+            track_id: a1,
+            hidden: true,
+        })
+        .unwrap();
+        let track = ed.timeline.tracks.iter().find(|t| t.id == a1).unwrap();
+        assert!(track.muted && track.locked && track.hidden);
+    }
+
+    #[test]
+    fn cannot_delete_last_audio_track() {
+        let mut ed = TimelineEditor::new();
+        let audio_ids: Vec<_> = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .map(|t| t.id)
+            .collect();
+        assert!(!audio_ids.is_empty());
+        for id in &audio_ids[..audio_ids.len().saturating_sub(1)] {
+            ed.apply(EditCommand::RemoveTrack { track_id: *id })
+                .unwrap();
+        }
+        let last = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let err = ed
+            .apply(EditCommand::RemoveTrack { track_id: last })
+            .unwrap_err();
+        assert!(matches!(err, TimelineError::LastTrack("audio")));
+    }
+
+    #[test]
+    fn spacer_negative_delta_clamps_without_overlap() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "a.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 4.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 6.0,
+            in_point: 0.0,
+            out_point: 2.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        // Drag spacer left inside the 2s gap — only remove available space.
+        ed.apply(EditCommand::SpacerShift {
+            track_id: Some(v1),
+            at: 5.0,
+            delta: -3.0,
+        })
+        .unwrap();
+        let clips = &ed.timeline.tracks[0].clips;
+        assert!((clips[0].start - 0.0).abs() < 1e-9);
+        assert!((clips[1].start - 4.0).abs() < 1e-9);
+        assert!(clips[1].start >= clips[0].end() - 1e-6);
+    }
+
+    #[test]
+    fn close_gap_removes_space_at_playhead() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "a.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 3.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 8.0,
+            in_point: 0.0,
+            out_point: 2.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::CloseGap {
+            track_id: Some(v1),
+            at: 5.0,
+        })
+        .unwrap();
+        let clips = &ed.timeline.tracks[0].clips;
+        assert!((clips[1].start - 3.0).abs() < 1e-9);
+        assert!(matches!(
+            ed.apply(EditCommand::CloseGap {
+                track_id: Some(v1),
+                at: 1.0,
+            })
+            .unwrap_err(),
+            TimelineError::NoGap
+        ));
+    }
+
+    #[test]
+    fn remove_gaps_packs_track_from_time() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "a.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 2.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 5.0,
+            in_point: 0.0,
+            out_point: 2.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "c.mp4".into(),
+            source_path: None,
+            start: 10.0,
+            in_point: 0.0,
+            out_point: 1.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::RemoveGaps {
+            track_id: Some(v1),
+            from: 0.0,
+        })
+        .unwrap();
+        let clips = &ed.timeline.tracks[0].clips;
+        assert!((clips[0].start - 0.0).abs() < 1e-9);
+        assert!((clips[1].start - 2.0).abs() < 1e-9);
+        assert!((clips[2].start - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overwrite_move_replaces_range() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let left = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 10.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        ed.apply(EditCommand::SetEditMode {
+            mode: EditMode::Overwrite,
+        })
+        .unwrap();
+        // Place a short clip via move onto the long one (overwrite punches hole).
+        let short = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "b.mp4".into(),
+                source_path: None,
+                start: 20.0,
+                in_point: 0.0,
+                out_point: 2.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        ed.apply(EditCommand::MoveClip {
+            clip_id: short,
+            new_start: 4.0,
+            sync_linked: false,
+        })
+        .unwrap();
+        let _ = left;
+        let clips = &ed.timeline.tracks[0].clips;
+        assert!(clips.iter().any(|c| c.media_path == "b.mp4" && (c.start - 4.0).abs() < 1e-6));
+    }
+
+    /// End-to-end edit matrix matching the manual smoke checklist (logic layer).
+    #[test]
+    fn manual_smoke_matrix_logic() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+
+        // 1. Import AV → linked → Unlink → Link again
+        let res = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "smoke.mp4".into(),
+                source_path: Some("C:/media/smoke.mp4".into()),
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 12.0,
+            })
+            .unwrap();
+        let vid = res.primary_clip_id.unwrap();
+        let aid = res.secondary_clip_id.unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips[0].linked_clip_id, Some(aid));
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
+            .unwrap();
+        assert!(ed.timeline.tracks[0].clips[0].linked_clip_id.is_none());
+        ed.apply(EditCommand::LinkClips {
+            clip_a: vid,
+            clip_b: aid,
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips[0].linked_clip_id, Some(aid));
+
+        // 2. Split (Ctrl+B path = SplitClip sync_linked)
+        ed.apply(EditCommand::SplitClip {
+            clip_id: vid,
+            at: 4.0,
+            sync_linked: true,
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.tracks[0].clips.len(), 2);
+        let audio = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        assert_eq!(audio.clips.len(), 2);
+
+        // 3. Move linked pair stays aligned
+        let left_v = ed.timeline.tracks[0].clips[0].id;
+        ed.apply(EditCommand::MoveClip {
+            clip_id: left_v,
+            new_start: 1.0,
+            sync_linked: true,
+        })
+        .unwrap();
+        let v_start = ed.timeline.tracks[0].clips[0].start;
+        let a_start = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap()
+            .clips[0]
+            .start;
+        assert!((v_start - a_start).abs() < 1e-9);
+
+        // 4. Slip / ripple / spacer / delete smoke
+        let right_v = ed.timeline.tracks[0].clips[1].id;
+        ed.apply(EditCommand::SlipClip {
+            clip_id: right_v,
+            delta: 0.25,
+            sync_linked: true,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SpacerShift {
+            track_id: Some(v1),
+            at: 10.0,
+            delta: 1.0,
+        })
+        .unwrap();
+
+        // 5. Zone lift leaves gap; empty zone errors; extract closes gap
+        ed.apply(EditCommand::SetZone {
+            zone_in: Some(1.5),
+            zone_out: Some(2.5),
+        })
+        .unwrap();
+        ed.apply(EditCommand::LiftZone).unwrap();
+        let after_lift = ed.timeline.tracks[0].clips.len();
+        assert!(after_lift >= 2);
+        ed.apply(EditCommand::SetZone {
+            zone_in: None,
+            zone_out: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            ed.apply(EditCommand::ExtractZone).unwrap_err(),
+            TimelineError::NoZone
+        ));
+        ed.apply(EditCommand::SetZone {
+            zone_in: Some(8.0),
+            zone_out: Some(9.0),
+        })
+        .unwrap();
+        // May or may not hit clips depending on layout — still must not panic.
+        let _ = ed.apply(EditCommand::ExtractZone);
+
+        // 6. Mute A1
+        ed.apply(EditCommand::SetTrackMute {
+            track_id: a1,
+            muted: true,
+        })
+        .unwrap();
+        assert!(ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == a1)
+            .unwrap()
+            .muted);
+
+        // 7. Unlink → move audio later (export start gap scenario)
+        let v_clip = ed.timeline.tracks[0].clips[0].id;
+        if let Some(link) = ed.timeline.tracks[0].clips[0].linked_clip_id {
+            let before = ed
+                .timeline
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio)
+                .unwrap()
+                .clips
+                .iter()
+                .find(|c| c.id == link)
+                .map(|c| c.start)
+                .unwrap_or(0.0);
+            ed.apply(EditCommand::UnlinkClip { clip_id: v_clip })
+                .unwrap();
+            ed.apply(EditCommand::MoveClip {
+                clip_id: link,
+                new_start: before + 2.0,
+                sync_linked: false,
+            })
+            .unwrap();
+            let a = ed
+                .timeline
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio)
+                .unwrap()
+                .clips
+                .iter()
+                .find(|c| c.id == link)
+                .unwrap();
+            assert!(
+                a.start > before + 0.5,
+                "audio should move later for export gap; before={before} after={}",
+                a.start
+            );
+        }
+
+        // 8. Undo restores prior snapshot
+        ed.undo().unwrap();
+        ed.redo().unwrap();
+    }
+
+    #[test]
+    fn set_clip_fades_clamps_and_split_preserves() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let res = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "x.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 10.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap();
+        let id = res.primary_clip_id.unwrap();
+        ed.apply(EditCommand::SetClipFades {
+            clip_id: id,
+            fade_in: 2.0,
+            fade_out: 3.0,
+        })
+        .unwrap();
+        {
+            let c = &ed.timeline.tracks[0].clips[0];
+            assert!((c.fade_in - 2.0).abs() < 1e-9);
+            assert!((c.fade_out - 3.0).abs() < 1e-9);
+            assert!((c.fade_gain_at(1.0) - 0.5).abs() < 1e-6);
+        }
+        // Over-long fades clamp.
+        ed.apply(EditCommand::SetClipFades {
+            clip_id: id,
+            fade_in: 8.0,
+            fade_out: 8.0,
+        })
+        .unwrap();
+        {
+            let c = &ed.timeline.tracks[0].clips[0];
+            assert!(c.fade_in + c.fade_out <= c.duration() + 1e-9);
+        }
+        ed.apply(EditCommand::SetClipFades {
+            clip_id: id,
+            fade_in: 1.0,
+            fade_out: 2.0,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SplitClip {
+            clip_id: id,
+            at: 4.0,
+            sync_linked: false,
+        })
+        .unwrap();
+        let left = &ed.timeline.tracks[0].clips[0];
+        let right = &ed.timeline.tracks[0].clips[1];
+        assert!((left.fade_in - 1.0).abs() < 1e-9);
+        assert!(left.fade_out.abs() < 1e-9);
+        assert!(right.fade_in.abs() < 1e-9);
+        assert!((right.fade_out - 2.0).abs() < 1e-9);
     }
 }

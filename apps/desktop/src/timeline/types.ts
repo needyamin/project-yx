@@ -23,13 +23,37 @@ export type PerformancePolicy = {
 export type Clip = {
   id: string;
   media_path: string;
+  /** Original file for export when media_path is a proxy. */
+  source_path?: string | null;
   start: number;
   in_point: number;
   out_point: number;
   role: "video" | "audio";
   linked_clip_id: string | null;
-  filters: { id: string; kind: string; enabled: boolean }[];
+  /** Fade-in duration from clip start (seconds). */
+  fade_in?: number;
+  /** Fade-out duration before clip end (seconds). */
+  fade_out?: number;
+  filters: { id: string; kind: string; enabled: boolean; params?: Record<string, unknown> }[];
 };
+
+/** Linear 0..1 gain at timeline time for clip fades. */
+export function clipFadeGain(
+  clip: Pick<Clip, "start" | "in_point" | "out_point" | "fade_in" | "fade_out">,
+  time: number,
+): number {
+  const dur = Math.max(0, (clip.out_point ?? 0) - (clip.in_point ?? 0));
+  const local = time - clip.start;
+  if (local < 0 || local >= dur) return 0;
+  const fadeIn = Math.max(0, clip.fade_in ?? 0);
+  const fadeOut = Math.max(0, clip.fade_out ?? 0);
+  let g = 1;
+  if (fadeIn > 1e-6 && local < fadeIn) g = Math.min(g, local / fadeIn);
+  if (fadeOut > 1e-6 && local > dur - fadeOut) {
+    g = Math.min(g, (dur - local) / fadeOut);
+  }
+  return Math.max(0, Math.min(1, g));
+}
 
 export type Track = {
   id: string;
@@ -90,6 +114,29 @@ export function formatTime(seconds: number): string {
   return `${m}:${String(rem).padStart(2, "0")}.${ms}`;
 }
 
+/** Ruler labels: drop tenths when step ≥ 1s; emphasize minute scale. */
+export function formatRulerTime(seconds: number, stepSec: number): string {
+  const s = Math.max(0, seconds || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = Math.floor(s % 60);
+  if (stepSec >= 3600) {
+    return `${h}:${String(m).padStart(2, "0")}:00`;
+  }
+  if (stepSec >= 60) {
+    const totalMin = Math.floor(s / 60);
+    return `${totalMin}:00`;
+  }
+  if (stepSec >= 1) {
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
+    }
+    return `${m}:${String(rem).padStart(2, "0")}`;
+  }
+  const tenths = Math.floor((s % 1) * 10);
+  return `${m}:${String(rem).padStart(2, "0")}.${tenths}`;
+}
+
 export function fileName(path: string): string {
   const parts = path.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || path;
@@ -112,6 +159,52 @@ export function clipAtPlayhead(timeline: Timeline, playhead: number, kind: "vide
         return { track, clip };
       }
     }
+  }
+  return null;
+}
+
+/** Next clip on a track of `kind` whose start is at/after `time` (sequence playback). */
+export function nextClipAfter(timeline: Timeline, time: number, kind: "video" | "audio") {
+  let best: { track: Track; clip: Clip } | null = null;
+  for (const track of timeline.tracks) {
+    if (track.kind !== kind || track.muted || track.hidden) continue;
+    for (const clip of track.clips) {
+      if (clip.start >= time - 0.001) {
+        if (!best || clip.start < best.clip.start) {
+          best = { track, clip };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function sameMedia(a: Clip, b: Clip): boolean {
+  if (a.media_path === b.media_path) return true;
+  if (a.source_path && b.source_path && a.source_path === b.source_path) return true;
+  if (a.source_path && a.source_path === b.media_path) return true;
+  if (b.source_path && b.source_path === a.media_path) return true;
+  return fileName(a.media_path) === fileName(b.media_path);
+}
+
+/** Partner for Link A/V: opposite role under playhead, else same media on unlocked track. */
+export function findLinkPartner(
+  timeline: Timeline,
+  clip: Clip,
+  playhead: number,
+): Clip | null {
+  const wantKind = clip.role === "video" ? "audio" : "video";
+  for (const track of timeline.tracks) {
+    if (track.kind !== wantKind || track.locked) continue;
+    for (const c of track.clips) {
+      const end = c.start + (c.out_point - c.in_point);
+      if (playhead >= c.start && playhead < end) return c;
+    }
+  }
+  for (const track of timeline.tracks) {
+    if (track.kind !== wantKind || track.locked) continue;
+    const match = track.clips.find((c) => sameMedia(c, clip));
+    if (match) return match;
   }
   return null;
 }

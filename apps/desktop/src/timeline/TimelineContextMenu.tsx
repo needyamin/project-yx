@@ -45,6 +45,9 @@ type Props = {
   onDelete: (clipId: string) => void;
   onRippleDelete: (clipId: string) => void;
   onToggleLink: (clipId: string) => void;
+  onCloseGapAt: (at: number, trackId: string | null) => void;
+  onFillGapsFrom: (from: number, trackId: string | null) => void;
+  onInsertSpaceAt: (at: number, trackId: string | null) => void;
   onSeek: (t: number) => void;
   onSetZoneIn: () => void;
   onSetZoneOut: () => void;
@@ -74,6 +77,9 @@ export function TimelineContextMenu({
   onDelete,
   onRippleDelete,
   onToggleLink,
+  onCloseGapAt,
+  onFillGapsFrom,
+  onInsertSpaceAt,
   onSeek,
   onSetZoneIn,
   onSetZoneOut,
@@ -118,6 +124,9 @@ export function TimelineContextMenu({
     onDelete,
     onRippleDelete,
     onToggleLink,
+    onCloseGapAt,
+    onFillGapsFrom,
+    onInsertSpaceAt,
     onSeek,
     onSetZoneIn,
     onSetZoneOut,
@@ -183,6 +192,9 @@ function buildItems(p: {
   onDelete: (clipId: string) => void;
   onRippleDelete: (clipId: string) => void;
   onToggleLink: (clipId: string) => void;
+  onCloseGapAt: (at: number, trackId: string | null) => void;
+  onFillGapsFrom: (from: number, trackId: string | null) => void;
+  onInsertSpaceAt: (at: number, trackId: string | null) => void;
   onSeek: (t: number) => void;
   onSetZoneIn: () => void;
   onSetZoneOut: () => void;
@@ -268,6 +280,26 @@ function buildItems(p: {
       },
       {
         type: "item",
+        label: "Insert Space",
+        action: () => p.onInsertSpaceAt(t.at, t.trackId),
+      },
+      {
+        type: "item",
+        label: "Remove Space",
+        action: () => p.onCloseGapAt(t.at, t.trackId),
+      },
+      {
+        type: "item",
+        label: "Remove Space in All Tracks",
+        action: () => p.onCloseGapAt(t.at, null),
+      },
+      {
+        type: "item",
+        label: "Remove All Spaces After Cursor",
+        action: () => p.onFillGapsFrom(t.at, t.trackId),
+      },
+      {
+        type: "item",
         label: `Delete ${t.trackKind} track`,
         danger: true,
         disabled: !t.canDelete,
@@ -281,6 +313,21 @@ function buildItems(p: {
         type: "item",
         label: "Seek here",
         action: () => p.onSeek(menu.target.at),
+      },
+      {
+        type: "item",
+        label: "Insert Space",
+        action: () => p.onInsertSpaceAt(menu.target.at, null),
+      },
+      {
+        type: "item",
+        label: "Remove Space in All Tracks",
+        action: () => p.onCloseGapAt(menu.target.at, null),
+      },
+      {
+        type: "item",
+        label: "Remove All Spaces After Cursor",
+        action: () => p.onFillGapsFrom(menu.target.at, null),
       },
       { type: "sep" },
     );
@@ -298,7 +345,7 @@ function buildItems(p: {
     },
     {
       type: "item",
-      label: mark(p.tool === "razor", "Razor tool"),
+      label: mark(p.tool === "razor", "Cut tool"),
       hint: "X",
       action: () => p.onTool("razor"),
     },

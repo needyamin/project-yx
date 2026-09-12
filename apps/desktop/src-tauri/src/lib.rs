@@ -5,14 +5,15 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use yx_detect::{probe_and_policy, HardwareProfile, PerformancePolicy};
 use yx_media::{
-    export_file_with_progress, probe_media, ExportCodec, ExportFit, ExportRequest, MediaInfo,
-    VideoEncoder,
+    export_file_with_progress, export_timeline_with_progress, probe_media, ExportCodec, ExportFit,
+    ExportFilter, ExportRequest, ExportSegment, MediaInfo, TimelineExportRequest, VideoEncoder,
 };
 use yx_proxy::{ProxyJob, ProxyManager};
 use yx_timeline::{
     ClipId, EditCommand, EditMode, FilterKind, MediaRole, Timeline, TimelineEditor, TrackId,
     TrackKind, TrimEdge,
 };
+use uuid::Uuid;
 
 struct AppState {
     editor: Mutex<TimelineEditor>,
@@ -81,13 +82,22 @@ fn add_media_to_timeline(
     start: f64,
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
+    place_media_on_timeline(&state, media_path, start)
+}
+
+fn place_media_on_timeline(
+    state: &State<'_, AppState>,
+    media_path: String,
+    start: f64,
+) -> Result<Timeline, String> {
     let info = probe_media(PathBuf::from(&media_path).as_path()).map_err(|e| e.to_string())?;
     let out_point = if info.duration > 0.0 {
         info.duration
     } else {
         5.0
     };
-    let path = playback_path(&state, &media_path);
+    let source = media_path.clone();
+    let path = playback_path(state, &media_path);
     let mut editor = state.editor.lock();
 
     if info.has_video && info.has_audio {
@@ -104,6 +114,7 @@ fn add_media_to_timeline(
                 video_track_id: video_track,
                 audio_track_id: audio_track,
                 media_path: path,
+                source_path: Some(source),
                 start,
                 in_point: 0.0,
                 out_point,
@@ -118,6 +129,7 @@ fn add_media_to_timeline(
             .apply(EditCommand::AddClip {
                 track_id: video_track,
                 media_path: path,
+                source_path: Some(source),
                 start,
                 in_point: 0.0,
                 out_point,
@@ -134,6 +146,7 @@ fn add_media_to_timeline(
             .apply(EditCommand::AddClip {
                 track_id: audio_track,
                 media_path: path,
+                source_path: Some(source),
                 start,
                 in_point: 0.0,
                 out_point,
@@ -156,72 +169,7 @@ fn add_clip_to_track(
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     let _ = track_id;
-    // Delegate to smart A/V routing.
-    let info = probe_media(PathBuf::from(&media_path).as_path()).map_err(|e| e.to_string())?;
-    let out_point = if info.duration > 0.0 {
-        info.duration
-    } else {
-        5.0
-    };
-    let path = playback_path(&state, &media_path);
-    let mut editor = state.editor.lock();
-
-    if info.has_video && info.has_audio {
-        let video_track = editor
-            .timeline()
-            .first_track(TrackKind::Video)
-            .ok_or_else(|| "no video track".to_string())?;
-        let audio_track = editor
-            .timeline()
-            .first_track(TrackKind::Audio)
-            .ok_or_else(|| "no audio track".to_string())?;
-        editor
-            .apply(EditCommand::AddAvPair {
-                video_track_id: video_track,
-                audio_track_id: audio_track,
-                media_path: path,
-                start,
-                in_point: 0.0,
-                out_point,
-            })
-            .map_err(|e| e.to_string())?;
-    } else if info.has_video {
-        let video_track = editor
-            .timeline()
-            .first_track(TrackKind::Video)
-            .ok_or_else(|| "no video track".to_string())?;
-        editor
-            .apply(EditCommand::AddClip {
-                track_id: video_track,
-                media_path: path,
-                start,
-                in_point: 0.0,
-                out_point,
-                role: MediaRole::Video,
-                linked_clip_id: None,
-            })
-            .map_err(|e| e.to_string())?;
-    } else if info.has_audio {
-        let audio_track = editor
-            .timeline()
-            .first_track(TrackKind::Audio)
-            .ok_or_else(|| "no audio track".to_string())?;
-        editor
-            .apply(EditCommand::AddClip {
-                track_id: audio_track,
-                media_path: path,
-                start,
-                in_point: 0.0,
-                out_point,
-                role: MediaRole::Audio,
-                linked_clip_id: None,
-            })
-            .map_err(|e| e.to_string())?;
-    } else {
-        return Err("file has no video or audio streams".into());
-    }
-
-    Ok(editor.timeline().clone())
+    place_media_on_timeline(&state, media_path, start)
 }
 
 #[tauri::command]
@@ -403,23 +351,109 @@ fn add_filter(
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
-    let kind = match kind.as_str() {
-        "exposure" => FilterKind::Exposure,
-        "contrast" => FilterKind::Contrast,
-        "lut" => FilterKind::Lut,
-        "crop" => FilterKind::Crop,
-        "fade" => FilterKind::Fade,
-        "text" => FilterKind::Text,
-        "blur" => FilterKind::Blur,
-        "denoise" => FilterKind::Denoise,
-        other => return Err(format!("unknown filter: {other}")),
-    };
+    let kind = parse_filter_kind(&kind)?;
     let mut editor = state.editor.lock();
     editor
         .apply(EditCommand::AddFilter {
             clip_id,
             kind,
             params: serde_json::json!({}),
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn update_filter(
+    clip_id: String,
+    filter_id: String,
+    params: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let filter_id: Uuid = filter_id.parse().map_err(|e| format!("bad filter id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::UpdateFilter {
+            clip_id,
+            filter_id,
+            params,
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn set_filter_enabled(
+    clip_id: String,
+    filter_id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let filter_id: Uuid = filter_id.parse().map_err(|e| format!("bad filter id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::SetFilterEnabled {
+            clip_id,
+            filter_id,
+            enabled,
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn remove_filter(
+    clip_id: String,
+    filter_id: String,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let filter_id: Uuid = filter_id.parse().map_err(|e| format!("bad filter id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::RemoveFilter {
+            clip_id,
+            filter_id,
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
+    Ok(match kind {
+        "transform" => FilterKind::Transform,
+        "crop" => FilterKind::Crop,
+        "exposure" => FilterKind::Exposure,
+        "contrast" => FilterKind::Contrast,
+        "saturation" => FilterKind::Saturation,
+        "blur" => FilterKind::Blur,
+        "flip" => FilterKind::Flip,
+        "chromakey" => FilterKind::Chromakey,
+        "volume" => FilterKind::Volume,
+        "lut" => FilterKind::Lut,
+        "fade" => FilterKind::Fade,
+        "text" => FilterKind::Text,
+        "denoise" => FilterKind::Denoise,
+        other => return Err(format!("unknown filter: {other}")),
+    })
+}
+
+#[tauri::command]
+fn set_clip_fades(
+    clip_id: String,
+    fade_in: f64,
+    fade_out: f64,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::SetClipFades {
+            clip_id,
+            fade_in,
+            fade_out,
         })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
@@ -451,10 +485,77 @@ struct ExportProgressPayload {
     phase: String,
 }
 
+fn collect_export_segments(
+    timeline: &Timeline,
+    kind: TrackKind,
+    proxies: &ProxyManager,
+) -> Vec<ExportSegment> {
+    let Some(track) = timeline
+        .tracks
+        .iter()
+        .find(|t| t.kind == kind && !t.muted && !t.hidden && !t.clips.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let mut clips: Vec<_> = track
+        .clips
+        .iter()
+        .filter(|c| c.out_point > c.in_point)
+        .collect();
+    clips.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    clips
+        .into_iter()
+        .map(|c| {
+            let source = c
+                .source_path
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&c.media_path));
+            ExportSegment {
+                path: proxies.original_path(source.as_path()),
+                in_point: c.in_point,
+                out_point: c.out_point,
+                start: c.start.max(0.0),
+                fade_in: c.fade_in.max(0.0),
+                fade_out: c.fade_out.max(0.0),
+                filters: c
+                    .filters
+                    .iter()
+                    .map(|f| ExportFilter {
+                        kind: match f.kind {
+                            FilterKind::Transform => "transform",
+                            FilterKind::Crop => "crop",
+                            FilterKind::Exposure => "exposure",
+                            FilterKind::Contrast => "contrast",
+                            FilterKind::Saturation => "saturation",
+                            FilterKind::Blur => "blur",
+                            FilterKind::Flip => "flip",
+                            FilterKind::Chromakey => "chromakey",
+                            FilterKind::Volume => "volume",
+                            FilterKind::Lut => "lut",
+                            FilterKind::Fade => "fade",
+                            FilterKind::Text => "text",
+                            FilterKind::Denoise => "denoise",
+                        }
+                        .into(),
+                        enabled: f.enabled,
+                        params: f.params.clone(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn export_media(
     app: AppHandle,
-    input_path: String,
+    input_path: Option<String>,
     output_path: String,
     width: u32,
     height: u32,
@@ -486,26 +587,14 @@ async fn export_media(
         "amf" => VideoEncoder::Amf,
         _ => VideoEncoder::Software,
     };
-    let req = ExportRequest {
-        input_path: PathBuf::from(&input_path),
-        output_path: PathBuf::from(output_path),
-        width,
-        height,
-        fps,
-        codec,
-        x264_preset: x264_preset.unwrap_or_else(|| "slow".to_string()),
-        crf,
-        video_bitrate,
-        audio_bitrate: audio_bitrate.unwrap_or_else(|| "320k".into()),
-        fit,
-        encoder,
-        match_source: match_source.unwrap_or(true),
-    };
+    let x264_preset = x264_preset.unwrap_or_else(|| "slow".to_string());
+    let audio_bitrate = audio_bitrate.unwrap_or_else(|| "320k".into());
+    let match_source = match_source.unwrap_or(true);
 
-    let duration_secs = duration
-        .filter(|d| *d > 0.0)
-        .or_else(|| probe_media(std::path::Path::new(&input_path)).ok().map(|i| i.duration))
-        .unwrap_or(0.0);
+    let timeline = state.editor.lock().timeline().clone();
+    let video_segs = collect_export_segments(&timeline, TrackKind::Video, &state.proxies);
+    let audio_segs = collect_export_segments(&timeline, TrackKind::Audio, &state.proxies);
+    let use_timeline = !video_segs.is_empty() || !audio_segs.is_empty();
 
     let _ = app.emit(
         "export-progress",
@@ -516,19 +605,89 @@ async fn export_media(
     );
 
     let app_progress = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        export_file_with_progress(&req, &policy, duration_secs, |pct| {
-            let _ = app_progress.emit(
-                "export-progress",
-                ExportProgressPayload {
-                    percent: pct,
-                    phase: "encoding".into(),
-                },
-            );
+    let result = if use_timeline {
+        let seg_end: f64 = video_segs
+            .iter()
+            .map(ExportSegment::end)
+            .chain(audio_segs.iter().map(ExportSegment::end))
+            .fold(0.0_f64, f64::max);
+        let duration_secs = duration
+            .filter(|d| *d > 0.0)
+            .unwrap_or_else(|| timeline.duration().max(seg_end));
+
+        let req = TimelineExportRequest {
+            video: video_segs,
+            audio: audio_segs,
+            output_path: PathBuf::from(output_path),
+            width,
+            height,
+            fps,
+            codec,
+            x264_preset,
+            crf,
+            video_bitrate,
+            audio_bitrate,
+            fit,
+            encoder,
+            match_source,
+        };
+
+        tauri::async_runtime::spawn_blocking(move || {
+            export_timeline_with_progress(&req, &policy, duration_secs, |pct| {
+                let _ = app_progress.emit(
+                    "export-progress",
+                    ExportProgressPayload {
+                        percent: pct,
+                        phase: "encoding".into(),
+                    },
+                );
+            })
         })
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        let input_path = input_path.ok_or_else(|| {
+            "nothing to export — add clips to the timeline or select a media file".to_string()
+        })?;
+        let req = ExportRequest {
+            input_path: PathBuf::from(&input_path),
+            output_path: PathBuf::from(output_path),
+            width,
+            height,
+            fps,
+            codec,
+            x264_preset,
+            crf,
+            video_bitrate,
+            audio_bitrate,
+            fit,
+            encoder,
+            match_source,
+        };
+
+        let duration_secs = duration
+            .filter(|d| *d > 0.0)
+            .or_else(|| {
+                probe_media(std::path::Path::new(&input_path))
+                    .ok()
+                    .map(|i| i.duration)
+            })
+            .unwrap_or(0.0);
+
+        tauri::async_runtime::spawn_blocking(move || {
+            export_file_with_progress(&req, &policy, duration_secs, |pct| {
+                let _ = app_progress.emit(
+                    "export-progress",
+                    ExportProgressPayload {
+                        percent: pct,
+                        phase: "encoding".into(),
+                    },
+                );
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
 
     match result {
         Ok(()) => {
@@ -606,6 +765,40 @@ fn spacer_shift(
             at,
             delta,
         })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn close_gap(
+    at: f64,
+    track_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let track_id = match track_id {
+        Some(s) => Some(s.parse().map_err(|e| format!("bad track id: {e}"))?),
+        None => None,
+    };
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::CloseGap { track_id, at })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+#[tauri::command]
+fn remove_gaps(
+    from: f64,
+    track_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let track_id = match track_id {
+        Some(s) => Some(s.parse().map_err(|e| format!("bad track id: {e}"))?),
+        None => None,
+    };
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::RemoveGaps { track_id, from })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
 }
@@ -716,6 +909,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .setup(|app| {
             #[cfg(desktop)]
@@ -750,9 +945,15 @@ pub fn run() {
             add_track,
             remove_track,
             add_filter,
+            update_filter,
+            set_filter_enabled,
+            remove_filter,
+            set_clip_fades,
             set_edit_mode,
             slip_clip,
             spacer_shift,
+            close_gap,
+            remove_gaps,
             ripple_trim,
             add_marker,
             remove_marker,

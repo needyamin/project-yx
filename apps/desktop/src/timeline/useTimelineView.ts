@@ -17,6 +17,8 @@ export function useTimelineView(durationSec: number) {
     [durationSec, pxPerSec],
   );
 
+  const hasUserZoomed = useCallback(() => userZoomedRef.current, []);
+
   const zoomIn = useCallback(() => {
     userZoomedRef.current = true;
     setPxPerSec((v) => Math.min(MAX_PPS, v * 1.25));
@@ -29,7 +31,8 @@ export function useTimelineView(durationSec: number) {
 
   const zoomFit = useCallback(
     (viewportWidth: number) => {
-      const usable = Math.max(240, viewportWidth - 24);
+      // Match contentWidth padding (+160) so the full duration fits in view.
+      const usable = Math.max(240, viewportWidth - 160);
       const safeDur = Math.max(1, durationSec);
       const next = usable / safeDur;
       setPxPerSec(Math.min(MAX_PPS, Math.max(MIN_PPS, next)));
@@ -100,6 +103,7 @@ export function useTimelineView(durationSec: number) {
     zoomOut,
     zoomFit,
     maybeAutoFit,
+    hasUserZoomed,
     timeToX,
     xToTime,
     applySnap,

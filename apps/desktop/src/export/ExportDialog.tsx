@@ -230,7 +230,8 @@ export function ExportDialog({
             <p>
               {sourceName ? (
                 <>
-                  Source: <strong>{sourceName}</strong>
+                  {sourceName.startsWith("Timeline") ? "Export" : "Source"}:{" "}
+                  <strong>{sourceName}</strong>
                 </>
               ) : (
                 "No media selected"

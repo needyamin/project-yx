@@ -1,7 +1,38 @@
-/target
-**/node_modules
-**/dist
-**/.DS_Store
-apps/desktop/src-tauri/gen
+# Rust
+/target/
+**/target/
+
+# Node / frontend
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/.vite/
+
+# Tauri generated
+apps/desktop/src-tauri/gen/
+
+# Local caches / tooling
+.proxy-cache/
 *.log
-.proxy-cache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Updater signing — private keys only (keep *.key.pub)
+apps/desktop/src-tauri/yx-updater.key
+apps/desktop/src-tauri/*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+*.suo
+*.sw?
+*.swp

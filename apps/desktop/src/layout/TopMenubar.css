@@ -1,0 +1,40 @@
+.menu-sep {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 0.25rem 0;
+}
+
+.about-modal {
+  position: absolute;
+  top: 42px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  min-width: 240px;
+  padding: 1rem 1.15rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.about-modal strong {
+  font-size: 0.95rem;
+}
+
+.about-modal p {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.about-muted {
+  color: var(--muted);
+  margin-bottom: 0.5rem !important;
+}
+
+.topbar {
+  position: relative;
+}

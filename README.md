@@ -24,6 +24,7 @@ See [STACK_PLAN.md](STACK_PLAN.md) for architecture details.
 - **Background FFmpeg encode** with live **progress bar** (UI stays responsive)
 - Best export uses software x264, CRF 15, slow preset, source fps/size (no forced downscale)
 - Proxies + capped encode threads for weaker CPUs
+- **Auto-update** from [GitHub Releases](https://github.com/needyamin/project-yx/releases) (Help → Check for Updates)
 
 ## Timeline shortcuts
 
@@ -86,14 +87,42 @@ apps/desktop               # Tauri + React
 
 ## App icon
 
-`apps/desktop/public/logo.png` is the project mark. It is used only for **OS / window / tray / installer icons** (via `src-tauri/icons`), not inside the editor UI.
+`apps/desktop/public/logo.png` is the project mark (favicons / window). OS installer icons live under `apps/desktop/src-tauri/icons`.
 
-Regenerate icon set after changing the logo:
+After changing the logo, regenerate the OS icon set:
 
 ```bash
 cd apps/desktop
 npm run icons
 ```
+
+## Releases and auto-update
+
+Published builds check:
+
+`https://github.com/needyamin/project-yx/releases/latest/download/latest.json`
+
+1. Generate signing keys once (already used for this repo’s pubkey in `tauri.conf.json`):
+
+```bash
+cd apps/desktop
+npx tauri signer generate -w src-tauri/yx-updater.key
+```
+
+2. Add GitHub Actions secrets (repo → Settings → Secrets):
+   - `TAURI_SIGNING_PRIVATE_KEY` — full contents of `yx-updater.key`
+   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — key password (if set)
+
+3. Push a version tag to publish:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The **Release** workflow builds Windows installers, uploads updater signatures, and writes `latest.json`. Installed apps then update via **Help → Check for Updates…** (or a quiet check on launch).
+
+Never commit `yx-updater.key`.
 
 ## License
 

@@ -36,14 +36,14 @@ pub struct MediaInfo {
     pub has_video: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportCodec {
     H264,
     H265,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFit {
     /// Letterbox / pillarbox to exact size.
@@ -52,7 +52,7 @@ pub enum ExportFit {
     Cover,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoEncoder {
     Auto,
@@ -81,6 +81,225 @@ pub struct ExportRequest {
     pub fit: ExportFit,
     pub encoder: VideoEncoder,
     /// Keep source frame size (skip resize/pad/crop). Still forces even dims for yuv420p.
+    pub match_source: bool,
+}
+
+/// One trimmed media segment on the edited timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportSegment {
+    pub path: PathBuf,
+    pub in_point: f64,
+    pub out_point: f64,
+    /// Absolute timeline position (seconds) where this segment begins.
+    #[serde(default)]
+    pub start: f64,
+    /// Fade-in duration from segment start (seconds).
+    #[serde(default)]
+    pub fade_in: f64,
+    /// Fade-out duration before segment end (seconds).
+    #[serde(default)]
+    pub fade_out: f64,
+    /// Ordered effect stack copied from the clip (WYSIWYG with preview).
+    #[serde(default)]
+    pub filters: Vec<ExportFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportFilter {
+    pub kind: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ExportSegment {
+    pub fn duration(&self) -> f64 {
+        (self.out_point - self.in_point).max(0.0)
+    }
+
+    pub fn end(&self) -> f64 {
+        self.start + self.duration()
+    }
+}
+
+/// Build FFmpeg video filter pieces (no labels) from the effect stack + fades.
+/// Applied after decode trim, before setpts/overlay.
+pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let fw = frame_w.max(2) as f64;
+    let fh = frame_h.max(2) as f64;
+
+    for f in &seg.filters {
+        if !f.enabled {
+            continue;
+        }
+        let p = &f.params;
+        match f.kind.as_str() {
+            "crop" => {
+                let left = num(p, "left", 0.0).clamp(0.0, 0.49);
+                let top = num(p, "top", 0.0).clamp(0.0, 0.49);
+                let right = num(p, "right", 0.0).clamp(0.0, 0.49);
+                let bottom = num(p, "bottom", 0.0).clamp(0.0, 0.49);
+                if left + right + top + bottom > 1e-6 {
+                    let w = (1.0 - left - right).max(0.02);
+                    let h = (1.0 - top - bottom).max(0.02);
+                    parts.push(format!(
+                        "crop=iw*{w:.6}:ih*{h:.6}:iw*{left:.6}:ih*{top:.6}"
+                    ));
+                }
+            }
+            "exposure" => {
+                let amount = num(p, "amount", 0.0).clamp(-1.0, 1.0);
+                if amount.abs() > 1e-4 {
+                    // Map -1..1 → brightness-ish for eq
+                    parts.push(format!("eq=brightness={amount:.4}"));
+                }
+            }
+            "contrast" => {
+                let amount = num(p, "amount", 1.0).clamp(0.0, 3.0);
+                if (amount - 1.0).abs() > 1e-4 {
+                    parts.push(format!("eq=contrast={amount:.4}"));
+                }
+            }
+            "saturation" => {
+                let amount = num(p, "amount", 1.0).clamp(0.0, 3.0);
+                if (amount - 1.0).abs() > 1e-4 {
+                    parts.push(format!("eq=saturation={amount:.4}"));
+                }
+            }
+            "blur" => {
+                let radius = num(p, "radius", 0.0).clamp(0.0, 40.0);
+                if radius > 0.05 {
+                    let r = radius.round().max(1.0) as i32;
+                    parts.push(format!("boxblur={r}:{r}"));
+                }
+            }
+            "flip" => {
+                if bool_p(p, "horizontal", false) {
+                    parts.push("hflip".into());
+                }
+                if bool_p(p, "vertical", false) {
+                    parts.push("vflip".into());
+                }
+            }
+            "chromakey" => {
+                let color = p
+                    .get("color")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0x00FF00");
+                let hex = color.trim_start_matches('#');
+                let similarity = num(p, "similarity", 0.3).clamp(0.01, 1.0);
+                let blend = num(p, "blend", 0.1).clamp(0.0, 1.0);
+                parts.push(format!(
+                    "chromakey=0x{hex}:similarity={similarity:.4}:blend={blend:.4}"
+                ));
+            }
+            "transform" => {
+                let scale = num(p, "scale", 1.0).clamp(0.05, 8.0);
+                let rotation = num(p, "rotation", 0.0);
+                let opacity = num(p, "opacity", 1.0).clamp(0.0, 1.0);
+                let x = num(p, "x", 0.0); // normalized -1..1 offset of center
+                let y = num(p, "y", 0.0);
+                if (scale - 1.0).abs() > 1e-4 {
+                    parts.push(format!("scale=iw*{scale:.6}:ih*{scale:.6}"));
+                }
+                if rotation.abs() > 1e-3 {
+                    parts.push(format!(
+                        "rotate={rotation:.6}*PI/180:ow=rotw({rotation:.6}*PI/180):oh=roth({rotation:.6}*PI/180):c=none"
+                    ));
+                }
+                // Pad/crop back to frame and position via overlay offset later —
+                // for single-layer export, pad to canvas then crop.
+                if x.abs() > 1e-4 || y.abs() > 1e-4 || (scale - 1.0).abs() > 1e-4 || rotation.abs() > 1e-3
+                {
+                    let ox = (fw * x * 0.5) as i32;
+                    let oy = (fh * y * 0.5) as i32;
+                    parts.push(format!(
+                        "pad={fw}:{fh}:(ow-iw)/2+{ox}:(oh-ih)/2+{oy}:black"
+                    ));
+                    parts.push(format!("crop={fw}:{fh}"));
+                }
+                if opacity < 0.999 {
+                    parts.push(format!(
+                        "format=rgba,colorchannelmixer=aa={opacity:.4}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let fi = seg.fade_in.max(0.0);
+    let fo = seg.fade_out.max(0.0);
+    let dur = seg.duration();
+    if fi > 1e-4 {
+        parts.push(format!("fade=t=in:st=0:d={fi:.6}"));
+    }
+    if fo > 1e-4 && dur > fo {
+        let st = (dur - fo).max(0.0);
+        parts.push(format!("fade=t=out:st={st:.6}:d={fo:.6}"));
+    }
+
+    parts.join(",")
+}
+
+fn build_audio_effect_chain(seg: &ExportSegment) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for f in &seg.filters {
+        if !f.enabled {
+            continue;
+        }
+        if f.kind == "volume" {
+            let gain = num(&f.params, "gain", 1.0).clamp(0.0, 4.0);
+            if (gain - 1.0).abs() > 1e-4 {
+                parts.push(format!("volume={gain:.4}"));
+            }
+        }
+    }
+    let fi = seg.fade_in.max(0.0);
+    let fo = seg.fade_out.max(0.0);
+    let dur = seg.duration();
+    if fi > 1e-4 {
+        parts.push(format!("afade=t=in:st=0:d={fi:.6}"));
+    }
+    if fo > 1e-4 && dur > fo {
+        let st = (dur - fo).max(0.0);
+        parts.push(format!("afade=t=out:st={st:.6}:d={fo:.6}"));
+    }
+    parts.join(",")
+}
+
+fn num(p: &serde_json::Value, key: &str, default: f64) -> f64 {
+    p.get(key)
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+        .unwrap_or(default)
+}
+
+fn bool_p(p: &serde_json::Value, key: &str, default: bool) -> bool {
+    p.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+/// Export the assembled timeline (cuts / splits / trims), not a single source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineExportRequest {
+    pub video: Vec<ExportSegment>,
+    pub audio: Vec<ExportSegment>,
+    pub output_path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    pub fps: Option<f64>,
+    pub codec: ExportCodec,
+    pub x264_preset: String,
+    pub crf: Option<u8>,
+    pub video_bitrate: Option<String>,
+    pub audio_bitrate: String,
+    pub fit: ExportFit,
+    pub encoder: VideoEncoder,
     pub match_source: bool,
 }
 
@@ -169,28 +388,19 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
     Ok(info)
 }
 
-/// Build an FFmpeg CLI export command that prefers hardware encode when policy allows.
-pub fn build_export_args(
-    req: &ExportRequest,
-    policy: &PerformancePolicy,
-) -> Result<Vec<String>, MediaError> {
-    ensure_ffmpeg()?;
-
+fn video_scale_chain(match_source: bool, width: u32, height: u32, fit: ExportFit, fps: Option<f64>) -> String {
     let mut filters: Vec<String> = Vec::new();
-
-    if let Some(fps) = req.fps {
+    if let Some(fps) = fps {
         if fps > 0.0 {
             filters.push(format!("fps={fps}"));
         }
     }
-
-    if req.match_source {
-        // Keep source size; only even dims for yuv420p (no pad/crop resize).
+    if match_source {
         filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".into());
     } else {
-        let w = req.width.max(2) & !1;
-        let h = req.height.max(2) & !1;
-        let scale = match req.fit {
+        let w = width.max(2) & !1;
+        let h = height.max(2) & !1;
+        let scale = match fit {
             ExportFit::Contain => format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
             ),
@@ -200,30 +410,38 @@ pub fn build_export_args(
         };
         filters.push(scale);
     }
-
     filters.push("format=yuv420p".into());
+    filters.push("setsar=1".into());
+    filters.join(",")
+}
 
-    let mut args = vec![
-        "-y".into(),
-        "-i".into(),
-        req.input_path.display().to_string(),
-        "-vf".into(),
-        filters.join(","),
+fn append_encoder_args(
+    args: &mut Vec<String>,
+    codec: &ExportCodec,
+    encoder: &VideoEncoder,
+    x264_preset: &str,
+    crf: Option<u8>,
+    video_bitrate: &Option<String>,
+    audio_bitrate: &str,
+    height: u32,
+    policy: &PerformancePolicy,
+) {
+    args.extend([
         "-c:a".into(),
         "aac".into(),
         "-b:a".into(),
-        req.audio_bitrate.clone(),
+        audio_bitrate.to_string(),
         "-movflags".into(),
         "+faststart".into(),
-    ];
+    ]);
 
-    let use_hw = match req.encoder {
+    let use_hw = match encoder {
         VideoEncoder::Software => false,
         VideoEncoder::Nvenc | VideoEncoder::Qsv | VideoEncoder::Amf => true,
         VideoEncoder::Auto => policy.prefer_hw_encode,
     };
 
-    let (vcodec, hw_preset) = match (&req.codec, &req.encoder, use_hw) {
+    let (vcodec, hw_preset) = match (codec, encoder, use_hw) {
         (ExportCodec::H265, VideoEncoder::Nvenc, _) | (ExportCodec::H265, VideoEncoder::Auto, true) => {
             ("hevc_nvenc", "p5")
         }
@@ -244,7 +462,7 @@ pub fn build_export_args(
     if soft {
         args.extend([
             "-preset".into(),
-            req.x264_preset.clone(),
+            x264_preset.to_string(),
             "-threads".into(),
             policy.encode_threads.to_string(),
             "-pix_fmt".into(),
@@ -253,21 +471,20 @@ pub fn build_export_args(
         if vcodec == "libx264" {
             args.extend(["-profile:v".into(), "high".into()]);
         }
-        if let Some(crf) = req.crf {
+        if let Some(crf) = crf {
             args.extend(["-crf".into(), crf.to_string()]);
-        } else if let Some(br) = &req.video_bitrate {
+        } else if let Some(br) = video_bitrate {
             args.extend(["-b:v".into(), br.clone()]);
         } else {
-            args.extend(["-b:v".into(), bitrate_for_height(req.height)]);
+            args.extend(["-b:v".into(), bitrate_for_height(height)]);
         }
     } else {
-        // Hardware: constant-quality mode reduces blockiness vs fixed bitrate.
         if !hw_preset.is_empty() {
             args.extend(["-preset".into(), hw_preset.into()]);
         }
-        if let Some(br) = &req.video_bitrate {
+        if let Some(br) = video_bitrate {
             args.extend(["-b:v".into(), br.clone()]);
-        } else if let Some(crf) = req.crf {
+        } else if let Some(crf) = crf {
             let cq = crf.clamp(10, 28);
             if vcodec.contains("nvenc") {
                 args.extend([
@@ -290,7 +507,7 @@ pub fn build_export_args(
                     cq.to_string(),
                 ]);
             } else {
-                let base = bitrate_kbps_for_height(req.height.max(1080));
+                let base = bitrate_kbps_for_height(height.max(1080));
                 let factor = match crf {
                     0..=14 => 1.8,
                     15..=18 => 1.4,
@@ -300,9 +517,211 @@ pub fn build_export_args(
                 args.extend(["-b:v".into(), format!("{}k", (base as f64 * factor) as u32)]);
             }
         } else {
-            args.extend(["-b:v".into(), bitrate_for_height(req.height.max(1080))]);
+            args.extend(["-b:v".into(), bitrate_for_height(height.max(1080))]);
         }
     }
+}
+
+/// Build an FFmpeg CLI export command that prefers hardware encode when policy allows.
+pub fn build_export_args(
+    req: &ExportRequest,
+    policy: &PerformancePolicy,
+) -> Result<Vec<String>, MediaError> {
+    ensure_ffmpeg()?;
+
+    let vf = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps);
+
+    let mut args = vec![
+        "-y".into(),
+        "-i".into(),
+        req.input_path.display().to_string(),
+        "-vf".into(),
+        vf,
+    ];
+
+    append_encoder_args(
+        &mut args,
+        &req.codec,
+        &req.encoder,
+        &req.x264_preset,
+        req.crf,
+        &req.video_bitrate,
+        &req.audio_bitrate,
+        req.height,
+        policy,
+    );
+
+    args.push(req.output_path.display().to_string());
+    Ok(args)
+}
+
+/// Build FFmpeg args that place timeline segments at their starts, filling gaps
+/// with black / silence so unlink+move stays in sync on export.
+pub fn build_timeline_export_args(
+    req: &TimelineExportRequest,
+    policy: &PerformancePolicy,
+) -> Result<Vec<String>, MediaError> {
+    ensure_ffmpeg()?;
+
+    if req.video.is_empty() && req.audio.is_empty() {
+        return Err(MediaError::FfmpegFailed(
+            "timeline has no clips to export".into(),
+        ));
+    }
+
+    let mut args = vec!["-y".into()];
+
+    for seg in &req.video {
+        let dur = seg.duration();
+        if dur <= 0.0 {
+            return Err(MediaError::FfmpegFailed(
+                "video segment has zero duration".into(),
+            ));
+        }
+        args.extend([
+            "-ss".into(),
+            format!("{:.6}", seg.in_point.max(0.0)),
+            "-t".into(),
+            format!("{:.6}", dur),
+            "-i".into(),
+            seg.path.display().to_string(),
+        ]);
+    }
+
+    for seg in &req.audio {
+        let dur = seg.duration();
+        if dur <= 0.0 {
+            return Err(MediaError::FfmpegFailed(
+                "audio segment has zero duration".into(),
+            ));
+        }
+        args.extend([
+            "-ss".into(),
+            format!("{:.6}", seg.in_point.max(0.0)),
+            "-t".into(),
+            format!("{:.6}", dur),
+            "-i".into(),
+            seg.path.display().to_string(),
+        ]);
+    }
+
+    let v_count = req.video.len();
+    let a_count = req.audio.len();
+    let scale = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps);
+    let w = req.width.max(2) & !1;
+    let h = req.height.max(2) & !1;
+
+    let v_end = req
+        .video
+        .iter()
+        .map(ExportSegment::end)
+        .fold(0.0_f64, f64::max);
+    let a_end = req
+        .audio
+        .iter()
+        .map(ExportSegment::end)
+        .fold(0.0_f64, f64::max);
+    let total = v_end.max(a_end).max(0.001);
+
+    let mut fc = String::new();
+
+    // --- Video: black base + overlays at timeline starts ---
+    if v_count > 0 {
+        fc.push_str(&format!(
+            "color=c=black:s={w}x{h}:d={total:.6},format=yuv420p,setsar=1,fps=30[vbase];"
+        ));
+        let mut prev = "vbase".to_string();
+        for (i, seg) in req.video.iter().enumerate() {
+            let out = if i + 1 == v_count {
+                "vout".to_string()
+            } else {
+                format!("vbg{i}")
+            };
+            let effects = build_video_effect_chain(seg, w, h);
+            let mut vchain = format!("[{i}:v]{scale}");
+            if !effects.is_empty() {
+                vchain.push(',');
+                vchain.push_str(&effects);
+            }
+            vchain.push_str(&format!(
+                ",setpts=PTS-STARTPTS+{start:.6}/TB[v{i}]",
+                start = seg.start.max(0.0),
+            ));
+            fc.push_str(&format!(
+                "{vchain};[{prev}][v{i}]overlay=eof_action=pass:shortest=0[{out}];",
+                prev = prev,
+                out = out,
+            ));
+            prev = out;
+        }
+    } else {
+        fc.push_str(&format!(
+            "color=c=black:s={w}x{h}:d={total:.6},format=yuv420p,setsar=1[vout];"
+        ));
+    }
+
+    // --- Audio: silence base + delayed clips, then amix ---
+    if a_count > 0 {
+        fc.push_str(&format!(
+            "anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{total:.6},asetpts=PTS-STARTPTS[abase];"
+        ));
+        for (i, seg) in req.audio.iter().enumerate() {
+            let idx = v_count + i;
+            let delay_ms = (seg.start.max(0.0) * 1000.0).round().max(0.0) as u64;
+            let effects = build_audio_effect_chain(seg);
+            let mut achain = format!(
+                "[{idx}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS"
+            );
+            if !effects.is_empty() {
+                achain.push(',');
+                achain.push_str(&effects);
+            }
+            achain.push_str(&format!(
+                ",adelay={delay_ms}|{delay_ms},apad=whole_dur={total:.6}[a{i}];"
+            ));
+            fc.push_str(&achain);
+        }
+        let n = a_count + 1;
+        let mut labels = String::from("[abase]");
+        for i in 0..a_count {
+            labels.push_str(&format!("[a{i}]"));
+        }
+        fc.push_str(&format!(
+            "{labels}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0,atrim=0:{total:.6},asetpts=PTS-STARTPTS[aout]"
+        ));
+    } else {
+        fc.push_str(&format!(
+            "anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{total:.6},asetpts=PTS-STARTPTS[aout]"
+        ));
+    }
+
+    // Trim trailing semicolon on video-only branch before audio append.
+    if fc.ends_with(';') && a_count == 0 {
+        // video already ended with ; then we appended anullsrc — fine
+    }
+
+    args.extend([
+        "-filter_complex".into(),
+        fc,
+        "-map".into(),
+        "[vout]".into(),
+        "-map".into(),
+        "[aout]".into(),
+        "-t".into(),
+        format!("{total:.6}"),
+    ]);
+
+    append_encoder_args(
+        &mut args,
+        &req.codec,
+        &req.encoder,
+        &req.x264_preset,
+        req.crf,
+        &req.video_bitrate,
+        &req.audio_bitrate,
+        req.height,
+        policy,
+    );
 
     args.push(req.output_path.display().to_string());
     Ok(args)
@@ -349,6 +768,38 @@ where
             let mut soft_req = req.clone();
             soft_req.encoder = VideoEncoder::Software;
             let mut soft_args = build_export_args(&soft_req, policy)?;
+            inject_progress_flags(&mut soft_args);
+            on_progress(0.0);
+            run_ffmpeg_progress(&soft_args, duration_secs, &mut on_progress)
+        }
+    }
+}
+
+pub fn export_timeline_with_progress<F>(
+    req: &TimelineExportRequest,
+    policy: &PerformancePolicy,
+    duration_secs: f64,
+    mut on_progress: F,
+) -> Result<(), MediaError>
+where
+    F: FnMut(f64),
+{
+    let mut args = build_timeline_export_args(req, policy)?;
+    inject_progress_flags(&mut args);
+
+    match run_ffmpeg_progress(&args, duration_secs, &mut on_progress) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let can_retry = matches!(
+                req.encoder,
+                VideoEncoder::Auto | VideoEncoder::Nvenc | VideoEncoder::Qsv | VideoEncoder::Amf
+            );
+            if !can_retry {
+                return Err(err);
+            }
+            let mut soft_req = req.clone();
+            soft_req.encoder = VideoEncoder::Software;
+            let mut soft_args = build_timeline_export_args(&soft_req, policy)?;
             inject_progress_flags(&mut soft_args);
             on_progress(0.0);
             run_ffmpeg_progress(&soft_args, duration_secs, &mut on_progress)
@@ -474,6 +925,226 @@ fn parse_fraction(s: &str) -> Option<f64> {
         Some(num / den)
     } else {
         s.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_policy() -> PerformancePolicy {
+        PerformancePolicy {
+            tier: PerformanceTier::Medium,
+            preview_scale: yx_detect::PreviewScale::Half,
+            proxy: yx_detect::ProxyPreset {
+                height: 720,
+                video_bitrate_kbps: 6000,
+            },
+            encode_threads: 4,
+            preview_allows_heavy_filters: true,
+            prefer_hw_decode: false,
+            prefer_hw_encode: false,
+        }
+    }
+
+    #[test]
+    fn timeline_export_args_trim_and_concat() {
+        if ensure_ffmpeg().is_err() {
+            return;
+        }
+        let req = TimelineExportRequest {
+            video: vec![
+                ExportSegment {
+                    path: PathBuf::from("a.mp4"),
+                    in_point: 0.0,
+                    out_point: 2.5,
+                    start: 0.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                filters: vec![],
+                },
+                ExportSegment {
+                    path: PathBuf::from("a.mp4"),
+                    in_point: 5.0,
+                    out_point: 8.0,
+                    start: 2.5,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                filters: vec![],
+                },
+            ],
+            audio: vec![
+                ExportSegment {
+                    path: PathBuf::from("a.mp4"),
+                    in_point: 0.0,
+                    out_point: 2.5,
+                    start: 0.0,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                filters: vec![],
+                },
+                ExportSegment {
+                    path: PathBuf::from("a.mp4"),
+                    in_point: 5.0,
+                    out_point: 8.0,
+                    start: 2.5,
+                    fade_in: 0.0,
+                    fade_out: 0.0,
+                filters: vec![],
+                },
+            ],
+            output_path: PathBuf::from("out.mp4"),
+            width: 1920,
+            height: 1080,
+            fps: None,
+            codec: ExportCodec::H264,
+            x264_preset: "fast".into(),
+            crf: Some(18),
+            video_bitrate: None,
+            audio_bitrate: "192k".into(),
+            fit: ExportFit::Contain,
+            encoder: VideoEncoder::Software,
+            match_source: true,
+        };
+
+        let args = build_timeline_export_args(&req, &test_policy()).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("-ss"));
+        assert!(joined.contains("color=c=black"));
+        assert!(joined.contains("overlay="));
+        assert!(joined.contains("anullsrc"));
+        assert!(joined.contains("adelay="));
+        assert!(joined.contains("[vout]"));
+        assert!(joined.contains("[aout]"));
+        assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    #[test]
+    fn timeline_export_respects_audio_start_gap() {
+        if ensure_ffmpeg().is_err() {
+            return;
+        }
+        let req = TimelineExportRequest {
+            video: vec![ExportSegment {
+                path: PathBuf::from("v.mp4"),
+                in_point: 0.0,
+                out_point: 5.0,
+                start: 0.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
+            filters: vec![],
+            }],
+            audio: vec![ExportSegment {
+                path: PathBuf::from("a.mp4"),
+                in_point: 0.0,
+                out_point: 3.0,
+                start: 2.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
+            filters: vec![],
+            }],
+            output_path: PathBuf::from("gap.mp4"),
+            width: 1280,
+            height: 720,
+            fps: Some(30.0),
+            codec: ExportCodec::H264,
+            x264_preset: "ultrafast".into(),
+            crf: Some(23),
+            video_bitrate: None,
+            audio_bitrate: "128k".into(),
+            fit: ExportFit::Contain,
+            encoder: VideoEncoder::Software,
+            match_source: false,
+        };
+        let args = build_timeline_export_args(&req, &test_policy()).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("adelay=2000|2000"), "expected 2s audio delay: {joined}");
+        assert!(joined.contains("color=c=black"));
+        assert!(joined.contains("amix="));
+    }
+
+    #[test]
+    fn timeline_export_includes_fade_filters() {
+        if ensure_ffmpeg().is_err() {
+            return;
+        }
+        let req = TimelineExportRequest {
+            video: vec![ExportSegment {
+                path: PathBuf::from("v.mp4"),
+                in_point: 0.0,
+                out_point: 5.0,
+                start: 0.0,
+                fade_in: 0.5,
+                fade_out: 1.0,
+            filters: vec![],
+            }],
+            audio: vec![ExportSegment {
+                path: PathBuf::from("a.mp4"),
+                in_point: 0.0,
+                out_point: 5.0,
+                start: 0.0,
+                fade_in: 0.25,
+                fade_out: 0.75,
+            filters: vec![],
+            }],
+            output_path: PathBuf::from("fade.mp4"),
+            width: 1280,
+            height: 720,
+            fps: Some(30.0),
+            codec: ExportCodec::H264,
+            x264_preset: "ultrafast".into(),
+            crf: Some(23),
+            video_bitrate: None,
+            audio_bitrate: "128k".into(),
+            fit: ExportFit::Contain,
+            encoder: VideoEncoder::Software,
+            match_source: false,
+        };
+        let args = build_timeline_export_args(&req, &test_policy()).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("fade=t=in"), "{joined}");
+        assert!(joined.contains("fade=t=out"), "{joined}");
+        assert!(joined.contains("afade=t=in"), "{joined}");
+        assert!(joined.contains("afade=t=out"), "{joined}");
+    }
+
+    #[test]
+    fn effect_chain_includes_eq_blur_crop_key() {
+        let seg = ExportSegment {
+            path: PathBuf::from("v.mp4"),
+            in_point: 0.0,
+            out_point: 4.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            filters: vec![
+                ExportFilter {
+                    kind: "crop".into(),
+                    enabled: true,
+                    params: serde_json::json!({"left":0.1,"top":0.1,"right":0.1,"bottom":0.1}),
+                },
+                ExportFilter {
+                    kind: "exposure".into(),
+                    enabled: true,
+                    params: serde_json::json!({"amount":0.2}),
+                },
+                ExportFilter {
+                    kind: "blur".into(),
+                    enabled: true,
+                    params: serde_json::json!({"radius":4.0}),
+                },
+                ExportFilter {
+                    kind: "chromakey".into(),
+                    enabled: true,
+                    params: serde_json::json!({"color":"#00ff00","similarity":0.3,"blend":0.1}),
+                },
+            ],
+        };
+        let chain = build_video_effect_chain(&seg, 1920, 1080);
+        assert!(chain.contains("crop="), "{chain}");
+        assert!(chain.contains("eq=brightness"), "{chain}");
+        assert!(chain.contains("boxblur="), "{chain}");
+        assert!(chain.contains("chromakey="), "{chain}");
     }
 }
 

@@ -187,6 +187,18 @@ impl ProxyManager {
             .map(|j| j.proxy_path.clone())
             .unwrap_or_else(|| source.to_path_buf())
     }
+
+    /// Resolve a timeline/playback path back to the original source for export.
+    pub fn original_path(&self, path: &Path) -> PathBuf {
+        let guard = self.inner.lock();
+        if let Some(job) = guard.values().find(|j| j.proxy_path == path) {
+            return job.source_path.clone();
+        }
+        if let Some(job) = guard.values().find(|j| j.source_path == path) {
+            return job.source_path.clone();
+        }
+        path.to_path_buf()
+    }
 }
 
 /// Shared handle for the Tauri app state.

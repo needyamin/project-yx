@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Project YX Contributors"]
-repository = "https://github.com/example/project-yx"
+repository = "https://github.com/needyamin/project-yx"
 
 [workspace.dependencies]
 yx-detect = { path = "crates/yx-detect" }

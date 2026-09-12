@@ -1,5 +1,6 @@
 import type { EditMode, PerformanceTier } from "./types";
 import { formatTime } from "./types";
+import { IconSnap } from "./icons";
 
 type Props = {
   playhead: number;
@@ -23,11 +24,11 @@ export function TimelineStatusBar({
       <div className="tl-status-toggles">
         <button
           type="button"
-          className={snap ? "active" : ""}
+          className={`tl-icon-btn xs ${snap ? "active" : ""}`}
           title="Snap"
           onClick={() => onSnap(!snap)}
         >
-          Snap
+          <IconSnap size={12} />
         </button>
       </div>
       <span className="tl-status-tc">{formatTime(playhead)}</span>

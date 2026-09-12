@@ -6,12 +6,25 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { ExportDialog, type ExportSettings } from "./export/ExportDialog";
 import { ProjectBin, type BinFilter } from "./bin/ProjectBin";
 import { EditorShell } from "./layout/EditorShell";
+import { TopMenubar } from "./layout/TopMenubar";
+import { checkForAppUpdate } from "./update/checkUpdate";
 import { ClipMonitor } from "./monitors/ClipMonitor";
 import { ProjectMonitor, type PreviewAspect } from "./monitors/ProjectMonitor";
+import { EffectInspector } from "./effects/EffectInspector";
+import {
+  EFFECT_CATALOG,
+  previewVideoStyle,
+  previewVolumeGain,
+  type FilterInstance,
+} from "./effects/effects";
+import "./monitors/ProjectMonitor.css";
 import { TimelinePanel } from "./timeline/TimelinePanel";
 import {
   clipAtPlayhead,
+  clipFadeGain,
   fileName,
+  formatTime,
+  nextClipAfter,
   timelineDuration,
   type BootInfo,
   type EditMode,
@@ -21,8 +34,6 @@ import {
   type TimelineTool,
 } from "./timeline/types";
 import "./App.css";
-
-type RightTab = "effects" | "adjust";
 
 const MEDIA_EXTENSIONS = [
   "mp4",
@@ -39,16 +50,11 @@ const MEDIA_EXTENSIONS = [
   "ogg",
 ] as const;
 
-const FILTERS: { id: string; label: string; heavy?: boolean }[] = [
-  { id: "exposure", label: "Exposure" },
-  { id: "contrast", label: "Contrast" },
-  { id: "fade", label: "Fade" },
-  { id: "crop", label: "Crop" },
-  { id: "text", label: "Text" },
-  { id: "lut", label: "LUT", heavy: true },
-  { id: "blur", label: "Blur", heavy: true },
-  { id: "denoise", label: "Denoise", heavy: true },
-];
+const FILTERS = EFFECT_CATALOG.map((e) => ({
+  id: e.id,
+  label: e.label,
+  heavy: e.heavy,
+}));
 
 function isMediaPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -58,13 +64,21 @@ function isMediaPath(path: string): boolean {
 function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const resumePlayRef = useRef(false);
+  const timelineDropRef = useRef<((clientX: number) => number) | null>(null);
+  const viewControlsRef = useRef<{
+    zoomFit: () => void;
+    zoomIn: () => void;
+    zoomOut: () => void;
+    setSnap: (v: boolean) => void;
+    snap: boolean;
+  } | null>(null);
   const [boot, setBoot] = useState<BootInfo | null>(null);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
   const [binFilter, setBinFilter] = useState<BinFilter>("media");
-  const [rightTab, setRightTab] = useState<RightTab>("effects");
   const [tool, setTool] = useState<TimelineTool>("select");
   const [status, setStatus] = useState("Booting…");
   const [busy, setBusy] = useState(false);
@@ -75,6 +89,8 @@ function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [cropTool, setCropTool] = useState(false);
+  const [snapOn, setSnapOn] = useState(true);
 
   const refreshBoot = useCallback(async () => {
     const info = await invoke<BootInfo>("get_boot_info");
@@ -86,6 +102,25 @@ function App() {
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
+
+  // Silent update check after launch.
+  useEffect(() => {
+    if (!boot) return;
+    const t = window.setTimeout(() => {
+      void checkForAppUpdate({
+        interactive: false,
+        onStatus: (s) => {
+          if (s.kind === "available") setStatus(s.message);
+          else if (s.kind === "none") {
+            /* keep ready status */
+          } else if (s.kind === "error") {
+            /* quiet on launch */
+          }
+        },
+      });
+    }, 2500);
+    return () => window.clearTimeout(t);
+  }, [boot]);
 
   const selectedMedia = useMemo(
     () => library.find((m) => m.id === selectedMediaId) ?? null,
@@ -123,6 +158,12 @@ function App() {
     return null;
   }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
 
+  /** Timeline A-track path for Project Monitor (video is muted; this drives sound). */
+  const timelineAudioPath = useMemo(() => {
+    if (!audioUnderPlayhead) return null;
+    return audioUnderPlayhead.clip.media_path;
+  }, [audioUnderPlayhead]);
+
   const previewSrc = useMemo(() => {
     if (!previewPath) return null;
     try {
@@ -132,8 +173,36 @@ function App() {
     }
   }, [previewPath]);
 
+  const timelineAudioSrc = useMemo(() => {
+    if (!timelineAudioPath) return null;
+    try {
+      return convertFileSrc(timelineAudioPath);
+    } catch {
+      return null;
+    }
+  }, [timelineAudioPath]);
+
+  const previewClipId = useMemo(() => {
+    if (previewMode === "video") return videoUnderPlayhead?.clip.id ?? null;
+    if (previewMode === "audio") return audioUnderPlayhead?.clip.id ?? null;
+    return null;
+  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
+
+  const previewInPoint = useMemo(() => {
+    if (previewMode === "video") return videoUnderPlayhead?.clip.in_point ?? null;
+    if (previewMode === "audio") return audioUnderPlayhead?.clip.in_point ?? null;
+    return null;
+  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
+
+  const audioClipId = audioUnderPlayhead?.clip.id ?? null;
+
   const projectDuration = useMemo(
     () => (timeline ? timelineDuration(timeline, 10) : 10),
+    [timeline],
+  );
+
+  const hasTimelineClips = useMemo(
+    () => !!timeline?.tracks.some((t) => t.clips.length > 0),
     [timeline],
   );
 
@@ -147,11 +216,17 @@ function App() {
 
   // Load media into the project monitor elements
   useEffect(() => {
-    setPlaying(false);
     const video = videoRef.current;
     const audio = audioRef.current;
+    const shouldResume = resumePlayRef.current;
+    resumePlayRef.current = false;
+
+    if (!shouldResume) {
+      setPlaying(false);
+    }
     if (video) {
       video.pause();
+      video.muted = true;
       video.removeAttribute("src");
       video.load();
     }
@@ -160,36 +235,60 @@ function App() {
       audio.removeAttribute("src");
       audio.load();
     }
-    if (!previewSrc) return;
+    if (!previewSrc && !timelineAudioSrc) return;
 
-    if (previewMode === "video" && video) {
+    const syncAudioLocal = () => {
+      if (!audio || !audioUnderPlayhead || !timelineAudioSrc) return;
+      const local =
+        audioUnderPlayhead.clip.in_point + (playhead - audioUnderPlayhead.clip.start);
+      audio.currentTime = Math.max(
+        audioUnderPlayhead.clip.in_point,
+        Math.min(local, audioUnderPlayhead.clip.out_point - 0.01),
+      );
+    };
+
+    if (previewMode === "video" && video && previewSrc) {
       video.src = previewSrc;
+      video.muted = true;
       video.load();
+      if (timelineAudioSrc && audio) {
+        audio.src = timelineAudioSrc;
+        audio.load();
+      }
       const onMeta = () => {
         if (videoUnderPlayhead) {
           const local =
             videoUnderPlayhead.clip.in_point + (playhead - videoUnderPlayhead.clip.start);
-          video.currentTime = Math.max(videoUnderPlayhead.clip.in_point, local);
+          video.currentTime = Math.max(
+            videoUnderPlayhead.clip.in_point,
+            Math.min(local, videoUnderPlayhead.clip.out_point - 0.01),
+          );
+        }
+        syncAudioLocal();
+        if (shouldResume) {
+          void video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          if (timelineAudioSrc && audio) {
+            void audio.play().catch(() => undefined);
+          }
         }
       };
       video.addEventListener("loadedmetadata", onMeta);
       return () => video.removeEventListener("loadedmetadata", onMeta);
     }
 
-    if (previewMode === "audio" && audio) {
-      audio.src = previewSrc;
+    if (previewMode === "audio" && audio && (timelineAudioSrc || previewSrc)) {
+      audio.src = timelineAudioSrc ?? previewSrc!;
       audio.load();
       const onMeta = () => {
-        if (audioUnderPlayhead) {
-          const local =
-            audioUnderPlayhead.clip.in_point + (playhead - audioUnderPlayhead.clip.start);
-          audio.currentTime = Math.max(audioUnderPlayhead.clip.in_point, local);
+        syncAudioLocal();
+        if (shouldResume) {
+          void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         }
       };
       audio.addEventListener("loadedmetadata", onMeta);
       return () => audio.removeEventListener("loadedmetadata", onMeta);
     }
-  }, [previewSrc, previewMode]);
+  }, [previewSrc, timelineAudioSrc, previewMode, previewClipId, previewInPoint, audioClipId]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -202,16 +301,49 @@ function App() {
       if (hit) {
         const timelineTime = hit.clip.start + (active.currentTime - hit.clip.in_point);
         setPlayhead(Math.max(hit.clip.start, timelineTime));
+        // Keep A-track audio locked to the playhead while video drives clock.
+        if (previewMode === "video" && audio && audioUnderPlayhead && !audio.paused) {
+          const want =
+            audioUnderPlayhead.clip.in_point + (timelineTime - audioUnderPlayhead.clip.start);
+          if (Math.abs(audio.currentTime - want) > 0.12) {
+            audio.currentTime = Math.max(
+              audioUnderPlayhead.clip.in_point,
+              Math.min(want, audioUnderPlayhead.clip.out_point - 0.01),
+            );
+          }
+        }
         if (active.currentTime >= hit.clip.out_point - 0.02) {
-          active.pause();
-          setPlaying(false);
+          const clipEnd = hit.clip.start + (hit.clip.out_point - hit.clip.in_point);
+          const next =
+            timeline != null
+              ? nextClipAfter(timeline, clipEnd, previewMode === "video" ? "video" : "audio")
+              : null;
+          if (next && next.clip.id !== hit.clip.id) {
+            resumePlayRef.current = !active.paused || playing;
+            active.pause();
+            audio?.pause();
+            setPlayhead(next.clip.start);
+          } else {
+            active.pause();
+            audio?.pause();
+            setPlaying(false);
+            setPlayhead(clipEnd);
+          }
         }
       } else {
         setPlayhead(active.currentTime);
       }
     };
-    const onPlay = () => setPlaying(true);
-    const onPause = () => setPlaying(false);
+    const onPlay = () => {
+      setPlaying(true);
+      if (previewMode === "video" && audio && timelineAudioSrc && audio.paused) {
+        void audio.play().catch(() => undefined);
+      }
+    };
+    const onPause = () => {
+      setPlaying(false);
+      audio?.pause();
+    };
     const onErr = () => setPreviewError("Could not load preview.");
 
     active.addEventListener("timeupdate", onTime);
@@ -224,7 +356,14 @@ function App() {
       active.removeEventListener("pause", onPause);
       active.removeEventListener("error", onErr);
     };
-  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
+  }, [
+    previewMode,
+    videoUnderPlayhead,
+    audioUnderPlayhead,
+    timeline,
+    playing,
+    timelineAudioSrc,
+  ]);
 
   async function importPaths(paths: string[]) {
     const mediaPaths = paths.filter(isMediaPath);
@@ -326,7 +465,7 @@ function App() {
           : media.has_video
             ? "video"
             : "audio";
-      setStatus(`Added ${media.name} as ${kind}`);
+      setStatus(`Added ${media.name} as ${kind} at ${formatTime(start)}`);
     } catch (e) {
       setStatus(String(e));
     } finally {
@@ -371,8 +510,13 @@ function App() {
   }
 
   async function onFilter(kind: string) {
-    if (!selectedClipId) {
+    if (!selectedClipId || !selectedClip) {
       setStatus("Select a timeline clip first");
+      return;
+    }
+    const roles = EFFECT_CATALOG.find((e) => e.id === kind)?.roles;
+    if (roles && !roles.includes(selectedClip.clip.role)) {
+      setStatus(`${kind} is for ${roles.join("/")} clips`);
       return;
     }
     try {
@@ -380,6 +524,97 @@ function App() {
         normalizeTimeline(await invoke<Timeline>("add_filter", { clipId: selectedClipId, kind })),
       );
       setStatus(`Applied ${kind}`);
+      setBinFilter("effects");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  async function updateFilterParams(filterId: string, params: Record<string, unknown>) {
+    if (!selectedClipId) return;
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("update_filter", {
+            clipId: selectedClipId,
+            filterId,
+            params,
+          }),
+        ),
+      );
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  async function toggleFilter(filterId: string, enabled: boolean) {
+    if (!selectedClipId) return;
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("set_filter_enabled", {
+            clipId: selectedClipId,
+            filterId,
+            enabled,
+          }),
+        ),
+      );
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  async function removeFilter(filterId: string) {
+    if (!selectedClipId) return;
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("remove_filter", {
+            clipId: selectedClipId,
+            filterId,
+          }),
+        ),
+      );
+      setStatus("Effect removed");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  async function commitCrop(crop: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  }) {
+    if (!selectedClipId || !selectedClip) {
+      setStatus("Select a clip to crop");
+      return;
+    }
+    try {
+      let filters = selectedClip.clip.filters ?? [];
+      let cropFilter = filters.find((f) => f.kind === "crop");
+      if (!cropFilter) {
+        const next = normalizeTimeline(
+          await invoke<Timeline>("add_filter", { clipId: selectedClipId, kind: "crop" }),
+        );
+        setTimeline(next);
+        const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === selectedClipId);
+        cropFilter = clip?.filters.find((f) => f.kind === "crop");
+        filters = clip?.filters ?? [];
+      }
+      if (!cropFilter) return;
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("update_filter", {
+            clipId: selectedClipId,
+            filterId: cropFilter.id,
+            params: crop,
+          }),
+        ),
+      );
+      setCropTool(false);
+      setStatus("Crop applied");
     } catch (e) {
       setStatus(String(e));
     }
@@ -400,17 +635,19 @@ function App() {
     audioUnderPlayhead,
   ]);
 
+  const canExport = hasTimelineClips || !!exportSource;
+
   function openExportDialog() {
-    if (!exportSource) {
-      setStatus("Import or select media to export");
+    if (!canExport) {
+      setStatus("Add media to the timeline (or select a file) to export");
       return;
     }
     setExportOpen(true);
   }
 
   async function runExport(settings: ExportSettings) {
-    if (!exportSource) {
-      setStatus("Import or select media to export");
+    if (!canExport) {
+      setStatus("Add media to the timeline (or select a file) to export");
       return;
     }
     try {
@@ -445,7 +682,7 @@ function App() {
           library.find((m) => m.path === exportSource) ??
           (selectedMedia?.path === exportSource ? selectedMedia : null);
         await invoke("export_media", {
-          inputPath: exportSource,
+          inputPath: hasTimelineClips ? null : exportSource,
           outputPath,
           width: settings.width,
           height: settings.height,
@@ -459,11 +696,17 @@ function App() {
           fit: settings.fit,
           encoder: settings.encoder,
           matchSource: settings.matchSource,
-          duration: sourceItem?.duration ?? null,
+          duration: hasTimelineClips
+            ? projectDuration
+            : (sourceItem?.duration ?? null),
         });
         setExportProgress(1);
         setExportOpen(false);
-        setStatus(`Exported ${settings.width}×${settings.height}`);
+        setStatus(
+          hasTimelineClips
+            ? `Exported timeline · ${settings.width}×${settings.height}`
+            : `Exported ${settings.width}×${settings.height}`,
+        );
       } finally {
         unlisten();
       }
@@ -537,7 +780,8 @@ function App() {
       setTimeline(normalizeTimeline(await invoke<Timeline>("lift_zone")));
       setStatus("Lift zone");
     } catch (e) {
-      setStatus(String(e));
+      const msg = String(e);
+      setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
     }
   }
 
@@ -546,20 +790,63 @@ function App() {
       setTimeline(normalizeTimeline(await invoke<Timeline>("extract_zone")));
       setStatus("Extract zone");
     } catch (e) {
+      const msg = String(e);
+      setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
+    }
+  }
+
+  async function splitAtPlayhead() {
+    if (!timeline) return;
+    const under =
+      clipAtPlayhead(timeline, playhead, "video") ??
+      clipAtPlayhead(timeline, playhead, "audio");
+    const selectedUnder =
+      selectedClip &&
+      playhead > selectedClip.clip.start &&
+      playhead <
+        selectedClip.clip.start +
+          (selectedClip.clip.out_point - selectedClip.clip.in_point)
+        ? selectedClip.clip
+        : null;
+    const clip = selectedUnder ?? under?.clip;
+    if (!clip) {
+      setStatus("Playhead must be inside a clip");
+      return;
+    }
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("split_clip_at", {
+            clipId: clip.id,
+            at: playhead,
+            syncLinked: true,
+          }),
+        ),
+      );
+      setStatus(`Split at ${playhead.toFixed(2)}s`);
+    } catch (e) {
       setStatus(String(e));
     }
   }
 
   function togglePlay() {
-    const el =
-      previewMode === "video"
-        ? videoRef.current
-        : previewMode === "audio"
-          ? audioRef.current
-          : null;
-    if (!el || !previewSrc) return;
-    if (el.paused) void el.play();
-    else el.pause();
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    if (previewMode === "video" && video && previewSrc) {
+      if (video.paused) {
+        video.muted = true;
+        void video.play();
+        if (timelineAudioSrc && audio) void audio.play().catch(() => undefined);
+      } else {
+        video.pause();
+        audio?.pause();
+      }
+      return;
+    }
+    if (previewMode === "audio" && audio && (timelineAudioSrc || previewSrc)) {
+      if (audio.paused) void audio.play();
+      else audio.pause();
+    }
   }
 
   function seekTimeline(t: number) {
@@ -567,11 +854,65 @@ function App() {
     const videoHit = timeline ? clipAtPlayhead(timeline, t, "video") : null;
     const audioHit = timeline ? clipAtPlayhead(timeline, t, "audio") : null;
     if (videoHit && videoRef.current) {
+      videoRef.current.muted = true;
       videoRef.current.currentTime = videoHit.clip.in_point + (t - videoHit.clip.start);
-    } else if (audioHit && audioRef.current) {
+    }
+    if (audioHit && audioRef.current) {
       audioRef.current.currentTime = audioHit.clip.in_point + (t - audioHit.clip.start);
     }
+    applyPreviewFades(t, videoHit?.clip ?? null, audioHit?.clip ?? null);
   }
+
+  function applyPreviewFades(
+    t: number,
+    videoClip: {
+      start: number;
+      in_point: number;
+      out_point: number;
+      fade_in?: number;
+      fade_out?: number;
+      filters?: FilterInstance[];
+    } | null,
+    audioClip: {
+      start: number;
+      in_point: number;
+      out_point: number;
+      fade_in?: number;
+      fade_out?: number;
+      filters?: FilterInstance[];
+    } | null,
+  ) {
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    if (video) {
+      const fade = videoClip ? clipFadeGain(videoClip, t) : 1;
+      const style = previewVideoStyle(
+        (videoClip?.filters ?? []) as FilterInstance[],
+        fade,
+      );
+      video.style.filter = style.filter;
+      video.style.transform = style.transform;
+      video.style.opacity = String(style.opacity);
+      video.style.clipPath = style.clipPath ?? "";
+    }
+    if (audio) {
+      const fade = audioClip ? clipFadeGain(audioClip, t) : 1;
+      audio.volume = Math.min(
+        1,
+        previewVolumeGain((audioClip?.filters ?? []) as FilterInstance[], fade),
+      );
+    }
+  }
+
+  // Keep monitor opacity / volume in sync with playhead fades.
+  useEffect(() => {
+    applyPreviewFades(
+      playhead,
+      videoUnderPlayhead?.clip ?? null,
+      audioUnderPlayhead?.clip ?? null,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playhead, videoUnderPlayhead, audioUnderPlayhead]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -588,6 +929,9 @@ function App() {
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
         e.preventDefault();
         void onRedo();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "b" || e.key === "B")) {
+        e.preventDefault();
+        void splitAtPlayhead();
       } else if (e.key === "s" || e.key === "S") {
         setTool("select");
       } else if (e.key === "x" || e.key === "X") {
@@ -627,111 +971,34 @@ function App() {
   }
 
   const topbar = (
-    <header className="topbar">
-      <div className="brand">
-        <span className="logo">YX</span>
-        <div>
-          <strong>Project YX</strong>
-          <span className={`pill tier-${boot.policy.tier}`}>{boot.policy.tier}</span>
-        </div>
-      </div>
-
-      <div className="top-tools">
-        <button className="tool" onClick={() => void onUndo()} title="Undo (Ctrl+Z)">
-          ↶
-        </button>
-        <button className="tool" onClick={() => void onRedo()} title="Redo (Ctrl+Y)">
-          ↷
-        </button>
-      </div>
-
-      <div className="top-actions">
-        <button className="ghost-btn" disabled={busy} onClick={() => void onImport()}>
-          Import
-        </button>
-        <button
-          className="primary-btn"
-          disabled={busy || !exportSource}
-          onClick={openExportDialog}
-        >
-          Export
-        </button>
-      </div>
-    </header>
-  );
-
-  const effects = (
-    <aside className="right-rail">
-      <nav className="rail-tabs">
-        {(
-          [
-            ["effects", "Effects"],
-            ["adjust", "Clip"],
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            className={rightTab === id ? "active" : ""}
-            onClick={() => setRightTab(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
-
-      <div className="rail-body">
-        {rightTab === "effects" && (
-          <div className="effect-grid">
-            {FILTERS.map((f) => (
-              <button
-                key={f.id}
-                className={`effect-card ${f.heavy && !boot.policy.preview_allows_heavy_filters ? "heavy" : ""}`}
-                disabled={!selectedClipId}
-                onClick={() => void onFilter(f.id)}
-              >
-                <span className="effect-icon">{f.label.slice(0, 1)}</span>
-                <span>{f.label}</span>
-              </button>
-            ))}
-          </div>
-        )}
-
-        {rightTab === "adjust" && (
-          <div className="adjust-panel">
-            {selectedClip ? (
-              <>
-                <h3>{fileName(selectedClip.clip.media_path)}</h3>
-                <dl>
-                  <div>
-                    <dt>Track</dt>
-                    <dd>
-                      {selectedClip.track.name} · {selectedClip.clip.role}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Linked</dt>
-                    <dd>{selectedClip.clip.linked_clip_id ? "Yes" : "No"}</dd>
-                  </div>
-                  <div>
-                    <dt>Filters</dt>
-                    <dd>
-                      {selectedClip.clip.filters.map((f) => f.kind).join(", ") || "None"}
-                    </dd>
-                  </div>
-                </dl>
-              </>
-            ) : (
-              <p className="empty-hint">Select a timeline clip.</p>
-            )}
-            <div className="machine-card compact">
-              <p>
-                {boot.policy.tier} · proxy {boot.policy.proxy.height}p
-              </p>
-            </div>
-          </div>
-        )}
-      </div>
-    </aside>
+    <TopMenubar
+      tier={boot.policy.tier}
+      busy={busy}
+      canExport={canExport}
+      playing={playing}
+      snap={snapOn}
+      onImport={() => void onImport()}
+      onExport={openExportDialog}
+      onUndo={() => void onUndo()}
+      onRedo={() => void onRedo()}
+      onAspect={setPreviewAspect}
+      onZoomFit={() => viewControlsRef.current?.zoomFit()}
+      onZoomIn={() => viewControlsRef.current?.zoomIn()}
+      onZoomOut={() => viewControlsRef.current?.zoomOut()}
+      onToggleSnap={() => {
+        const next = !snapOn;
+        setSnapOn(next);
+        viewControlsRef.current?.setSnap(next);
+        setStatus(next ? "Snap on" : "Snap off");
+      }}
+      onTogglePlay={togglePlay}
+      onCheckUpdates={() => {
+        void checkForAppUpdate({
+          interactive: true,
+          onStatus: (s) => setStatus(s.message),
+        });
+      }}
+    />
   );
 
   return (
@@ -739,25 +1006,58 @@ function App() {
       <EditorShell
         topbar={topbar}
         bin={
-          <ProjectBin
-            library={library}
-            selectedMediaId={selectedMediaId}
-            filter={binFilter}
-            onFilter={setBinFilter}
-            onSelect={(id) => {
-              setSelectedMediaId(id);
-              setSelectedClipId(null);
-            }}
-            onImport={() => void onImport()}
-            onAddToTimeline={(item) => void addMediaToTimeline(item)}
-            busy={busy}
-            dragOver={dragOver}
-          />
+          <div className="bin-column">
+            <ProjectBin
+              library={library}
+              selectedMediaId={selectedMediaId}
+              filter={binFilter}
+              onFilter={setBinFilter}
+              onSelect={(id) => {
+                setSelectedMediaId(id);
+                setSelectedClipId(null);
+              }}
+              onImport={() => void onImport()}
+              onAddToTimeline={(item) => void addMediaToTimeline(item)}
+              onDropToTimeline={(item, clientX) => {
+                const start = timelineDropRef.current?.(clientX) ?? playhead;
+                void addMediaToTimeline(item, start);
+              }}
+              onDropToClipMonitor={(item) => {
+                setSelectedMediaId(item.id);
+                setLibrary((prev) =>
+                  prev.some((m) => m.id === item.id) ? prev : [item, ...prev],
+                );
+                setBinFilter(item.has_video ? "media" : "audio");
+                setSelectedClipId(null);
+                setStatus(`Clip Monitor · ${item.name}`);
+              }}
+              busy={busy}
+              dragOver={dragOver}
+              effects={FILTERS}
+              effectsEnabled={!!selectedClipId}
+              effectsAllowHeavy={boot.policy.preview_allows_heavy_filters}
+              onApplyEffect={(id) => void onFilter(id)}
+              selectedClipSummary={
+                selectedClip ? fileName(selectedClip.clip.media_path) : null
+              }
+            />
+            <EffectInspector
+              clipId={selectedClipId}
+              clipRole={selectedClip?.clip.role ?? null}
+              filters={(selectedClip?.clip.filters ?? []).map((f) => ({
+                id: f.id,
+                kind: f.kind,
+                enabled: f.enabled,
+                params: (f.params ?? {}) as Record<string, unknown>,
+              }))}
+              onUpdate={(id, params) => void updateFilterParams(id, params)}
+              onToggle={(id, en) => void toggleFilter(id, en)}
+              onRemove={(id) => void removeFilter(id)}
+            />
+          </div>
         }
         clipMonitor={
-          selectedMedia ? (
-            <ClipMonitor media={selectedMedia} aspect={previewAspect} />
-          ) : null
+          <ClipMonitor media={selectedMedia} aspect={previewAspect} />
         }
         projectMonitor={
           <ProjectMonitor
@@ -773,9 +1073,31 @@ function App() {
             audioRef={audioRef}
             onTogglePlay={togglePlay}
             onSeekRatio={(ratio) => seekTimeline(ratio * projectDuration)}
+            cropTool={cropTool}
+            onCropTool={setCropTool}
+            cropDraft={
+              (() => {
+                const c = selectedClip?.clip.filters?.find((f) => f.kind === "crop" && f.enabled);
+                if (!c?.params) return null;
+                const p = c.params as Record<string, number>;
+                return {
+                  left: p.left ?? 0,
+                  top: p.top ?? 0,
+                  right: p.right ?? 0,
+                  bottom: p.bottom ?? 0,
+                };
+              })()
+            }
+            onCropCommit={(crop) => void commitCrop(crop)}
+            chromakeyActive={Boolean(
+              selectedClip?.clip.filters?.some((f) => f.kind === "chromakey" && f.enabled),
+            )}
+            onEyedropColor={(hex) => {
+              const f = selectedClip?.clip.filters?.find((x) => x.kind === "chromakey");
+              if (f) void updateFilterParams(f.id, { ...(f.params as object), color: hex });
+            }}
           />
         }
-        effects={effects}
         timeline={
           <TimelinePanel
             timeline={timeline}
@@ -797,6 +1119,13 @@ function App() {
             onAddMarker={() => void addMarkerAtPlayhead()}
             onUndo={() => void onUndo()}
             onRedo={() => void onRedo()}
+            onRegisterDropResolver={(fn) => {
+              timelineDropRef.current = fn;
+            }}
+            onRegisterViewControls={(api) => {
+              viewControlsRef.current = api;
+              if (api) setSnapOn(api.snap);
+            }}
           />
         }
       />
@@ -804,9 +1133,35 @@ function App() {
         open={exportOpen}
         busy={busy}
         progress={exportProgress}
-        sourceName={exportSource ? fileName(exportSource) : null}
+        sourceName={
+          hasTimelineClips
+            ? "Timeline sequence (with cuts)"
+            : exportSource
+              ? fileName(exportSource)
+              : null
+        }
         sourceInfo={
           (() => {
+            if (hasTimelineClips && timeline) {
+              const fromLibrary =
+                selectedMedia ??
+                library.find((m) =>
+                  timeline.tracks.some((t) =>
+                    t.clips.some(
+                      (c) =>
+                        c.media_path === m.path ||
+                        fileName(c.media_path) === fileName(m.path),
+                    ),
+                  ),
+                ) ??
+                null;
+              return {
+                width: fromLibrary?.width || timeline.width || 1920,
+                height: fromLibrary?.height || timeline.height || 1080,
+                frameRate: fromLibrary?.frame_rate || timeline.frame_rate || 30,
+                duration: projectDuration,
+              };
+            }
             const item =
               library.find((m) => m.path === exportSource) ??
               (selectedMedia?.path === exportSource ? selectedMedia : null);
@@ -837,7 +1192,19 @@ function normalizeTimeline(t: Timeline): Timeline {
     markers: t.markers ?? [],
     zone_in: t.zone_in ?? null,
     zone_out: t.zone_out ?? null,
-    tracks: t.tracks.map((tr) => ({ ...tr, hidden: tr.hidden ?? false })),
+    tracks: t.tracks.map((tr) => ({
+      ...tr,
+      hidden: tr.hidden ?? false,
+      clips: tr.clips.map((c) => ({
+        ...c,
+        fade_in: c.fade_in ?? 0,
+        fade_out: c.fade_out ?? 0,
+        filters: (c.filters ?? []).map((f) => ({
+          ...f,
+          params: (f.params ?? {}) as Record<string, unknown>,
+        })),
+      })),
+    })),
   };
 }
 

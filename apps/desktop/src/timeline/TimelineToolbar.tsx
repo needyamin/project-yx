@@ -1,5 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import type { EditMode, TimelineTool } from "./types";
+import {
+  IconMore,
+  IconRazor,
+  IconRedo,
+  IconRipple,
+  IconSelect,
+  IconSlip,
+  IconSpacer,
+  IconSplit,
+  IconUndo,
+  IconZoomFit,
+  IconZoomIn,
+  IconZoomOut,
+} from "./icons";
 
 type Props = {
   tool: TimelineTool;
@@ -16,6 +30,12 @@ type Props = {
   onToggleLink: () => void;
   onRippleDelete: () => void;
   onSplitAtPlayhead: () => void;
+  /** Kdenlive: Remove Space in All Tracks (at playhead). */
+  onRemoveSpaceAllTracks: () => void;
+  /** Kdenlive: Remove All Spaces After Cursor (all tracks from playhead). */
+  onRemoveAllSpacesAfterCursor: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onZoomFit: () => void;
@@ -39,6 +59,10 @@ export function TimelineToolbar({
   onToggleLink,
   onRippleDelete,
   onSplitAtPlayhead,
+  onRemoveSpaceAllTracks,
+  onRemoveAllSpacesAfterCursor,
+  onUndo,
+  onRedo,
   onZoomIn,
   onZoomOut,
   onZoomFit,
@@ -76,33 +100,75 @@ export function TimelineToolbar({
     <div className="tl-toolbar">
       <div className="tl-tool-group">
         <button
-          className={tool === "select" ? "active" : ""}
-          title="Select / drag move (S)"
+          type="button"
+          className={`tl-tool-btn ${tool === "select" ? "active" : ""}`}
+          title="Selection tool (S)"
           onClick={() => onTool("select")}
         >
-          Select
+          <IconSelect />
+          <span>Select</span>
         </button>
         <button
-          className={tool === "razor" ? "active" : ""}
-          title="Razor cut (X)"
+          type="button"
+          className="tl-tool-btn"
+          title="Split clip at playhead (Ctrl+B)"
+          onClick={onSplitAtPlayhead}
+        >
+          <IconSplit />
+          <span>Split</span>
+        </button>
+        <button
+          type="button"
+          className={`tl-tool-btn ${tool === "razor" ? "active" : ""}`}
+          title="Cut / razor — click a clip to cut (X)"
           onClick={() => onTool("razor")}
         >
-          Razor
+          <IconRazor />
+          <span>Cut</span>
         </button>
-        <button title="Split at playhead (Ctrl+B)" onClick={onSplitAtPlayhead}>
-          Split
+        <button
+          type="button"
+          className={`tl-tool-btn ${tool === "spacer" ? "active" : ""}`}
+          title="Spacer tool — drag to create or remove space (M)"
+          onClick={() => onTool("spacer")}
+        >
+          <IconSpacer />
+          <span>Spacer</span>
+        </button>
+        <button
+          type="button"
+          className={`tl-tool-btn ${tool === "slip" ? "active" : ""}`}
+          title="Slip tool (Y)"
+          onClick={() => onTool("slip")}
+        >
+          <IconSlip />
+          <span>Slip</span>
+        </button>
+        <button
+          type="button"
+          className={`tl-tool-btn ${tool === "ripple" ? "active" : ""}`}
+          title="Ripple tool (R)"
+          onClick={() => onTool("ripple")}
+        >
+          <IconRipple />
+          <span>Ripple</span>
         </button>
       </div>
 
       <div className="tl-tool-group tl-zoom-group">
-        <button title="Zoom out" onClick={onZoomOut}>
-          −
+        <button type="button" className="tl-icon-btn" title="Zoom out" onClick={onZoomOut}>
+          <IconZoomOut />
         </button>
-        <button className="fit-btn active" title="Fit entire timeline in view" onClick={onZoomFit}>
-          Fit
+        <button
+          type="button"
+          className="tl-icon-btn"
+          title="Fit entire timeline in view"
+          onClick={onZoomFit}
+        >
+          <IconZoomFit />
         </button>
-        <button title="Zoom in" onClick={onZoomIn}>
-          +
+        <button type="button" className="tl-icon-btn" title="Zoom in" onClick={onZoomIn}>
+          <IconZoomIn />
         </button>
         {pxPerSec != null && (
           <span className="tl-zoom-label" title="Pixels per second">
@@ -113,34 +179,16 @@ export function TimelineToolbar({
 
       <div className="tl-tool-group tl-more-wrap" ref={moreRef}>
         <button
-          className={moreOpen ? "active" : ""}
+          type="button"
+          className={`tl-tool-btn ${moreOpen ? "active" : ""}`}
           title="More tools"
           onClick={() => setMoreOpen((v) => !v)}
         >
-          More…
+          <IconMore />
+          <span>More</span>
         </button>
         {moreOpen && (
           <div className="tl-more-menu" role="menu">
-            <p className="tl-more-label">Tools</p>
-            {(
-              [
-                ["spacer", "Spacer (M)"],
-                ["slip", "Slip (Y)"],
-                ["ripple", "Ripple (R)"],
-              ] as const
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                role="menuitem"
-                className={tool === id ? "active" : ""}
-                onClick={() => run(() => onTool(id))}
-              >
-                {label}
-              </button>
-            ))}
-
-            <div className="tl-more-sep" />
             <p className="tl-more-label">Edit mode</p>
             {(
               [
@@ -179,6 +227,19 @@ export function TimelineToolbar({
             </button>
 
             <div className="tl-more-sep" />
+            <p className="tl-more-label">Space</p>
+            <button type="button" role="menuitem" onClick={() => run(onRemoveSpaceAllTracks)}>
+              Remove Space in All Tracks
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => run(onRemoveAllSpacesAfterCursor)}
+            >
+              Remove All Spaces After Cursor
+            </button>
+
+            <div className="tl-more-sep" />
             <p className="tl-more-label">Edit</p>
             <button
               type="button"
@@ -199,6 +260,15 @@ export function TimelineToolbar({
             </button>
           </div>
         )}
+      </div>
+
+      <div className="tl-tool-group">
+        <button type="button" className="tl-icon-btn" title="Undo (Ctrl+Z)" onClick={onUndo}>
+          <IconUndo />
+        </button>
+        <button type="button" className="tl-icon-btn" title="Redo (Ctrl+Y)" onClick={onRedo}>
+          <IconRedo />
+        </button>
       </div>
     </div>
   );
