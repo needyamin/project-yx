@@ -6,11 +6,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
-use yx_detect::PerformancePolicy;
+use yx_detect::{command_no_window, PerformancePolicy};
 use yx_media::{probe_media, MediaError, MediaInfo};
 
 #[derive(Debug, Error)]
@@ -138,7 +137,7 @@ impl ProxyManager {
         let bitrate = format!("{}k", policy.proxy.video_bitrate_kbps);
         let threads = policy.encode_threads.to_string();
 
-        let output = Command::new("ffmpeg")
+        let output = command_no_window("ffmpeg")
             .args([
                 "-y",
                 "-i",

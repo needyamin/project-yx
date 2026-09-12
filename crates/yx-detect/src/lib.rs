@@ -195,6 +195,26 @@ fn which_ffmpeg() -> Option<std::path::PathBuf> {
     which_bin("ffmpeg")
 }
 
+/// Spawn helper that does not flash a console window on Windows.
+pub fn command_no_window(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        // CREATE_NO_WINDOW prevents the black ffmpeg console flash on GUI apps.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null());
+    }
+    #[cfg(not(windows))]
+    {
+        use std::process::Stdio;
+        cmd.stdin(Stdio::null());
+    }
+    cmd
+}
+
 fn which_bin(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -250,7 +270,7 @@ fn probe_ffmpeg_hwaccels() -> (Vec<String>, Vec<String>) {
     let mut decode = Vec::new();
     let mut encode = Vec::new();
 
-    if let Ok(output) = std::process::Command::new("ffmpeg")
+    if let Ok(output) = command_no_window("ffmpeg")
         .args(["-hide_banner", "-hwaccels"])
         .output()
     {
@@ -270,7 +290,7 @@ fn probe_ffmpeg_hwaccels() -> (Vec<String>, Vec<String>) {
         }
     }
 
-    if let Ok(output) = std::process::Command::new("ffmpeg")
+    if let Ok(output) = command_no_window("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
     {

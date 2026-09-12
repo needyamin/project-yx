@@ -16,7 +16,9 @@
         "width": 1280,
         "height": 800,
         "minWidth": 960,
-        "minHeight": 640
+        "minHeight": 640,
+        "visible": false,
+        "backgroundColor": "#141418"
       }
     ],
     "security": {
@@ -44,8 +46,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "createUpdaterArtifacts": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",
@@ -53,7 +55,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "both",
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    }
   },
   "plugins": {
     "updater": {

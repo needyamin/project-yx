@@ -8,6 +8,7 @@ import { ProjectBin, type BinFilter } from "./bin/ProjectBin";
 import { EditorShell } from "./layout/EditorShell";
 import { TopMenubar } from "./layout/TopMenubar";
 import { checkForAppUpdate } from "./update/checkUpdate";
+import { UpdateDialog } from "./update/UpdateDialog";
 import { ClipMonitor } from "./monitors/ClipMonitor";
 import { ProjectMonitor, type PreviewAspect } from "./monitors/ProjectMonitor";
 import { EffectInspector } from "./effects/EffectInspector";
@@ -87,6 +88,7 @@ function App() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewAspect, setPreviewAspect] = useState<PreviewAspect>("landscape");
   const [exportOpen, setExportOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [cropTool, setCropTool] = useState(false);
@@ -121,6 +123,19 @@ function App() {
     }, 2500);
     return () => window.clearTimeout(t);
   }, [boot]);
+
+  // Tray: Check for Updates…
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("tray-check-updates", () => {
+      setUpdateOpen(true);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   const selectedMedia = useMemo(
     () => library.find((m) => m.id === selectedMediaId) ?? null,
@@ -992,12 +1007,7 @@ function App() {
         setStatus(next ? "Snap on" : "Snap off");
       }}
       onTogglePlay={togglePlay}
-      onCheckUpdates={() => {
-        void checkForAppUpdate({
-          interactive: true,
-          onStatus: (s) => setStatus(s.message),
-        });
-      }}
+      onCheckUpdates={() => setUpdateOpen(true)}
     />
   );
 
@@ -1180,6 +1190,7 @@ function App() {
         onClose={() => !busy && setExportOpen(false)}
         onExport={(settings) => void runExport(settings)}
       />
+      <UpdateDialog open={updateOpen} onClose={() => setUpdateOpen(false)} />
     </>
   );
 }

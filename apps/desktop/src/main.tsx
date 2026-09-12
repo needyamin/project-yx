@@ -1,6 +1,18 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
+
+/** Show window after first paint to avoid blank WebView flashes on Windows. */
+async function showMainWindow() {
+  try {
+    const win = getCurrentWindow();
+    await win.show();
+    await win.setFocus();
+  } catch {
+    /* browser / missing ACL — Rust fallback may still show */
+  }
+}
 
 // Desktop app: never show WebView browser chrome (Print / Refresh / Inspect).
 document.addEventListener("contextmenu", (e) => {
@@ -14,3 +26,9 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <App />
   </React.StrictMode>,
 );
+
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    void showMainWindow();
+  });
+});

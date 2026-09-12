@@ -15,7 +15,7 @@ export type FilterInstance = {
   id: string;
   kind: string;
   enabled: boolean;
-  params: Record<string, unknown>;
+  params?: Record<string, unknown>;
 };
 
 export const EFFECT_CATALOG: {

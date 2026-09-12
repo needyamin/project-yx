@@ -2,9 +2,20 @@
   "name": "project-yx-workspace",
   "private": true,
   "version": "0.1.0",
+  "type": "module",
   "scripts": {
     "dev": "npm --prefix apps/desktop run tauri dev",
     "tauri": "npm --prefix apps/desktop run tauri",
-    "build": "npm --prefix apps/desktop run tauri build"
+    "build": "npm --prefix apps/desktop run tauri build",
+    "dist": "node scripts/build-windows.js",
+    "dist:nsis": "node scripts/build-windows.js --nsis-only",
+    "dist:portable": "node scripts/build-portable.js",
+    "dist:inno": "node scripts/build-inno.js",
+    "dist:msix": "node scripts/build-msix.js",
+    "dist:win": "node scripts/build-win.js",
+    "dist:release": "node scripts/build-release.js",
+    "dist:linux": "node scripts/build-linux.js",
+    "dist:linux:docker": "node scripts/build-linux-docker.js",
+    "clean": "node scripts/clean.js"
   }
 }

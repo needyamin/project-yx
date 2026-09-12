@@ -5,9 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use thiserror::Error;
-use yx_detect::{PerformancePolicy, PerformanceTier};
+use yx_detect::{command_no_window, PerformancePolicy, PerformanceTier};
 
 #[derive(Debug, Error)]
 pub enum MediaError {
@@ -325,7 +324,7 @@ impl ExportRequest {
 
 pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
     ensure_ffmpeg()?;
-    let output = Command::new("ffprobe")
+    let output = command_no_window("ffprobe")
         .args([
             "-v",
             "quiet",
@@ -823,10 +822,10 @@ where
     F: FnMut(f64),
 {
     use std::io::{BufRead, BufReader, Read};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::thread;
 
-    let mut child = Command::new("ffmpeg")
+    let mut child = command_no_window("ffmpeg")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -903,7 +902,7 @@ fn bitrate_for_height(height: u32) -> String {
 }
 
 fn ensure_ffmpeg() -> Result<(), MediaError> {
-    let ok = Command::new("ffmpeg")
+    let ok = command_no_window("ffmpeg")
         .args(["-version"])
         .output()
         .map(|o| o.status.success())

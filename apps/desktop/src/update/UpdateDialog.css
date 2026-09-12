@@ -1,0 +1,117 @@
+.update-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background: rgba(4, 6, 10, 0.72);
+  backdrop-filter: blur(4px);
+}
+
+.update-modal {
+  width: min(400px, 100%);
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: #12151c;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.update-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.15rem 0.85rem;
+  border-bottom: 1px solid var(--line);
+  background: #161a24;
+}
+
+.update-modal-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.update-modal-head p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.update-close {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.update-close:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text);
+}
+
+.update-close:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.update-modal-body {
+  padding: 1.1rem 1.15rem 0.35rem;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.update-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.update-detail {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 10rem;
+  overflow: auto;
+}
+
+.update-detail.error {
+  color: #f0a0a0;
+}
+
+.update-spinner {
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent, #6ea8fe);
+  border-radius: 50%;
+  animation: update-spin 0.7s linear infinite;
+}
+
+@keyframes update-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.update-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.85rem 1.15rem 1rem;
+}
+
+.update-modal-foot .primary-btn:disabled,
+.update-modal-foot .ghost-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

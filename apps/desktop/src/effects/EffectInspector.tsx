@@ -128,7 +128,7 @@ export function EffectInspector({
               </div>
               <ParamEditors
                 kind={expanded.kind}
-                params={expanded.params}
+                params={expanded.params ?? {}}
                 onChange={(p) => onUpdate(expanded.id, p)}
               />
             </section>
