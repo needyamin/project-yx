@@ -1,4 +1,4 @@
-# Project YX
+# Project YX - Pro Video Editing for Every Machine
 
 Open-source desktop video editor focused on **smooth editing on weak CPUs** and **4K / vertical export**, with a **minimal sticky UI** (bin, project monitor, timeline) and advanced tools tucked into menus.
 
