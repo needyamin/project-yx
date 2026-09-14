@@ -1841,6 +1841,7 @@ function App() {
         timeline={
           <TimelinePanel
             timeline={timeline}
+            library={library}
             selectedClipId={selectedClipId}
             playhead={playhead}
             tool={tool}

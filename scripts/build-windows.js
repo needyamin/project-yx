@@ -14,6 +14,7 @@ import {
   createPortableExe,
   portableStagingPath,
 } from "./lib/portable.js";
+import { prepareBundledBinaries } from "./prepare-binaries.js";
 
 const mode = process.argv.includes("--nsis-only")
   ? "nsis"
@@ -23,6 +24,7 @@ const mode = process.argv.includes("--nsis-only")
 const force = process.argv.includes("--force");
 
 ensureBuild();
+prepareBundledBinaries();
 ensureTauriBuild({ bundles: ["nsis"], force });
 const names = artifactBase();
 ensureDist();

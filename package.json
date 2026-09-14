@@ -16,6 +16,7 @@
     "dist:release": "node scripts/build-release.js",
     "dist:linux": "node scripts/build-linux.js",
     "dist:linux:docker": "node scripts/build-linux-docker.js",
+    "prepare:bin": "node scripts/prepare-binaries.js",
     "clean": "node scripts/clean.js"
   }
 }

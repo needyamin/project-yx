@@ -52,7 +52,7 @@ Modes: **Normal**, **Insert**, **Overwrite** (via **More…** or context menu). 
 
 - Rust stable (`rustup`) — `cargo` on `PATH`
 - Node.js 20+
-- **FFmpeg + ffprobe on `PATH`** (required at runtime for import/export; not bundled)
+- **FFmpeg + ffprobe on `PATH`** (for local development; production release packages bundle them automatically)
 
 ### Windows development
 
@@ -323,4 +323,4 @@ Help → **Check for Updates** uses that feed. Silent checks on launch stay quie
 
 ## License
 
-GPL-3.0-or-later (practical choice when shipping with GPL FFmpeg builds). FFmpeg remains a **system dependency**; bundling a GPL FFmpeg build would add redistribution obligations — this project expects users to install FFmpeg themselves.
+GPL-3.0-or-later (practical choice when shipping with GPL FFmpeg builds). Production release packages bundle FFmpeg and ffprobe directly for an out-of-the-box zero-setup experience, while the engine cleanly supports custom system PATH binaries as well.

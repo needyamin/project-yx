@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
-use yx_detect::{command_no_window, PerformancePolicy};
+use yx_detect::{command_ffmpeg, PerformancePolicy};
 use yx_media::{probe_media, MediaError, MediaInfo};
 
 #[derive(Debug, Error)]
@@ -137,7 +137,7 @@ impl ProxyManager {
         let bitrate = format!("{}k", policy.proxy.video_bitrate_kbps);
         let threads = policy.encode_threads.to_string();
 
-        let output = command_no_window("ffmpeg")
+        let output = command_ffmpeg()
             .args([
                 "-y",
                 "-i",

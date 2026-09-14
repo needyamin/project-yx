@@ -10,10 +10,12 @@ import {
   createPortableExe,
   portableStagingPath,
 } from "./lib/portable.js";
+import { prepareBundledBinaries } from "./prepare-binaries.js";
 
 const force = process.argv.includes("--force");
 
 ensureBuild();
+prepareBundledBinaries();
 ensureTauriBuild({ bundles: ["nsis"], force });
 
 const names = artifactBase();

@@ -48,7 +48,7 @@ export function stagePortableApp(stagingDir) {
     const lower = name.toLowerCase();
     if (skip.has(name)) continue;
     if (entry.isDirectory()) {
-      if (name === "resources") {
+      if (name === "resources" || name === "bin") {
         copyDir(path.join(rel, name), path.join(stagingDir, name));
       }
       continue;
@@ -69,14 +69,21 @@ export function stagePortableApp(stagingDir) {
     }
   }
 
+  // Also stage bundled media binaries from src-tauri/bin if available
+  const tauriBin = path.join(TAURI_DIR, "bin");
+  if (fs.existsSync(tauriBin)) {
+    copyDir(tauriBin, path.join(stagingDir, "bin"));
+  }
+
   // README for portable users
   const readme = `Project YX — Portable
 
 Extract all files and run yx-desktop.exe (or Project YX.exe).
 
+Includes bundled FFmpeg and ffprobe in bin/ for out-of-the-box editing and export.
+
 Requirements:
 - Windows 10/11 with WebView2 (usually preinstalled)
-- FFmpeg and ffprobe available on PATH for import/export
 
 This build does not install to Program Files and does not require an installer.
 `;

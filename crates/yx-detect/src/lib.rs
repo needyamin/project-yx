@@ -191,8 +191,71 @@ pub fn encode_thread_cap(physical_cpus: usize) -> usize {
     physical_cpus.saturating_sub(1).max(1)
 }
 
+/// Find a binary by checking:
+/// 1. Next to the running executable (and its bin/ or resources/ subdirectories)
+/// 2. Current working directory (and dev bin folders)
+/// 3. System PATH
+pub fn find_binary(name: &str) -> Option<std::path::PathBuf> {
+    // 1. Check relative to current executable
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let candidates = [
+                exe_dir.join(name),
+                exe_dir.join(format!("{name}.exe")),
+                exe_dir.join("bin").join(name),
+                exe_dir.join("bin").join(format!("{name}.exe")),
+                exe_dir.join("resources").join(name),
+                exe_dir.join("resources").join(format!("{name}.exe")),
+                exe_dir.join("resources").join("bin").join(name),
+                exe_dir.join("resources").join("bin").join(format!("{name}.exe")),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. Check current working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidates = [
+            cwd.join(name),
+            cwd.join(format!("{name}.exe")),
+            cwd.join("bin").join(name),
+            cwd.join("bin").join(format!("{name}.exe")),
+            cwd.join("apps").join("desktop").join("src-tauri").join("bin").join(name),
+            cwd.join("apps").join("desktop").join("src-tauri").join("bin").join(format!("{name}.exe")),
+        ];
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // 3. Fall back to system PATH
+    which_bin(name)
+}
+
+pub fn ffmpeg_path() -> std::path::PathBuf {
+    find_binary("ffmpeg").unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"))
+}
+
+pub fn ffprobe_path() -> std::path::PathBuf {
+    find_binary("ffprobe").unwrap_or_else(|| std::path::PathBuf::from("ffprobe"))
+}
+
+pub fn command_ffmpeg() -> std::process::Command {
+    command_no_window(ffmpeg_path())
+}
+
+pub fn command_ffprobe() -> std::process::Command {
+    command_no_window(ffprobe_path())
+}
+
 fn which_ffmpeg() -> Option<std::path::PathBuf> {
-    which_bin("ffmpeg")
+    find_binary("ffmpeg")
 }
 
 /// Spawn helper that does not flash a console window on Windows.
@@ -270,7 +333,7 @@ fn probe_ffmpeg_hwaccels() -> (Vec<String>, Vec<String>) {
     let mut decode = Vec::new();
     let mut encode = Vec::new();
 
-    if let Ok(output) = command_no_window("ffmpeg")
+    if let Ok(output) = command_ffmpeg()
         .args(["-hide_banner", "-hwaccels"])
         .output()
     {
@@ -290,7 +353,7 @@ fn probe_ffmpeg_hwaccels() -> (Vec<String>, Vec<String>) {
         }
     }
 
-    if let Ok(output) = command_no_window("ffmpeg")
+    if let Ok(output) = command_ffmpeg()
         .args(["-hide_banner", "-encoders"])
         .output()
     {
@@ -344,5 +407,13 @@ mod tests {
     fn encode_cap_leaves_one_core() {
         assert_eq!(encode_thread_cap(8), 7);
         assert_eq!(encode_thread_cap(1), 1);
+    }
+
+    #[test]
+    fn find_binary_discovers_ffmpeg_or_fallback() {
+        let path = ffmpeg_path();
+        assert!(!path.as_os_str().is_empty());
+        let probe = ffprobe_path();
+        assert!(!probe.as_os_str().is_empty());
     }
 }

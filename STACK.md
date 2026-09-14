@@ -31,7 +31,7 @@ This document describes the full technology stack used by **Project YX**: what e
 └───────────────────────────┬─────────────────────────────┘
                             │ subprocess / PATH
 ┌───────────────────────────▼─────────────────────────────┐
-│  FFmpeg + ffprobe  (system install, not bundled)        │
+│  FFmpeg + ffprobe  (bundled in releases; PATH fallback) │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -130,7 +130,7 @@ Configured for smaller/faster shipping binaries: `lto = true`, `opt-level = 3`, 
 | Proxies | `yx-proxy` generates lighter edit media; export prefers originals |
 | Hardware | `yx-detect` influences proxy/export choices |
 
-**Runtime requirement:** `ffmpeg` and `ffprobe` must be on the system `PATH`. They are **not** bundled into EXE/MSIX/AppImage by default.
+**Bundling & Runtime:** Releases bundle `ffmpeg` and `ffprobe` directly into the package (`bin/` resources) for zero-setup out-of-the-box editing and 4K export. The engine (`yx-detect`) automatically checks the application directory first and cleanly falls back to system `PATH` if custom binaries are desired.
 
 ---
 

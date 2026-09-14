@@ -38,6 +38,7 @@ import {
   createPortableExe,
   portableStagingPath,
 } from "./lib/portable.js";
+import { prepareBundledBinaries } from "./prepare-binaries.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const forceWindowsOnly = process.argv.includes("--windows-only");
@@ -63,6 +64,9 @@ console.log("[yx-dist] === Clean previous release artifacts ===");
 cleanReleaseArtifacts();
 ensureBuild();
 ensureDist();
+
+console.log("[yx-dist] === Stage bundled media binaries (FFmpeg & FFprobe) ===");
+prepareBundledBinaries();
 
 console.log("[yx-dist] === Force Tauri production build (NSIS) ===");
 const buildResult = ensureTauriBuild({

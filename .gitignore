@@ -17,6 +17,7 @@
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/WixTools/
 apps/desktop/src-tauri/nsis/
+apps/desktop/src-tauri/bin/
 
 # Local caches / tooling
 .proxy-cache/

@@ -12,6 +12,7 @@ import { TrackHeader } from "./TrackHeader";
 import {
   formatTime,
   formatRulerTime,
+  fileName,
   findLinkPartner,
   clipTimelineDuration,
   timelineDuration,
@@ -63,6 +64,7 @@ type Props = {
       snap: boolean;
     } | null,
   ) => void;
+  library?: LibraryItem[];
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
 };
@@ -74,6 +76,7 @@ export function TimelinePanel({
   tool,
   status,
   tier,
+  library = [],
   onTool,
   onTimeline,
   onSelectClip,
@@ -98,16 +101,21 @@ export function TimelinePanel({
   const headerDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   const [binDragOver, setBinDragOver] = useState(false);
+  const [rulerHoverTime, setRulerHoverTime] = useState<number | null>(null);
   const [binDropPreview, setBinDropPreview] = useState<{
     item: LibraryItem;
     start: number;
     trackId: string;
   } | null>(null);
   const [headerPx, setHeaderPx] = useState(HEADER_DEFAULT);
-  /** Live start shared by linked A/V while one partner is moved. */
+  /** Live draft shared by linked A/V while one partner is moved or resized. */
   const [dragPreview, setDragPreview] = useState<{
-    clipIds: string[];
-    start: number;
+    partnerClipId: string;
+    draft: {
+      start: number;
+      in_point: number;
+      out_point: number;
+    };
   } | null>(null);
   const duration = timelineDuration(timeline, 10);
   const view = useTimelineView(duration);
@@ -592,14 +600,20 @@ export function TimelinePanel({
               className="tl-ruler"
               onClick={onLanePointer}
               onPointerDown={beginScrub}
+              onPointerMove={(e) => {
+                setRulerHoverTime(timeFromClientX(e.clientX));
+              }}
+              onPointerLeave={() => {
+                setRulerHoverTime(null);
+              }}
               onContextMenu={(e) => {
                 openContext(e, { kind: "ruler", at: timeFromClientX(e.clientX) });
               }}
             >
-              {rulerTicks(duration, view.pxPerSec).map((tick) => (
+              {rulerTicks(Math.max(duration + 120, view.xToTime(view.contentWidth) + 60), view.pxPerSec).map((tick) => (
                 <span
                   key={tick.t}
-                  className={`tl-tick ${tick.major ? "major" : "minor"}`}
+                  className={`tl-tick ${tick.kind}`}
                   style={{ left: view.timeToX(tick.t) }}
                 >
                   <i className="tl-tick-mark" aria-hidden />
@@ -608,6 +622,16 @@ export function TimelinePanel({
                   ) : null}
                 </span>
               ))}
+              {rulerHoverTime != null && (
+                <div
+                  className="tl-ruler-hover"
+                  style={{ left: view.timeToX(rulerHoverTime) }}
+                >
+                  <span className="tl-ruler-hover-badge">
+                    {formatTime(rulerHoverTime)}
+                  </span>
+                </div>
+              )}
               {zoneLeft != null && zoneRight != null && zoneRight > zoneLeft && (
                 <div
                   className="tl-zone"
@@ -687,20 +711,47 @@ export function TimelinePanel({
                       </div>
                     </div>
                   )}
-                  {track.clips.map((clip: Clip) => (
-                    <ClipBlock
-                      key={clip.id}
-                      clip={clip}
-                      selected={selectedClipId === clip.id}
-                      tool={tool}
-                      view={view}
-                      locked={track.locked}
-                      anchors={anchors.filter(
-                        (a) =>
-                          a !== clip.start &&
-                          a !== clip.start + clipTimelineDuration(clip),
-                      )}
-                      onSelect={() => onSelectClip(clip.id)}
+                  {track.clips.map((clip: Clip) => {
+                    const trackObstacles = track.clips
+                      .filter((c) => c.id !== clip.id)
+                      .map((c) => ({ start: c.start, duration: clipTimelineDuration(c) }));
+                    let obstacles = trackObstacles;
+                    if (clip.linked_clip_id) {
+                      for (const t of timeline.tracks) {
+                        if (t.clips.some((c) => c.id === clip.linked_clip_id)) {
+                          const partnerObstacles = t.clips
+                            .filter((c) => c.id !== clip.linked_clip_id)
+                            .map((c) => ({ start: c.start, duration: clipTimelineDuration(c) }));
+                          obstacles = [...trackObstacles, ...partnerObstacles];
+                          break;
+                        }
+                      }
+                    }
+
+                    const libItem = library.find(
+                      (m) =>
+                        m.path === clip.media_path ||
+                        fileName(m.path) === fileName(clip.media_path),
+                    );
+                    const maxMediaDuration = libItem?.duration ?? Infinity;
+
+                    return (
+                      <ClipBlock
+                        key={clip.id}
+                        clip={clip}
+                        selected={selectedClipId === clip.id}
+                        tool={tool}
+                        view={view}
+                        locked={track.locked}
+                        obstacles={obstacles}
+                        editMode={timeline.edit_mode ?? "normal"}
+                        maxMediaDuration={maxMediaDuration}
+                        anchors={anchors.filter(
+                          (a) =>
+                            a !== clip.start &&
+                            a !== clip.start + clipTimelineDuration(clip),
+                        )}
+                        onSelect={() => onSelectClip(clip.id)}
                       onContextMenu={(e) => {
                         const at = timeFromClientX(e.clientX);
                         const end = clip.start + clipTimelineDuration(clip);
@@ -715,9 +766,9 @@ export function TimelinePanel({
                           clipEnd: end,
                         });
                       }}
-                      previewStart={
-                        dragPreview?.clipIds.includes(clip.id)
-                          ? dragPreview.start
+                      previewDraft={
+                        dragPreview?.partnerClipId === clip.id
+                          ? dragPreview.draft
                           : null
                       }
                       onDragActive={(active) => {
@@ -730,15 +781,15 @@ export function TimelinePanel({
                           `Cut at ${formatTime(at)}`,
                         )
                       }
-                      onMoveDrag={(phase, start) => {
+                      onLiveDrag={(phase, draft) => {
                         if (!clip.linked_clip_id) return;
                         if (phase === "end") {
                           setDragPreview(null);
                           return;
                         }
                         setDragPreview({
-                          clipIds: [clip.id, clip.linked_clip_id],
-                          start,
+                          partnerClipId: clip.linked_clip_id,
+                          draft,
                         });
                       }}
                       onMove={(newStart) => {
@@ -758,15 +809,16 @@ export function TimelinePanel({
                           }
                         })();
                       }}
-                      onTrim={(inPoint, outPoint, keepEnd) =>
+                      onTrim={(inPoint, outPoint, keepEnd) => {
+                        setDragPreview(null);
                         void run("trim_clip", {
                           clipId: clip.id,
                           inPoint,
                           outPoint,
                           keepEnd,
                           syncLinked: true,
-                        })
-                      }
+                        });
+                      }}
                       onRippleTrim={(edge, newEdgeTime) =>
                         void run(
                           "ripple_trim",
@@ -802,7 +854,8 @@ export function TimelinePanel({
                         )
                       }
                     />
-                  ))}
+                  );
+                })}
                   <div className="tl-playhead" style={{ left: view.timeToX(playhead) }} />
                 </div>
               );
@@ -982,15 +1035,23 @@ export function TimelinePanel({
   );
 }
 
-/** Major/minor ticks; labels emphasize minutes when zoomed out. */
+export type RulerTickKind = "major" | "medium" | "minor";
+
+export type RulerTick = {
+  t: number;
+  kind: RulerTickKind;
+  label: string | null;
+};
+
+/** Detailed ruler ticks: major time labels, halfway medium ticks, and minor divisions covering the timeline. */
 function rulerTicks(
   duration: number,
   pxPerSec: number,
-): { t: number; major: boolean; label: string | null }[] {
-  const targetPx = 72;
+): RulerTick[] {
+  const targetPx = 90;
   const rawStep = targetPx / Math.max(0.01, pxPerSec);
   const nice = [
-    0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
+    0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
   ];
   let step = nice[nice.length - 1];
   for (const n of nice) {
@@ -1000,34 +1061,38 @@ function rulerTicks(
     }
   }
 
-  let minorStep = step;
-  if (step >= 60) minorStep = step / 5;
-  else if (step >= 10) minorStep = step / 5;
-  else if (step >= 1) minorStep = step / 2;
+  let subDivisions = 5;
+  if (step === 1 || step === 2 || step === 10 || step === 60) {
+    subDivisions = 5;
+  } else if (step === 0.5 || step === 0.1 || step === 15 || step === 30) {
+    subDivisions = 5;
+  } else {
+    subDivisions = 4;
+  }
+  const minorStep = step / subDivisions;
 
   const isMajor = (t: number) => {
     const q = t / step;
-    return Math.abs(q - Math.round(q)) < 1e-6;
+    return Math.abs(q - Math.round(q)) < 1e-4;
   };
 
-  const ticks: { t: number; major: boolean; label: string | null }[] = [];
-  const end = duration + 1e-6;
+  const isMedium = (t: number) => {
+    const halfStep = step / 2;
+    const q = t / halfStep;
+    return Math.abs(q - Math.round(q)) < 1e-4;
+  };
+
+  const ticks: RulerTick[] = [];
+  const end = duration + 1e-4;
   for (let t = 0; t <= end; t += minorStep) {
-    const rounded = Number(t.toFixed(3));
+    const rounded = Number(t.toFixed(4));
     const major = isMajor(rounded);
+    const medium = !major && isMedium(rounded);
+    const kind: RulerTickKind = major ? "major" : medium ? "medium" : "minor";
     ticks.push({
       t: rounded,
-      major,
+      kind,
       label: major ? formatRulerTime(rounded, step) : null,
-    });
-  }
-  const last = ticks[ticks.length - 1];
-  if (!last || last.t < duration - 1e-6) {
-    const t = Number(duration.toFixed(3));
-    ticks.push({
-      t,
-      major: true,
-      label: formatRulerTime(t, step),
     });
   }
   return ticks;

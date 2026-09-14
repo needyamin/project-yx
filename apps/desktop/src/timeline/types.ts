@@ -222,3 +222,46 @@ export function findLinkPartner(
   }
   return null;
 }
+
+export type Obstacle = { start: number; duration: number };
+
+/**
+ * Find a start time near `desired` where `[start, start+dur)` does not overlap any obstacles.
+ * Matches the Rust engine's `resolve_non_overlapping_start` behavior so dragging is silky smooth
+ * and never overlaps adjacent clips.
+ */
+export function resolveNonOverlappingStart(
+  desired: number,
+  dur: number,
+  obstacles: Obstacle[],
+): number {
+  let start = Math.max(0, desired);
+  for (let iter = 0; iter < 64; iter++) {
+    const end = start + dur;
+    let conflict: Obstacle | null = null;
+    for (const other of obstacles) {
+      const oEnd = other.start + other.duration;
+      const overlaps = start < oEnd - 0.001 && end > other.start + 0.001;
+      if (overlaps) {
+        conflict = other;
+        break;
+      }
+    }
+    if (!conflict) {
+      return Math.max(0, start);
+    }
+    const snapAfter = conflict.start + conflict.duration;
+    const canSnapBefore = conflict.start >= dur - 0.001;
+    const snapBefore = canSnapBefore ? Math.max(0, conflict.start - dur) : 0;
+    const useBefore =
+      canSnapBefore &&
+      Math.abs(desired - snapBefore) <= Math.abs(desired - snapAfter);
+    const next = useBefore ? snapBefore : snapAfter;
+    if (Math.abs(next - start) < 0.001) {
+      start = snapAfter;
+    } else {
+      start = next;
+    }
+  }
+  return Math.max(0, start);
+}

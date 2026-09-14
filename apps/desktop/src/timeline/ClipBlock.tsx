@@ -1,6 +1,11 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import type { Clip, TimelineTool } from "./types";
-import { clipTimelineDuration, fileName, formatTime } from "./types";
+import type { Clip, EditMode, Obstacle, TimelineTool } from "./types";
+import {
+  clipTimelineDuration,
+  fileName,
+  formatTime,
+  resolveNonOverlappingStart,
+} from "./types";
 import type { TimelineView } from "./useTimelineView";
 
 type Props = {
@@ -10,13 +15,23 @@ type Props = {
   view: TimelineView;
   locked: boolean;
   anchors: number[];
-  /** Live start from parent while a linked partner is being dragged. */
-  previewStart?: number | null;
+  obstacles?: Obstacle[];
+  editMode?: EditMode;
+  maxMediaDuration?: number;
+  /** Live draft from parent while a linked partner is being dragged or resized. */
+  previewDraft?: {
+    start: number;
+    in_point: number;
+    out_point: number;
+  } | null;
   onSelect: () => void;
   onRazor: (at: number) => void;
   onMove: (newStart: number) => void;
-  /** Notify parent during move so linked partners can preview lockstep. */
-  onMoveDrag?: (phase: "start" | "move" | "end", start: number) => void;
+  /** Notify parent during move/trim so linked partners can preview lockstep. */
+  onLiveDrag?: (
+    phase: "start" | "move" | "end",
+    draft: { start: number; in_point: number; out_point: number },
+  ) => void;
   onTrim: (inPoint: number, outPoint: number, keepEnd: boolean) => void;
   onRippleTrim: (edge: "left" | "right", newEdgeTime: number) => void;
   onSlip: (delta: number) => void;
@@ -34,11 +49,14 @@ export function ClipBlock({
   view,
   locked,
   anchors,
-  previewStart = null,
+  obstacles = [],
+  editMode = "normal",
+  maxMediaDuration = Infinity,
+  previewDraft = null,
   onSelect,
   onRazor,
   onMove,
-  onMoveDrag,
+  onLiveDrag,
   onTrim,
   onRippleTrim,
   onSlip,
@@ -53,14 +71,14 @@ export function ClipBlock({
     fade_in: number;
     fade_out: number;
   } | null>(null);
+  const [dragMode, setDragMode] = useState<DragMode | null>(null);
+  const [trimDelta, setTrimDelta] = useState(0);
   const draggingRef = useRef(false);
 
   // Local draft wins while this clip is dragged; otherwise linked partner preview.
-  const start =
-    draft?.start ??
-    (previewStart != null ? previewStart : clip.start);
-  const inPoint = draft?.in_point ?? clip.in_point;
-  const outPoint = draft?.out_point ?? clip.out_point;
+  const start = draft?.start ?? previewDraft?.start ?? clip.start;
+  const inPoint = draft?.in_point ?? previewDraft?.in_point ?? clip.in_point;
+  const outPoint = draft?.out_point ?? previewDraft?.out_point ?? clip.out_point;
   const fadeIn = draft?.fade_in ?? clip.fade_in ?? 0;
   const fadeOut = draft?.fade_out ?? clip.fade_out ?? 0;
   const speedRaw = clip.speed ?? 1;
@@ -68,7 +86,7 @@ export function ClipBlock({
   const dur = Math.max(0.05, (outPoint - inPoint) / speed);
   const left = view.timeToX(start);
   const width = Math.max(12, view.timeToX(dur));
-  const previewing = !draft && previewStart != null;
+  const previewing = !draft && previewDraft != null;
   const fadeInPx = Math.min(width, view.timeToX(Math.max(0, fadeIn)));
   const fadeOutPx = Math.min(width, view.timeToX(Math.max(0, fadeOut)));
 
@@ -126,7 +144,15 @@ export function ClipBlock({
     draggingRef.current = true;
     onDragActive?.(true);
     setDraft(latest);
-    if (resolved === "move") onMoveDrag?.("start", originStart);
+    setDragMode(resolved);
+    setTrimDelta(0);
+    if (resolved === "move" || resolved === "trim-left" || resolved === "trim-right" || resolved === "slip") {
+      onLiveDrag?.("start", {
+        start: latest.start,
+        in_point: latest.in_point,
+        out_point: latest.out_point,
+      });
+    }
 
     const onMoveWin = (ev: PointerEvent) => {
       const dx = ev.clientX - originX;
@@ -142,6 +168,11 @@ export function ClipBlock({
           fade_out: originFadeOut,
         };
         setDraft(latest);
+        onLiveDrag?.("move", {
+          start: latest.start,
+          in_point: latest.in_point,
+          out_point: latest.out_point,
+        });
         return;
       }
 
@@ -174,7 +205,12 @@ export function ClipBlock({
       }
 
       if (resolved === "move") {
-        const next = view.applySnap(Math.max(0, originStart + dt), anchors);
+        const rawNext = Math.max(0, originStart + dt);
+        const snapped = view.applySnap(rawNext, anchors);
+        const next =
+          (editMode ?? "normal") === "normal" && obstacles && obstacles.length > 0
+            ? resolveNonOverlappingStart(snapped, originDur, obstacles)
+            : snapped;
         latest = {
           start: next,
           in_point: originIn,
@@ -183,28 +219,61 @@ export function ClipBlock({
           fade_out: originFadeOut,
         };
         setDraft(latest);
-        onMoveDrag?.("move", next);
+        onLiveDrag?.("move", {
+          start: latest.start,
+          in_point: latest.in_point,
+          out_point: latest.out_point,
+        });
         return;
       }
 
       if (resolved === "trim-left") {
+        let minStart = 0;
+        if (obstacles && obstacles.length > 0) {
+          for (const o of obstacles) {
+            const oEnd = o.start + o.duration;
+            if (oEnd <= originStart + 0.001) {
+              minStart = Math.max(minStart, oEnd);
+            }
+          }
+        }
         const maxIn = originOut - 0.05 * originSpeed;
         const newIn = Math.min(maxIn, Math.max(0, originIn + dt * originSpeed));
         const oldMedia = originOut - originIn;
         const newMedia = originOut - newIn;
+        const proposedStart = originStart + (oldMedia - newMedia) / originSpeed;
+        const clampedStart = Math.max(minStart, proposedStart);
+        const actualDtMedia = (originStart - clampedStart) * originSpeed;
+        const finalIn = Math.min(maxIn, Math.max(0, originIn - actualDtMedia));
         latest = {
-          start: Math.max(0, originStart + (oldMedia - newMedia) / originSpeed),
-          in_point: newIn,
+          start: clampedStart,
+          in_point: finalIn,
           out_point: originOut,
           fade_in: originFadeIn,
           fade_out: originFadeOut,
         };
         setDraft(latest);
+        setTrimDelta(clampedStart - originStart);
+        onLiveDrag?.("move", {
+          start: latest.start,
+          in_point: latest.in_point,
+          out_point: latest.out_point,
+        });
         return;
       }
 
+      let maxEnd = Infinity;
+      if (obstacles && obstacles.length > 0) {
+        for (const o of obstacles) {
+          if (o.start >= originStart + originDur - 0.001) {
+            maxEnd = Math.min(maxEnd, o.start);
+          }
+        }
+      }
       const minOut = originIn + 0.05 * originSpeed;
-      const newOut = Math.max(minOut, originOut + dt * originSpeed);
+      const maxOutBound = originIn + (maxEnd - originStart) * originSpeed;
+      const allowedMaxOut = Math.min(maxOutBound, maxMediaDuration ?? Infinity);
+      const newOut = Math.min(allowedMaxOut, Math.max(minOut, originOut + dt * originSpeed));
       latest = {
         start: originStart,
         in_point: originIn,
@@ -213,6 +282,12 @@ export function ClipBlock({
         fade_out: originFadeOut,
       };
       setDraft(latest);
+      setTrimDelta((newOut - originOut) / originSpeed);
+      onLiveDrag?.("move", {
+        start: latest.start,
+        in_point: latest.in_point,
+        out_point: latest.out_point,
+      });
     };
 
     const onUpWin = () => {
@@ -222,6 +297,14 @@ export function ClipBlock({
       view.setSnapGuide(null);
       draggingRef.current = false;
       onDragActive?.(false);
+
+      if (resolved === "move" || resolved === "trim-left" || resolved === "trim-right" || resolved === "slip") {
+        onLiveDrag?.("end", {
+          start: latest.start,
+          in_point: latest.in_point,
+          out_point: latest.out_point,
+        });
+      }
 
       if (resolved === "slip") {
         if (Math.abs(slipDelta) > 0.001) onSlip(slipDelta);
@@ -246,8 +329,6 @@ export function ClipBlock({
       if (resolved === "move") {
         if (moved) {
           onMove(latest.start);
-        } else {
-          onMoveDrag?.("end", latest.start);
         }
       } else if (moved) {
         if (tool === "ripple") {
@@ -264,6 +345,8 @@ export function ClipBlock({
         }
       }
       setDraft(null);
+      setDragMode(null);
+      setTrimDelta(0);
     };
 
     window.addEventListener("pointermove", onMoveWin);
@@ -287,46 +370,92 @@ export function ClipBlock({
       }}
       title={`${fileName(clip.media_path)} — drag to move · corners for fade · right-click for tools`}
     >
+      {/* Kdenlive-style Fade Ramps with Diagonal Stroke Lines */}
       {fadeInPx > 1 && (
         <div
           className="tl-fade tl-fade-in"
           style={{ width: fadeInPx }}
           aria-hidden
-        />
+        >
+          <svg className="tl-fade-svg" preserveAspectRatio="none" viewBox="0 0 100 100">
+            <line x1="0" y1="100" x2="100" y2="0" stroke="rgba(255, 71, 87, 0.9)" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          </svg>
+        </div>
       )}
       {fadeOutPx > 1 && (
         <div
           className="tl-fade tl-fade-out"
           style={{ width: fadeOutPx }}
           aria-hidden
-        />
+        >
+          <svg className="tl-fade-svg" preserveAspectRatio="none" viewBox="0 0 100 100">
+            <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(255, 71, 87, 0.9)" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          </svg>
+        </div>
       )}
+
+      {/* Left Trim Handle (Kdenlive Trim-In style) */}
       <span
-        className="tl-edge left"
+        className={`tl-edge left ${dragMode === "trim-left" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "trim-left")}
-        title={tool === "ripple" ? "Ripple trim in" : "Trim in"}
-      />
+        title={tool === "ripple" ? "Ripple trim in / extend" : "Trim in / extend (drag left/right)"}
+      >
+        <span className="tl-edge-bar" aria-hidden />
+      </span>
+
+      {/* Left Fade Handle (Kdenlive circular grab dot) */}
       <span
-        className="tl-fade-handle left"
+        className={`tl-fade-handle left ${fadeIn > 0 ? "has-fade" : ""} ${dragMode === "fade-in" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "fade-in")}
-        title="Fade in"
-        style={{ left: Math.max(8, fadeInPx) }}
+        title={fadeIn > 0 ? `Fade in: ${fadeIn.toFixed(2)}s (drag to adjust)` : "Drag to fade in"}
+        style={{ left: fadeInPx }}
       />
+
       <div className="tl-clip-body">
         <span className="tl-clip-name">{fileName(clip.media_path)}</span>
         <small>{formatTime(dur)}</small>
       </div>
+
+      {/* Right Fade Handle (Kdenlive circular grab dot) */}
       <span
-        className="tl-fade-handle right"
+        className={`tl-fade-handle right ${fadeOut > 0 ? "has-fade" : ""} ${dragMode === "fade-out" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "fade-out")}
-        title="Fade out"
-        style={{ right: Math.max(8, fadeOutPx) }}
+        title={fadeOut > 0 ? `Fade out: ${fadeOut.toFixed(2)}s (drag to adjust)` : "Drag to fade out"}
+        style={{ right: fadeOutPx }}
       />
+
+      {/* Right Trim Handle (Kdenlive Trim-Out style) */}
       <span
-        className="tl-edge right"
+        className={`tl-edge right ${dragMode === "trim-right" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "trim-right")}
-        title={tool === "ripple" ? "Ripple trim out" : "Trim out"}
-      />
+        title={tool === "ripple" ? "Ripple trim out / extend" : "Trim out / extend (drag left/right)"}
+      >
+        <span className="tl-edge-bar" aria-hidden />
+      </span>
+
+      {/* Floating Kdenlive HUD tooltips during resize or fade */}
+      {dragMode === "trim-left" && (
+        <div className="tl-hud tl-hud-edge left">
+          <span className="tl-hud-title">In: {formatTime(inPoint)}</span>
+          <span className="tl-hud-dur">{formatTime(dur)} ({trimDelta >= 0 ? `+${trimDelta.toFixed(2)}s` : `${trimDelta.toFixed(2)}s`})</span>
+        </div>
+      )}
+      {dragMode === "trim-right" && (
+        <div className="tl-hud tl-hud-edge right">
+          <span className="tl-hud-title">Out: {formatTime(outPoint)}</span>
+          <span className="tl-hud-dur">{formatTime(dur)} ({trimDelta >= 0 ? `+${trimDelta.toFixed(2)}s` : `${trimDelta.toFixed(2)}s`})</span>
+        </div>
+      )}
+      {dragMode === "fade-in" && (
+        <div className="tl-hud tl-hud-fade" style={{ left: fadeInPx }}>
+          <span>Fade In: {fadeIn.toFixed(2)}s</span>
+        </div>
+      )}
+      {dragMode === "fade-out" && (
+        <div className="tl-hud tl-hud-fade" style={{ right: fadeOutPx }}>
+          <span>Fade Out: {fadeOut.toFixed(2)}s</span>
+        </div>
+      )}
     </div>
   );
 }
