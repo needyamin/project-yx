@@ -2,10 +2,222 @@
   cursor: crosshair;
 }
 
-.crop-overlay {
+/* Interactive Crop Box */
+.crop-box {
   position: absolute;
-  border: 1px solid #3daee9;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  box-sizing: border-box;
+  border: 1.5px solid #3daee9;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.52);
+  z-index: 10;
+  touch-action: none;
+  user-select: none;
+}
+
+.crop-box-body {
+  position: absolute;
+  inset: 0;
+  cursor: move;
+  background: rgba(61, 174, 233, 0.03);
+}
+
+.crop-box-body:hover {
+  background: rgba(61, 174, 233, 0.08);
+}
+
+/* Rule-of-thirds grid lines */
+.crop-grid-h1,
+.crop-grid-h2,
+.crop-grid-v1,
+.crop-grid-v2 {
+  position: absolute;
   pointer-events: none;
-  z-index: 4;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.crop-grid-h1 {
+  top: 33.333%;
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+.crop-grid-h2 {
+  top: 66.666%;
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+
+.crop-grid-v1 {
+  left: 33.333%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.crop-grid-v2 {
+  left: 66.666%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+/* Resize Handles */
+.crop-handle {
+  position: absolute;
+  box-sizing: border-box;
+  background: #ffffff;
+  border: 1.5px solid #1a73e8;
+  border-radius: 2px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+  z-index: 12;
+  touch-action: none;
+  transition: transform 0.1s ease, background-color 0.1s ease;
+}
+
+.crop-handle:hover,
+.crop-handle:active {
+  background: #3daee9;
+  transform: scale(1.25);
+}
+
+/* Corner handles */
+.crop-handle-tl {
+  top: -6px;
+  left: -6px;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
+.crop-handle-tr {
+  top: -6px;
+  right: -6px;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
+.crop-handle-bl {
+  bottom: -6px;
+  left: -6px;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
+.crop-handle-br {
+  bottom: -6px;
+  right: -6px;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
+/* Edge handles */
+.crop-handle-t {
+  top: -5px;
+  left: 50%;
+  margin-left: -14px;
+  width: 28px;
+  height: 8px;
+  border-radius: 3px;
+  cursor: ns-resize;
+}
+
+.crop-handle-b {
+  bottom: -5px;
+  left: 50%;
+  margin-left: -14px;
+  width: 28px;
+  height: 8px;
+  border-radius: 3px;
+  cursor: ns-resize;
+}
+
+.crop-handle-l {
+  left: -5px;
+  top: 50%;
+  margin-top: -14px;
+  height: 28px;
+  width: 8px;
+  border-radius: 3px;
+  cursor: ew-resize;
+}
+
+.crop-handle-r {
+  right: -5px;
+  top: 50%;
+  margin-top: -14px;
+  height: 28px;
+  width: 8px;
+  border-radius: 3px;
+  cursor: ew-resize;
+}
+
+/* Floating dimension badge */
+.crop-info-badge {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(18, 18, 24, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: auto;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+  z-index: 15;
+}
+
+.crop-info-badge.flip-inside {
+  bottom: auto;
+  top: 8px;
+}
+
+.crop-dim-text {
+  color: #94a3b8;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.crop-dim-val {
+  color: #38bdf8;
+  font-weight: 600;
+  margin-left: 3px;
+}
+
+.crop-badge-btn {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #e2e8f0;
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.crop-badge-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+
+.crop-badge-btn.done {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+.crop-badge-btn.done:hover {
+  background: #1d4ed8;
 }

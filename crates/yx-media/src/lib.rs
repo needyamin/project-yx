@@ -168,8 +168,13 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 if left + right + top + bottom > 1e-6 {
                     let w = (1.0 - left - right).max(0.02);
                     let h = (1.0 - top - bottom).max(0.02);
+                    // Crop the source to the selected region, then scale it up to
+                    // fill the entire output canvas. The cropped area becomes the
+                    // full-screen output — no black bars or padding.
                     parts.push(format!(
-                        "crop=iw*{w:.6}:ih*{h:.6}:iw*{left:.6}:ih*{top:.6}"
+                        "crop=iw*{w:.6}:ih*{h:.6}:iw*{left:.6}:ih*{top:.6},scale={fw}:{fh}:flags=lanczos",
+                        fw = frame_w.max(2) & !1,
+                        fh = frame_h.max(2) & !1,
                     ));
                 }
             }

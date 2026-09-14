@@ -120,6 +120,21 @@ export function TimelinePanel({
   const duration = timelineDuration(timeline, 10);
   const view = useTimelineView(duration);
 
+  const trackClipObstacles = useMemo(() => {
+    const map = new Map<string, Array<{ id: string; start: number; duration: number }>>();
+    for (const track of timeline.tracks) {
+      map.set(
+        track.id,
+        track.clips.map((c) => ({
+          id: c.id,
+          start: c.start,
+          duration: clipTimelineDuration(c),
+        })),
+      );
+    }
+    return map;
+  }, [timeline.tracks]);
+
   const clampHeader = useCallback((w: number) => {
     return Math.max(HEADER_MIN, Math.min(HEADER_MAX, w));
   }, []);
@@ -260,12 +275,68 @@ export function TimelinePanel({
     }
   }
 
+  const activeRulerTicksRef = useRef<RulerTick[]>([]);
+
   function timeFromClientX(clientX: number): number {
     const scroller = scrollerRef.current;
     if (!scroller) return 0;
     const rect = scroller.getBoundingClientRect();
     const x = clientX - rect.left + scroller.scrollLeft;
-    return view.applySnap(view.xToTime(x), anchors);
+    const rawTime = Math.max(0, view.xToTime(x));
+
+    // 1. Magnetic anchor snapping (clip boundaries, markers, zones)
+    if (view.snap) {
+      const anchorThreshold = Math.max(0.04, 8 / view.pxPerSec);
+      let bestAnchor = rawTime;
+      let bestAnchorDist = anchorThreshold;
+      for (const a of anchors) {
+        const d = Math.abs(a - rawTime);
+        if (d < bestAnchorDist) {
+          bestAnchorDist = d;
+          bestAnchor = a;
+        }
+      }
+      if (bestAnchorDist < anchorThreshold) {
+        view.setSnapGuide(bestAnchor);
+        return Number(bestAnchor.toFixed(4));
+      }
+    }
+
+    view.setSnapGuide(null);
+
+    // 2. Magnetic ruler division tick snapping
+    if (view.snap && activeRulerTicksRef.current.length > 0) {
+      const tickThreshold = Math.max(0.02, 6 / view.pxPerSec);
+      let bestTick = rawTime;
+      let bestTickDist = tickThreshold;
+      for (const tick of activeRulerTicksRef.current) {
+        const d = Math.abs(tick.t - rawTime);
+        if (d < bestTickDist) {
+          bestTickDist = d;
+          bestTick = tick.t;
+        }
+      }
+      if (bestTickDist < tickThreshold) {
+        return Number(bestTick.toFixed(4));
+      }
+    }
+
+    // 3. Precision interval quantization (exact frame / hundredth / millisecond)
+    const FPS = 30;
+    const frameDur = 1 / FPS;
+    let qStep = frameDur;
+    if (view.pxPerSec >= 200) {
+      qStep = 0.01; // 10ms / hundredths
+    } else if (view.pxPerSec >= 40) {
+      qStep = frameDur; // exact 30fps frames
+    } else if (view.pxPerSec >= 15) {
+      qStep = 0.1; // 100ms
+    } else {
+      qStep = 0.5; // half second
+    }
+
+    const quantized = Math.round(rawTime / qStep) * qStep;
+    return Math.max(0, Number(quantized.toFixed(4)));
   }
 
   const timeFromClientXRef = useRef(timeFromClientX);
@@ -411,6 +482,16 @@ export function TimelinePanel({
     if (track.hidden) return 22;
     return track.kind === "video" ? 64 : 48;
   }
+
+  const totalRulerDuration = Math.max(duration + 120, view.xToTime(view.contentWidth) + 60);
+  const visibleStart = Math.max(0, view.xToTime(view.scrollLeft) - 5);
+  const visibleEnd = view.xToTime(
+    view.scrollLeft + (scrollerRef.current?.clientWidth ?? 1920) + 10,
+  );
+  const rulerTickList = useMemo(() => {
+    return rulerTicks(totalRulerDuration, view.pxPerSec, visibleStart, visibleEnd);
+  }, [totalRulerDuration, view.pxPerSec, visibleStart, visibleEnd]);
+  activeRulerTicksRef.current = rulerTickList;
 
   return (
     <section
@@ -610,7 +691,7 @@ export function TimelinePanel({
                 openContext(e, { kind: "ruler", at: timeFromClientX(e.clientX) });
               }}
             >
-              {rulerTicks(Math.max(duration + 120, view.xToTime(view.contentWidth) + 60), view.pxPerSec).map((tick) => (
+              {rulerTickList.map((tick) => (
                 <span
                   key={tick.t}
                   className={`tl-tick ${tick.kind}`}
@@ -712,17 +793,18 @@ export function TimelinePanel({
                     </div>
                   )}
                   {track.clips.map((clip: Clip) => {
-                    const trackObstacles = track.clips
-                      .filter((c) => c.id !== clip.id)
-                      .map((c) => ({ start: c.start, duration: clipTimelineDuration(c) }));
-                    let obstacles = trackObstacles;
+                    const trackObs = trackClipObstacles.get(track.id) ?? [];
+                    const ownObstacles = trackObs
+                      .filter((o) => o.id !== clip.id)
+                      .map((o) => ({ start: o.start, duration: o.duration }));
+                    let obstacles = ownObstacles;
                     if (clip.linked_clip_id) {
-                      for (const t of timeline.tracks) {
-                        if (t.clips.some((c) => c.id === clip.linked_clip_id)) {
-                          const partnerObstacles = t.clips
-                            .filter((c) => c.id !== clip.linked_clip_id)
-                            .map((c) => ({ start: c.start, duration: clipTimelineDuration(c) }));
-                          obstacles = [...trackObstacles, ...partnerObstacles];
+                      for (const [tid, obsList] of trackClipObstacles.entries()) {
+                        if (tid !== track.id && obsList.some((o) => o.id === clip.linked_clip_id)) {
+                          const partnerObs = obsList
+                            .filter((o) => o.id !== clip.linked_clip_id)
+                            .map((o) => ({ start: o.start, duration: o.duration }));
+                          obstacles = [...ownObstacles, ...partnerObs];
                           break;
                         }
                       }
@@ -784,7 +866,6 @@ export function TimelinePanel({
                       onLiveDrag={(phase, draft) => {
                         if (!clip.linked_clip_id) return;
                         if (phase === "end") {
-                          setDragPreview(null);
                           return;
                         }
                         setDragPreview({
@@ -793,6 +874,34 @@ export function TimelinePanel({
                         });
                       }}
                       onMove={(newStart) => {
+                        // Optimistic immediate update to eliminate snap-back flicker
+                        const optimistic: Timeline = {
+                          ...timeline,
+                          tracks: timeline.tracks.map((t) => {
+                            if (
+                              !t.clips.some(
+                                (c) =>
+                                  c.id === clip.id ||
+                                  (clip.linked_clip_id && c.id === clip.linked_clip_id),
+                              )
+                            ) {
+                              return t;
+                            }
+                            const updatedClips = t.clips.map((c) => {
+                              if (
+                                c.id === clip.id ||
+                                (clip.linked_clip_id && c.id === clip.linked_clip_id)
+                              ) {
+                                return { ...c, start: newStart };
+                              }
+                              return c;
+                            });
+                            updatedClips.sort((a, b) => a.start - b.start);
+                            return { ...t, clips: updatedClips };
+                          }),
+                        };
+                        onTimeline(optimistic);
+
                         void (async () => {
                           try {
                             await run(
@@ -810,6 +919,42 @@ export function TimelinePanel({
                         })();
                       }}
                       onTrim={(inPoint, outPoint, keepEnd) => {
+                        const newDur = (outPoint - inPoint) / (clip.speed ?? 1);
+                        const optimistic: Timeline = {
+                          ...timeline,
+                          tracks: timeline.tracks.map((t) => {
+                            if (
+                              !t.clips.some(
+                                (c) =>
+                                  c.id === clip.id ||
+                                  (clip.linked_clip_id && c.id === clip.linked_clip_id),
+                              )
+                            ) {
+                              return t;
+                            }
+                            const updatedClips = t.clips.map((c) => {
+                              if (
+                                c.id === clip.id ||
+                                (clip.linked_clip_id && c.id === clip.linked_clip_id)
+                              ) {
+                                const oldDur = clipTimelineDuration(c);
+                                const newStart = keepEnd
+                                  ? c.start + (oldDur - newDur)
+                                  : c.start;
+                                return {
+                                  ...c,
+                                  start: Math.max(0, newStart),
+                                  in_point: inPoint,
+                                  out_point: outPoint,
+                                };
+                              }
+                              return c;
+                            });
+                            updatedClips.sort((a, b) => a.start - b.start);
+                            return { ...t, clips: updatedClips };
+                          }),
+                        };
+                        onTimeline(optimistic);
                         setDragPreview(null);
                         void run("trim_clip", {
                           clipId: clip.id,
@@ -1035,7 +1180,7 @@ export function TimelinePanel({
   );
 }
 
-export type RulerTickKind = "major" | "medium" | "minor";
+export type RulerTickKind = "major" | "medium" | "minor" | "micro";
 
 export type RulerTick = {
   t: number;
@@ -1043,15 +1188,17 @@ export type RulerTick = {
   label: string | null;
 };
 
-/** Detailed ruler ticks: major time labels, halfway medium ticks, and minor divisions covering the timeline. */
+/** Detailed ruler ticks: major time labels, halfway medium ticks, minor divisions, and micro frame/ms ticks. */
 function rulerTicks(
   duration: number,
   pxPerSec: number,
+  rangeStart = 0,
+  rangeEnd = duration,
 ): RulerTick[] {
-  const targetPx = 90;
+  const targetPx = 100;
   const rawStep = targetPx / Math.max(0.01, pxPerSec);
   const nice = [
-    0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
+    0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
   ];
   let step = nice[nice.length - 1];
   for (const n of nice) {
@@ -1061,15 +1208,32 @@ function rulerTicks(
     }
   }
 
-  let subDivisions = 5;
+  // Determine minor subdivision count
+  let minorDivisions = 5;
   if (step === 1 || step === 2 || step === 10 || step === 60) {
-    subDivisions = 5;
-  } else if (step === 0.5 || step === 0.1 || step === 15 || step === 30) {
-    subDivisions = 5;
+    minorDivisions = 10;
+  } else if (step === 0.5 || step === 0.2 || step === 0.1 || step === 15 || step === 30) {
+    minorDivisions = 5;
   } else {
-    subDivisions = 4;
+    minorDivisions = 4;
   }
-  const minorStep = step / subDivisions;
+  const minorStep = step / minorDivisions;
+
+  // Determine if micro ticks fit (at least 4px between micro ticks)
+  let microDivisions = 1;
+  const minTickPx = 4;
+  if (minorStep * pxPerSec >= 24) {
+    if (minorStep * pxPerSec >= 40) {
+      microDivisions = 5;
+    } else {
+      microDivisions = 2;
+    }
+  }
+  const tickStep = minorStep / microDivisions;
+
+  if (tickStep * pxPerSec < minTickPx) {
+    return [];
+  }
 
   const isMajor = (t: number) => {
     const q = t / step;
@@ -1082,13 +1246,21 @@ function rulerTicks(
     return Math.abs(q - Math.round(q)) < 1e-4;
   };
 
+  const isMinor = (t: number) => {
+    const q = t / minorStep;
+    return Math.abs(q - Math.round(q)) < 1e-4;
+  };
+
   const ticks: RulerTick[] = [];
-  const end = duration + 1e-4;
-  for (let t = 0; t <= end; t += minorStep) {
+  const start = Math.max(0, Math.floor(rangeStart / tickStep) * tickStep);
+  const end = Math.min(duration + 1e-4, rangeEnd + 1e-4);
+
+  for (let t = start; t <= end; t += tickStep) {
     const rounded = Number(t.toFixed(4));
     const major = isMajor(rounded);
     const medium = !major && isMedium(rounded);
-    const kind: RulerTickKind = major ? "major" : medium ? "medium" : "minor";
+    const minor = !major && !medium && isMinor(rounded);
+    const kind: RulerTickKind = major ? "major" : medium ? "medium" : minor ? "minor" : "micro";
     ticks.push({
       t: rounded,
       kind,

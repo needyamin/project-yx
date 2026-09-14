@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy - Project YX Video Editor</title>
+  <meta name="description" content="Privacy Policy for Project YX - Pro Desktop Video Editor. Learn how Project YX handles your media, permissions, and data with complete privacy." />
+  <meta name="author" content="Project YX Team" />
+  <meta name="robots" content="index, follow" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --bg-base: #0a0e17;
+      --bg-surface: #111827;
+      --bg-surface-elevated: #1a2234;
+      --bg-surface-hover: #222d42;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-medium: rgba(255, 255, 255, 0.16);
+      --primary: #6366f1;
+      --primary-glow: rgba(99, 102, 241, 0.25);
+      --primary-light: #818cf8;
+      --accent: #06b6d4;
+      --accent-glow: rgba(6, 182, 212, 0.2);
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --success: #10b981;
+      --success-bg: rgba(16, 185, 129, 0.12);
+      --warning: #f59e0b;
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --shadow-card: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+      --container-width: 920px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      line-height: 1.7;
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+      background-image: 
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(99, 102, 241, 0.15), transparent),
+        radial-gradient(ellipse 60% 40% at 85% 10%, rgba(6, 182, 212, 0.08), transparent);
+      background-repeat: no-repeat;
+      min-height: 100vh;
+    }
+
+    /* Top Navigation / Brand Bar */
+    header.site-header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      background: rgba(10, 14, 23, 0.85);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .nav-container {
+      max-width: var(--container-width);
+      margin: 0 auto;
+      padding: 1rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      text-decoration: none;
+      color: var(--text-main);
+    }
+
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 1.1rem;
+      color: #fff;
+      box-shadow: 0 0 16px var(--primary-glow);
+    }
+
+    .brand-name {
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: -0.02em;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+    }
+
+    .nav-link {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.2s ease;
+    }
+
+    .nav-link:hover {
+      color: var(--text-main);
+    }
+
+    .nav-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    .nav-badge-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background-color: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+
+    /* Main Container */
+    main.content {
+      max-width: var(--container-width);
+      margin: 0 auto;
+      padding: 3.5rem 1.5rem 5rem 1.5rem;
+    }
+
+    /* Hero */
+    .hero {
+      margin-bottom: 3rem;
+      text-align: left;
+    }
+
+    .hero-tag {
+      display: inline-block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      color: var(--accent);
+      background: rgba(6, 182, 212, 0.1);
+      border: 1px solid rgba(6, 182, 212, 0.25);
+      padding: 0.25rem 0.75rem;
+      border-radius: 999px;
+      margin-bottom: 1rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    h1.hero-title {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.2;
+      margin-bottom: 0.75rem;
+      background: linear-gradient(135deg, #ffffff 40%, #9ca3af 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      color: var(--text-muted);
+      font-size: 0.92rem;
+    }
+
+    .hero-meta span {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    /* Highlights Banner */
+    .highlights-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 3rem;
+    }
+
+    .highlight-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+
+    .highlight-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-medium);
+    }
+
+    .highlight-icon {
+      font-size: 1.4rem;
+      margin-bottom: 0.6rem;
+      display: inline-block;
+    }
+
+    .highlight-title {
+      font-weight: 600;
+      font-size: 1rem;
+      color: var(--text-main);
+      margin-bottom: 0.25rem;
+    }
+
+    .highlight-desc {
+      font-size: 0.86rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Table of Contents */
+    .toc-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.5rem;
+      margin-bottom: 3rem;
+    }
+
+    .toc-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+    }
+
+    .toc-list {
+      list-style: none;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.6rem 1.5rem;
+    }
+
+    .toc-link {
+      color: var(--primary-light);
+      text-decoration: none;
+      font-size: 0.92rem;
+      transition: color 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .toc-link::before {
+      content: "•";
+      color: var(--accent);
+    }
+
+    .toc-link:hover {
+      color: #fff;
+      text-decoration: underline;
+    }
+
+    /* Content Sections */
+    section.policy-section {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 2.25rem;
+      margin-bottom: 2rem;
+      box-shadow: var(--shadow-card);
+    }
+
+    section.policy-section h2 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 1.2rem;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    section.policy-section h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin: 1.5rem 0 0.6rem 0;
+      color: var(--text-main);
+    }
+
+    section.policy-section p {
+      margin-bottom: 1rem;
+      color: #cbd5e1;
+      font-size: 0.98rem;
+    }
+
+    section.policy-section ul {
+      margin-left: 1.4rem;
+      margin-bottom: 1.25rem;
+      color: #cbd5e1;
+    }
+
+    section.policy-section li {
+      margin-bottom: 0.5rem;
+      padding-left: 0.25rem;
+    }
+
+    /* Callout Boxes */
+    .callout {
+      border-radius: var(--radius-sm);
+      padding: 1rem 1.25rem;
+      margin: 1.25rem 0;
+      display: flex;
+      gap: 0.85rem;
+      align-items: flex-start;
+      font-size: 0.92rem;
+    }
+
+    .callout-info {
+      background: rgba(99, 102, 241, 0.1);
+      border-left: 4px solid var(--primary);
+      color: #e0e7ff;
+    }
+
+    .callout-success {
+      background: var(--success-bg);
+      border-left: 4px solid var(--success);
+      color: #d1fae5;
+    }
+
+    .callout-icon {
+      font-size: 1.15rem;
+      flex-shrink: 0;
+      margin-top: 0.1rem;
+    }
+
+    /* Table */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.25rem 0;
+      font-size: 0.92rem;
+    }
+
+    .data-table th, .data-table td {
+      border: 1px solid var(--border-subtle);
+      padding: 0.75rem 1rem;
+      text-align: left;
+    }
+
+    .data-table th {
+      background: var(--bg-surface-elevated);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .data-table td {
+      color: var(--text-muted);
+    }
+
+    .data-table tr:hover td {
+      background: var(--bg-surface-hover);
+    }
+
+    .badge-no {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    /* Footer */
+    footer.site-footer {
+      border-top: 1px solid var(--border-subtle);
+      padding: 2.5rem 1.5rem;
+      background: rgba(10, 14, 23, 0.95);
+      font-size: 0.88rem;
+      color: var(--text-dim);
+    }
+
+    .footer-container {
+      max-width: var(--container-width);
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      align-items: center;
+      text-align: center;
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+    }
+
+    .footer-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: color 0.2s ease;
+    }
+
+    .footer-links a:hover {
+      color: var(--primary-light);
+    }
+
+    /* Back to Top Button */
+    .back-to-top {
+      display: inline-block;
+      margin-top: 1.5rem;
+      font-size: 0.85rem;
+      color: var(--primary-light);
+      text-decoration: none;
+    }
+
+    .back-to-top:hover {
+      text-decoration: underline;
+    }
+
+    /* Print styling */
+    @media print {
+      body {
+        background: #ffffff;
+        color: #000000;
+      }
+      header.site-header, footer.site-footer, .toc-box, .back-to-top {
+        display: none;
+      }
+      section.policy-section {
+        box-shadow: none;
+        border: 1px solid #ddd;
+        background: #fff;
+        color: #000;
+        page-break-inside: avoid;
+      }
+      h1.hero-title, section.policy-section h2, section.policy-section h3 {
+        color: #000;
+        -webkit-text-fill-color: initial;
+      }
+      p, li, td {
+        color: #333 !important;
+      }
+    }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      h1.hero-title {
+        font-size: 1.85rem;
+      }
+      section.policy-section {
+        padding: 1.5rem;
+      }
+      .hero-meta {
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="nav-container">
+      <a href="https://github.com/needyamin/project-yx" class="brand" target="_blank" rel="noopener noreferrer">
+        <div class="brand-icon">YX</div>
+        <span class="brand-name">Project YX</span>
+      </a>
+      <div class="nav-links">
+        <div class="nav-badge">
+          <span class="nav-badge-dot"></span>
+          <span>100% Offline &amp; Private</span>
+        </div>
+        <a href="https://github.com/needyamin/project-yx" class="nav-link" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="content">
+    <!-- Hero -->
+    <div class="hero">
+      <div class="hero-tag">Microsoft Store Compliance</div>
+      <h1 class="hero-title">Privacy Policy</h1>
+      <div class="hero-meta">
+        <span><strong>Application:</strong> Project YX Video Editor</span>
+        <span><strong>Package ID:</strong> com.projectyx.editor</span>
+        <span><strong>Last Updated:</strong> September 14, 2026</span>
+        <span><strong>Effective Date:</strong> September 14, 2026</span>
+      </div>
+    </div>
+
+    <!-- Highlights -->
+    <div class="highlights-grid">
+      <div class="highlight-card">
+        <div class="highlight-icon">🔒</div>
+        <div class="highlight-title">100% Local Processing</div>
+        <div class="highlight-desc">All video clips, audio tracks, and rendering stay strictly on your local computer.</div>
+      </div>
+      <div class="highlight-card">
+        <div class="highlight-icon">🚫</div>
+        <div class="highlight-title">Zero Telemetry</div>
+        <div class="highlight-desc">We do not track, log, or monitor your app usage, keystrokes, or editing workflow.</div>
+      </div>
+      <div class="highlight-card">
+        <div class="highlight-icon">👤</div>
+        <div class="highlight-title">No Account Needed</div>
+        <div class="highlight-desc">Use all features without creating an account, signing in, or sharing your email.</div>
+      </div>
+      <div class="highlight-card">
+        <div class="highlight-icon">🛡️</div>
+        <div class="highlight-title">No Data Sold</div>
+        <div class="highlight-desc">We do not collect, buy, sell, or trade personal data with advertisers or data brokers.</div>
+      </div>
+    </div>
+
+    <!-- Table of Contents -->
+    <nav class="toc-box" aria-label="Table of contents">
+      <div class="toc-title">Table of Contents</div>
+      <ul class="toc-list">
+        <li><a href="#overview" class="toc-link">1. Overview &amp; Principles</a></li>
+        <li><a href="#data-collection" class="toc-link">2. Information We Collect</a></li>
+        <li><a href="#media-files" class="toc-link">3. Your Media &amp; Local Files</a></li>
+        <li><a href="#network-usage" class="toc-link">4. Network &amp; Internet Access</a></li>
+        <li><a href="#third-parties" class="toc-link">5. Third-Party Services</a></li>
+        <li><a href="#data-storage" class="toc-link">6. Storage, Retention &amp; Security</a></li>
+        <li><a href="#children" class="toc-link">7. Children's Privacy (COPPA)</a></li>
+        <li><a href="#rights" class="toc-link">8. Your Rights (GDPR &amp; CCPA)</a></li>
+        <li><a href="#changes" class="toc-link">9. Policy Updates</a></li>
+        <li><a href="#contact" class="toc-link">10. Contact &amp; Inquiries</a></li>
+      </ul>
+    </nav>
+
+    <!-- Section 1 -->
+    <section id="overview" class="policy-section">
+      <h2>1. Overview &amp; Principles</h2>
+      <p>
+        Welcome to <strong>Project YX</strong> ("we", "our", or "the Application"). Project YX is a high-performance desktop video editor engineered for Windows and Linux.
+      </p>
+      <p>
+        Our core design philosophy is simple: <strong>your creative work and personal data belong exclusively to you.</strong> Project YX operates as an offline-first, standalone desktop application. We do not operate remote user tracking servers, cloud databases of user videos, or analytics pipelines.
+      </p>
+      <div class="callout callout-success">
+        <span class="callout-icon">✓</span>
+        <div>
+          <strong>Clear Privacy Guarantee:</strong> When you use Project YX, your media files, timelines, project files, and personal identifiers never leave your computer unless you explicitly choose to share or upload them elsewhere using your own independent tools.
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 2 -->
+    <section id="data-collection" class="policy-section">
+      <h2>2. Information We Collect</h2>
+      <p>
+        Project YX has been intentionally developed without user tracking infrastructure. Below is a comprehensive breakdown of data categories:
+      </p>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Data Category</th>
+            <th>Collected by Project YX?</th>
+            <th>Description / Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Personal Identifiers</strong><br>(Name, email, phone, IP address)</td>
+            <td><span class="badge-no">NOT COLLECTED</span></td>
+            <td>No account creation or registration is required to use the application.</td>
+          </tr>
+          <tr>
+            <td><strong>Usage Telemetry &amp; Analytics</strong><br>(Click tracking, feature usage)</td>
+            <td><span class="badge-no">NOT COLLECTED</span></td>
+            <td>We do not track which features, buttons, or shortcuts you use.</td>
+          </tr>
+          <tr>
+            <td><strong>Media &amp; Project Files</strong><br>(Videos, audio, pictures, timelines)</td>
+            <td><span class="badge-no">NOT COLLECTED</span></td>
+            <td>All editing and rendering happen completely on your device.</td>
+          </tr>
+          <tr>
+            <td><strong>Financial &amp; Payment Data</strong><br>(Credit cards, billing addresses)</td>
+            <td><span class="badge-no">NOT COLLECTED</span></td>
+            <td>Any purchase or store transaction is managed directly and securely by the Microsoft Store.</td>
+          </tr>
+          <tr>
+            <td><strong>Crash Logs &amp; Diagnostics</strong></td>
+            <td><span class="badge-no">NOT COLLECTED</span></td>
+            <td>We do not automatically transmit background crash reports to any server.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Section 3 -->
+    <section id="media-files" class="policy-section">
+      <h2>3. Your Media &amp; Local Files</h2>
+      <p>
+        To function as a video editor, Project YX requires standard operating system permissions to read and write files on your local drive:
+      </p>
+      <ul>
+        <li><strong>Importing Media:</strong> When you drag-and-drop or select video, audio, or image files, the application reads them from your local storage to generate preview frames and waveform visualizers.</li>
+        <li><strong>Saving Project Files:</strong> Timeline data, cuts, crop boxes, and project metadata are saved as local configuration files on your machine.</li>
+        <li><strong>Exporting Media:</strong> Final rendered video outputs (MP4, WebM, etc.) are written directly to your chosen local folder or output destination.</li>
+      </ul>
+      <div class="callout callout-info">
+        <span class="callout-icon">ℹ</span>
+        <div>
+          Project YX never transmits your source media or exported videos across the internet. All transcoding, scaling, and video rendering are executed locally on your hardware.
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 4 -->
+    <section id="network-usage" class="policy-section">
+      <h2>4. Network &amp; Internet Access</h2>
+      <p>
+        Project YX can function entirely without an active internet connection. Any internet connectivity is strictly limited to user-initiated or explicit actions:
+      </p>
+      <ul>
+        <li><strong>Software Update Checks (Optional):</strong> The application may query the public GitHub Release API (or Microsoft Store update services) to inform you when a newer version of the software is available. No user data, files, or tracking tokens are sent during this query.</li>
+        <li><strong>External Documentation Links:</strong> If you click a link within the application to view the user manual, source code, or issue tracker, your default web browser will open that destination URL (e.g., GitHub). These external websites are governed by their respective privacy policies.</li>
+      </ul>
+    </section>
+
+    <!-- Section 5 -->
+    <section id="third-parties" class="policy-section">
+      <h2>5. Third-Party Services</h2>
+      <p>
+        Project YX does not integrate advertising SDKs, third-party analytics trackers (such as Google Analytics, Mixpanel, or Amplitude), or commercial data-sharing plugins.
+      </p>
+      <p>
+        If acquired through the <strong>Microsoft Store</strong>, the installation and licensing verification processes are managed by Microsoft Corporation in accordance with the <a href="https://privacy.microsoft.com/en-us/privacystatement" target="_blank" rel="noopener noreferrer" style="color: var(--primary-light);">Microsoft Privacy Statement</a>.
+      </p>
+    </section>
+
+    <!-- Section 6 -->
+    <section id="data-storage" class="policy-section">
+      <h2>6. Storage, Retention &amp; Security</h2>
+      <p>
+        Because we do not collect or store your data on external servers:
+      </p>
+      <ul>
+        <li><strong>Data Retention:</strong> You retain complete custody of your projects and media. Files remain on your computer for as long as you choose to keep them.</li>
+        <li><strong>Data Deletion:</strong> You can delete any project file, cache directory, or exported video at any time through standard operating system file management. Uninstalling the application will remove application binaries.</li>
+        <li><strong>Security:</strong> The application leverages sandboxed desktop runtime architectures (Tauri) with restricted native capabilities, ensuring the app operates safely within your operating system environment.</li>
+      </ul>
+    </section>
+
+    <!-- Section 7 -->
+    <section id="children" class="policy-section">
+      <h2>7. Children's Privacy (COPPA Compliance)</h2>
+      <p>
+        Project YX is a general-purpose desktop utility and does not knowingly collect, solicit, or maintain any personal information from children under the age of 13 (or under the applicable age of digital consent in any jurisdiction), in full compliance with the Children's Online Privacy Protection Act (COPPA) and international privacy laws.
+      </p>
+    </section>
+
+    <!-- Section 8 -->
+    <section id="rights" class="policy-section">
+      <h2>8. Your Rights (GDPR, UK GDPR, CCPA / CPRA)</h2>
+      <p>
+        International privacy frameworks (such as the European General Data Protection Regulation and California Consumer Privacy Act) grant individuals specific rights regarding their personal data, including the right to access, rectify, port, and erase their information.
+      </p>
+      <p>
+        Because Project YX collects no personal data and maintains no central registry of users, <strong>we have no personal information to provide, sell, delete, or monetize.</strong> You have full, direct sovereign control over all your data directly on your device.
+      </p>
+    </section>
+
+    <!-- Section 9 -->
+    <section id="changes" class="policy-section">
+      <h2>9. Policy Updates</h2>
+      <p>
+        We may update this Privacy Policy from time to time to reflect improvements or operational changes. Any modifications will be posted to this page with an updated "Last Updated" date. We encourage users to periodically review this document.
+      </p>
+    </section>
+
+    <!-- Section 10 -->
+    <section id="contact" class="policy-section">
+      <h2>10. Contact &amp; Inquiries</h2>
+      <p>
+        If you have questions, concerns, or feedback regarding this Privacy Policy or the security practices of Project YX, please reach out to us:
+      </p>
+      <ul>
+        <li><strong>GitHub Issues / Inquiries:</strong> <a href="https://github.com/needyamin/project-yx/issues" target="_blank" rel="noopener noreferrer" style="color: var(--primary-light);">https://github.com/needyamin/project-yx/issues</a></li>
+        <li><strong>Project Repository:</strong> <a href="https://github.com/needyamin/project-yx" target="_blank" rel="noopener noreferrer" style="color: var(--primary-light);">https://github.com/needyamin/project-yx</a></li>
+      </ul>
+      <a href="#" class="back-to-top">↑ Back to top</a>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="footer-container">
+      <div class="footer-links">
+        <a href="https://github.com/needyamin/project-yx" target="_blank" rel="noopener noreferrer">Project YX on GitHub</a>
+        <a href="https://github.com/needyamin/project-yx/issues" target="_blank" rel="noopener noreferrer">Support &amp; Feedback</a>
+        <a href="https://github.com/needyamin/project-yx/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">License</a>
+      </div>
+      <p>&copy; 2026 Project YX Contributors. All rights reserved. Open-source, offline-first video editor.</p>
+    </div>
+  </footer>
+
+</body>
+</html>

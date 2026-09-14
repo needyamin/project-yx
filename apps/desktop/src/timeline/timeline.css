@@ -157,9 +157,15 @@
 }
 
 .tl-clip.dragging {
-  opacity: 0.92;
-  z-index: 6;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  opacity: 0.94;
+  z-index: 20;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.45);
+  cursor: grabbing !important;
+}
+
+.tl-clip.dragging .tl-edge,
+.tl-clip.dragging .tl-fade-handle {
+  pointer-events: none;
 }
 
 .tl-edge {
@@ -563,20 +569,25 @@ body.resizing-tl-headers {
   margin-top: auto;
 }
 
+.tl-tick.micro .tl-tick-mark {
+  height: 3.5px;
+  background: #383842;
+}
+
 .tl-tick.minor .tl-tick-mark {
-  height: 5px;
-  background: #3e3e46;
+  height: 6px;
+  background: #565664;
 }
 
 .tl-tick.medium .tl-tick-mark {
-  height: 9px;
-  background: #6a6a75;
+  height: 10px;
+  background: #848496;
 }
 
 .tl-tick.major .tl-tick-mark {
-  height: 14px;
+  height: 15px;
   width: 1.5px;
-  background: #9d9da8;
+  background: #dcdce6;
 }
 
 .tl-tick-label {

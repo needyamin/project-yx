@@ -40,6 +40,8 @@ type Props = {
   onEyedropColor?: (hex: string) => void;
   /** When Clip Monitor is hidden, show a control to restore it. */
   onShowClipMonitor?: () => void;
+  /** Whether the project timeline contains any clips. */
+  hasTimelineClips?: boolean;
 };
 
 export function ProjectMonitor({
@@ -67,16 +69,11 @@ export function ProjectMonitor({
   chromakeyActive = false,
   onEyedropColor,
   onShowClipMonitor,
+  hasTimelineClips = false,
 }: Props) {
   const safeDur = Math.max(0.001, duration);
   const tiktok = aspect === "tiktok";
   const frameRef = useRef<HTMLDivElement | null>(null);
-  const [drag, setDrag] = useState<{
-    x0: number;
-    y0: number;
-    x1: number;
-    y1: number;
-  } | null>(null);
   const [fullView, setFullView] = useState(false);
   const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
 
@@ -92,42 +89,96 @@ export function ProjectMonitor({
     return () => window.removeEventListener("keydown", onKey);
   }, [fullView]);
 
-  function clientToNorm(clientX: number, clientY: number) {
-    const el = frameRef.current;
-    if (!el) return { x: 0, y: 0 };
-    const r = el.getBoundingClientRect();
-    return {
-      x: Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width))),
-      y: Math.max(0, Math.min(1, (clientY - r.top) / Math.max(1, r.height))),
-    };
-  }
+  const [activeCrop, setActiveCrop] = useState<CropRect | null>(null);
 
-  function beginCrop(e: ReactPointerEvent) {
+  useEffect(() => {
+    setActiveCrop(cropDraft ?? null);
+  }, [cropDraft]);
+
+  const currentCrop = activeCrop ?? cropDraft ?? { left: 0, top: 0, right: 0, bottom: 0 };
+  const cropWidth = Math.max(0.05, 1 - currentCrop.left - currentCrop.right);
+  const cropHeight = Math.max(0.05, 1 - currentCrop.top - currentCrop.bottom);
+
+  type DragMode = "body" | "new" | "tl" | "tr" | "bl" | "br" | "t" | "b" | "l" | "r";
+
+  function startCropDrag(mode: DragMode, e: ReactPointerEvent) {
     if (!cropTool || previewMode !== "video") return;
     e.preventDefault();
-    const p = clientToNorm(e.clientX, e.clientY);
-    setDrag({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+    e.stopPropagation();
+
+    const el = frameRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    const base = activeCrop ?? cropDraft ?? { left: 0, top: 0, right: 0, bottom: 0 };
+    let current = { ...base };
 
     const onMove = (ev: PointerEvent) => {
-      const q = clientToNorm(ev.clientX, ev.clientY);
-      setDrag((d) => (d ? { ...d, x1: q.x, y1: q.y } : d));
+      const dx = (ev.clientX - startX) / Math.max(1, rect.width);
+      const dy = (ev.clientY - startY) / Math.max(1, rect.height);
+      let next = { ...base };
+
+      if (mode === "body") {
+        const w = 1 - base.left - base.right;
+        const h = 1 - base.top - base.bottom;
+        const newL = Math.max(0, Math.min(1 - w, base.left + dx));
+        const newT = Math.max(0, Math.min(1 - h, base.top + dy));
+        next = {
+          left: newL,
+          top: newT,
+          right: Math.max(0, 1 - newL - w),
+          bottom: Math.max(0, 1 - newT - h),
+        };
+      } else if (mode === "new") {
+        const p0x = Math.max(0, Math.min(1, (startX - rect.left) / rect.width));
+        const p0y = Math.max(0, Math.min(1, (startY - rect.top) / rect.height));
+        const p1x = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+        const p1y = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+        const l = Math.min(p0x, p1x);
+        const r = 1 - Math.max(p0x, p1x);
+        const t = Math.min(p0y, p1y);
+        const b = 1 - Math.max(p0y, p1y);
+        if (1 - l - r >= 0.05 && 1 - t - b >= 0.05) {
+          next = { left: l, top: t, right: r, bottom: b };
+        }
+      } else {
+        if (mode.includes("l")) {
+          next.left = Math.max(0, Math.min(1 - base.right - 0.05, base.left + dx));
+        }
+        if (mode.includes("r")) {
+          next.right = Math.max(0, Math.min(1 - base.left - 0.05, base.right - dx));
+        }
+        if (mode.includes("t")) {
+          next.top = Math.max(0, Math.min(1 - base.bottom - 0.05, base.top + dy));
+        }
+        if (mode.includes("b")) {
+          next.bottom = Math.max(0, Math.min(1 - base.top - 0.05, base.bottom - dy));
+        }
+      }
+
+      current = next;
+      setActiveCrop(next);
+
+      // Live visual preview on video element
+      if (videoRef.current) {
+        const topPct = (next.top * 100).toFixed(2);
+        const rightPct = (next.right * 100).toFixed(2);
+        const bottomPct = (next.bottom * 100).toFixed(2);
+        const leftPct = (next.left * 100).toFixed(2);
+        videoRef.current.style.clipPath = `inset(${topPct}% ${rightPct}% ${bottomPct}% ${leftPct}%)`;
+      }
     };
+
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      setDrag((d) => {
-        if (d && onCropCommit) {
-          const left = Math.min(d.x0, d.x1);
-          const right = 1 - Math.max(d.x0, d.x1);
-          const top = Math.min(d.y0, d.y1);
-          const bottom = 1 - Math.max(d.y0, d.y1);
-          if (1 - left - right > 0.05 && 1 - top - bottom > 0.05) {
-            onCropCommit({ left, top, right, bottom });
-          }
-        }
-        return null;
-      });
+      if (onCropCommit) {
+        onCropCommit(current);
+      }
     };
+
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -149,20 +200,13 @@ export function ProjectMonitor({
     onEyedropColor(hex);
   }
 
-  const liveCrop = drag
-    ? {
-        left: Math.min(drag.x0, drag.x1),
-        top: Math.min(drag.y0, drag.y1),
-        right: 1 - Math.max(drag.x0, drag.x1),
-        bottom: 1 - Math.max(drag.y0, drag.y1),
-      }
-    : cropDraft;
+  const canPlay = Boolean(previewSrc || hasTimelineClips || duration > 0);
 
   const ctxItems: ContextMenuItem[] = [
     {
       type: "item",
       label: playing ? "Pause" : "Play",
-      disabled: !previewSrc,
+      disabled: !canPlay,
       action: () => onTogglePlay(),
     },
     {
@@ -262,7 +306,7 @@ export function ProjectMonitor({
         <div
           ref={frameRef}
           className={`monitor-frame ${tiktok ? "phone" : "wide"} ${cropTool ? "crop-mode" : ""}`}
-          onPointerDown={beginCrop}
+          onPointerDown={(e) => startCropDrag("new", e)}
         >
           <video
             ref={videoRef}
@@ -280,27 +324,121 @@ export function ProjectMonitor({
               cursor: chromakeyActive ? "crosshair" : undefined,
             }}
           />
-          {liveCrop && previewMode === "video" && (
+          {cropTool && previewMode === "video" && (
             <div
-              className="crop-overlay"
+              className="crop-box"
               style={{
-                left: `${liveCrop.left * 100}%`,
-                top: `${liveCrop.top * 100}%`,
-                right: `${liveCrop.right * 100}%`,
-                bottom: `${liveCrop.bottom * 100}%`,
+                left: `${currentCrop.left * 100}%`,
+                top: `${currentCrop.top * 100}%`,
+                right: `${currentCrop.right * 100}%`,
+                bottom: `${currentCrop.bottom * 100}%`,
               }}
-            />
+            >
+              {/* Body for moving the whole box */}
+              <div
+                className="crop-box-body"
+                onPointerDown={(e) => startCropDrag("body", e)}
+                title="Drag to move crop area"
+              />
+
+              {/* Rule of thirds grid lines */}
+              <div className="crop-grid-h1" />
+              <div className="crop-grid-h2" />
+              <div className="crop-grid-v1" />
+              <div className="crop-grid-v2" />
+
+              {/* 4 Corner Resize Handles */}
+              <div
+                className="crop-handle crop-handle-tl"
+                onPointerDown={(e) => startCropDrag("tl", e)}
+                title="Resize Top-Left"
+              />
+              <div
+                className="crop-handle crop-handle-tr"
+                onPointerDown={(e) => startCropDrag("tr", e)}
+                title="Resize Top-Right"
+              />
+              <div
+                className="crop-handle crop-handle-bl"
+                onPointerDown={(e) => startCropDrag("bl", e)}
+                title="Resize Bottom-Left"
+              />
+              <div
+                className="crop-handle crop-handle-br"
+                onPointerDown={(e) => startCropDrag("br", e)}
+                title="Resize Bottom-Right"
+              />
+
+              {/* 4 Edge Resize Handles */}
+              <div
+                className="crop-handle crop-handle-t"
+                onPointerDown={(e) => startCropDrag("t", e)}
+                title="Resize Top Edge"
+              />
+              <div
+                className="crop-handle crop-handle-b"
+                onPointerDown={(e) => startCropDrag("b", e)}
+                title="Resize Bottom Edge"
+              />
+              <div
+                className="crop-handle crop-handle-l"
+                onPointerDown={(e) => startCropDrag("l", e)}
+                title="Resize Left Edge"
+              />
+              <div
+                className="crop-handle crop-handle-r"
+                onPointerDown={(e) => startCropDrag("r", e)}
+                title="Resize Right Edge"
+              />
+
+              {/* Information badge & Quick Actions */}
+              <div className={`crop-info-badge ${currentCrop.top < 0.12 ? "flip-inside" : ""}`}>
+                <span className="crop-dim-text">
+                  Crop:
+                  <span className="crop-dim-val">
+                    {Math.round(cropWidth * 100)}% × {Math.round(cropHeight * 100)}%
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className="crop-badge-btn"
+                  title="Reset crop to full frame"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const zero = { left: 0, top: 0, right: 0, bottom: 0 };
+                    setActiveCrop(zero);
+                    if (videoRef.current) {
+                      videoRef.current.style.clipPath = "";
+                    }
+                    onCropCommit?.(zero);
+                  }}
+                >
+                  Reset
+                </button>
+                <button
+                  type="button"
+                  className="crop-badge-btn done"
+                  title="Done cropping"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCropTool?.(false);
+                  }}
+                >
+                  Done
+                </button>
+              </div>
+            </div>
           )}
           <audio ref={audioRef} preload="metadata" className="monitor-timeline-audio" />
           <div
             className="monitor-audio-only"
-            style={{ display: previewMode === "audio" && previewSrc ? "grid" : "none" }}
+            style={{ display: !hasTimelineClips && previewMode === "audio" && previewSrc ? "grid" : "none" }}
           >
             <div className="audio-orb small">♪</div>
             <h2>Audio preview</h2>
             <p>Playing timeline audio</p>
           </div>
-          {previewMode === "empty" && (
+          {previewMode === "empty" && !hasTimelineClips && (
             <div className="monitor-empty">
               <p>
                 {tiktok
@@ -313,7 +451,7 @@ export function ProjectMonitor({
         {previewError && <div className="preview-error">{previewError}</div>}
       </div>
       <div className="monitor-transport">
-        <button type="button" className="play-btn sm" onClick={onTogglePlay} disabled={!previewSrc}>
+        <button type="button" className="play-btn sm" onClick={onTogglePlay} disabled={!canPlay}>
           {playing ? "❚❚" : "▶"}
         </button>
         <span className="timecode">{formatTime(playhead)}</span>
@@ -323,7 +461,7 @@ export function ProjectMonitor({
           min={0}
           max={1000}
           value={Math.round((playhead / safeDur) * 1000)}
-          disabled={!previewSrc && duration <= 0}
+          disabled={!canPlay}
           onChange={(e) => onSeekRatio(Number(e.target.value) / 1000)}
         />
         <span className="timecode muted-tc">{formatTime(duration)}</span>

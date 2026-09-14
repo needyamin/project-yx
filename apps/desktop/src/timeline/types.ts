@@ -122,33 +122,42 @@ export type TimelineTool = "select" | "razor" | "spacer" | "slip" | "ripple";
 
 export function formatTime(seconds: number): string {
   const s = Math.max(0, seconds || 0);
-  const m = Math.floor(s / 60);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const rem = Math.floor(s % 60);
-  const ms = Math.floor((s % 1) * 10);
-  return `${m}:${String(rem).padStart(2, "0")}.${ms}`;
+  const hundredths = Math.floor((s % 1) * 100);
+  const hPrefix = h > 0 ? `${h}:` : "";
+  const mStr = h > 0 ? String(m).padStart(2, "0") : String(m);
+  const sStr = String(rem).padStart(2, "0");
+  const cStr = String(hundredths).padStart(2, "0");
+  return `${hPrefix}${mStr}:${sStr}.${cStr}`;
 }
 
-/** Ruler labels: drop tenths when step ≥ 1s; emphasize minute scale. */
+/** Ruler labels: format cleanly based on step size down to milliseconds. */
 export function formatRulerTime(seconds: number, stepSec: number): string {
   const s = Math.max(0, seconds || 0);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const rem = Math.floor(s % 60);
+  const hPrefix = h > 0 ? `${h}:` : "";
+  const mStr = h > 0 ? String(m).padStart(2, "0") : String(m);
+  const sStr = String(rem).padStart(2, "0");
+
   if (stepSec >= 3600) {
-    return `${h}:${String(m).padStart(2, "0")}:00`;
+    return `${hPrefix}${mStr}:00:00`;
   }
   if (stepSec >= 60) {
-    const totalMin = Math.floor(s / 60);
-    return `${totalMin}:00`;
+    return `${hPrefix}${mStr}:${sStr}`;
   }
   if (stepSec >= 1) {
-    if (h > 0) {
-      return `${h}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
-    }
-    return `${m}:${String(rem).padStart(2, "0")}`;
+    return `${hPrefix}${mStr}:${sStr}`;
   }
-  const tenths = Math.floor((s % 1) * 10);
-  return `${m}:${String(rem).padStart(2, "0")}.${tenths}`;
+  if (stepSec >= 0.1) {
+    const tenths = Math.floor((s % 1) * 10);
+    return `${hPrefix}${mStr}:${sStr}.${tenths}`;
+  }
+  const hundredths = Math.floor(Number(((s % 1) * 100).toFixed(2)));
+  return `${hPrefix}${mStr}:${sStr}.${String(hundredths).padStart(2, "0")}`;
 }
 
 export function fileName(path: string): string {
@@ -226,42 +235,90 @@ export function findLinkPartner(
 export type Obstacle = { start: number; duration: number };
 
 /**
- * Find a start time near `desired` where `[start, start+dur)` does not overlap any obstacles.
- * Matches the Rust engine's `resolve_non_overlapping_start` behavior so dragging is silky smooth
- * and never overlaps adjacent clips.
+ * Find a start time near `desired` where `[start, start+dur)` does not overlap any obstacles
+ * and fits completely in a valid free space interval (gap).
+ *
+ * If a gap is smaller than `dur`, the clip will NOT be allowed to be placed inside it,
+ * preventing any invalid overlapping or truncated placements.
  */
 export function resolveNonOverlappingStart(
   desired: number,
   dur: number,
   obstacles: Obstacle[],
 ): number {
-  let start = Math.max(0, desired);
-  for (let iter = 0; iter < 64; iter++) {
-    const end = start + dur;
-    let conflict: Obstacle | null = null;
-    for (const other of obstacles) {
-      const oEnd = other.start + other.duration;
-      const overlaps = start < oEnd - 0.001 && end > other.start + 0.001;
-      if (overlaps) {
-        conflict = other;
-        break;
-      }
-    }
-    if (!conflict) {
-      return Math.max(0, start);
-    }
-    const snapAfter = conflict.start + conflict.duration;
-    const canSnapBefore = conflict.start >= dur - 0.001;
-    const snapBefore = canSnapBefore ? Math.max(0, conflict.start - dur) : 0;
-    const useBefore =
-      canSnapBefore &&
-      Math.abs(desired - snapBefore) <= Math.abs(desired - snapAfter);
-    const next = useBefore ? snapBefore : snapAfter;
-    if (Math.abs(next - start) < 0.001) {
-      start = snapAfter;
+  const target = Math.max(0, desired);
+  if (!obstacles || obstacles.length === 0 || dur <= 0.001) {
+    return target;
+  }
+
+  // 1. Filter and merge overlapping/touching obstacles into disjoint intervals [start, end]
+  const intervals: { start: number; end: number }[] = obstacles
+    .filter((o) => o.duration > 0.001)
+    .map((o) => ({
+      start: Math.max(0, o.start),
+      end: Math.max(0, o.start + o.duration),
+    }))
+    .sort((a, b) => a.start - b.start);
+
+  if (intervals.length === 0) {
+    return target;
+  }
+
+  const merged: { start: number; end: number }[] = [];
+  for (const curr of intervals) {
+    const prev = merged[merged.length - 1];
+    if (prev && curr.start <= prev.end + 0.001) {
+      prev.end = Math.max(prev.end, curr.end);
     } else {
-      start = next;
+      merged.push({ start: curr.start, end: curr.end });
     }
   }
-  return Math.max(0, start);
+
+  // 2. Compute valid free slots [gapStart, gapEnd] where gapEnd - gapStart >= dur
+  // Allowed start range in slot is [validMin, validMax] where validMin = gapStart, validMax = gapEnd - dur.
+  type ValidRange = { min: number; max: number };
+  const validRanges: ValidRange[] = [];
+
+  // Slot before first obstacle (from 0 to first obstacle start)
+  if (merged[0].start >= dur - 0.001) {
+    validRanges.push({ min: 0, max: merged[0].start - dur });
+  }
+
+  // Slots between adjacent obstacles
+  for (let i = 0; i < merged.length - 1; i++) {
+    const gapStart = merged[i].end;
+    const gapEnd = merged[i + 1].start;
+    if (gapEnd - gapStart >= dur - 0.001) {
+      validRanges.push({ min: gapStart, max: gapEnd - dur });
+    }
+  }
+
+  // Slot after last obstacle (to Infinity)
+  const lastEnd = merged[merged.length - 1].end;
+  validRanges.push({ min: lastEnd, max: Infinity });
+
+  // 3. Find the best placement:
+  // If target is inside any valid range, target is 100% valid!
+  for (const range of validRanges) {
+    if (target >= range.min - 0.001 && target <= range.max + 0.001) {
+      return Math.max(range.min, Math.min(range.max, target));
+    }
+  }
+
+  // If target falls in an occupied region or insufficient gap,
+  // find the closest valid start across all valid ranges.
+  let bestCandidate = validRanges[0].min;
+  let bestDist = Infinity;
+
+  for (const range of validRanges) {
+    const candidate = Math.max(range.min, Math.min(range.max, target));
+    const dist = Math.abs(candidate - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestCandidate = candidate;
+    }
+  }
+
+  return Math.max(0, bestCandidate);
 }
+

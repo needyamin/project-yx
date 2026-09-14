@@ -1489,8 +1489,22 @@ impl TimelineEditor {
 
         let placed = match mode {
             EditMode::Normal => {
-                let start = self.resolve_non_overlapping_start(track_id, desired, dur)?;
-                start
+                let mut obstacles: Vec<(f64, f64)> = Vec::new();
+                if let Some(track) = self.timeline.tracks.iter().find(|t| t.id == track_id) {
+                    obstacles.extend(track.clips.iter().map(|c| (c.start, c.end())));
+                }
+                if let Some(link) = linked {
+                    if let Ok((partner_track, _)) = self.timeline.find_clip(link) {
+                        obstacles.extend(
+                            partner_track
+                                .clips
+                                .iter()
+                                .filter(|c| c.id != link)
+                                .map(|c| (c.start, c.end())),
+                        );
+                    }
+                }
+                self.resolve_non_overlapping_start_for_obstacles(desired, dur, &obstacles)
             }
             EditMode::Insert => {
                 // Close the hole left behind, then open space at the drop point.
@@ -1537,8 +1551,81 @@ impl TimelineEditor {
         Ok(())
     }
 
+    /// Find a start time near `desired` where `[start, start+dur)` does not overlap obstacles
+    /// and fits completely in a valid free space interval (gap).
+    fn resolve_non_overlapping_start_for_obstacles(
+        &self,
+        desired: f64,
+        dur: f64,
+        obstacles: &[(f64, f64)],
+    ) -> f64 {
+        let target = desired.max(0.0);
+        if obstacles.is_empty() || dur <= 0.001 {
+            return target;
+        }
+
+        let mut intervals: Vec<(f64, f64)> = obstacles
+            .iter()
+            .filter(|(s, e)| *e - *s > 0.001)
+            .map(|(s, e)| (s.max(0.0), e.max(0.0)))
+            .collect();
+        intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        if intervals.is_empty() {
+            return target;
+        }
+
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for curr in intervals {
+            if let Some(prev) = merged.last_mut() {
+                if curr.0 <= prev.1 + 0.001 {
+                    prev.1 = prev.1.max(curr.1);
+                    continue;
+                }
+            }
+            merged.push(curr);
+        }
+
+        let mut valid_ranges: Vec<(f64, f64)> = Vec::new();
+
+        if merged[0].0 >= dur - 0.001 {
+            valid_ranges.push((0.0, merged[0].0 - dur));
+        }
+
+        for i in 0..merged.len().saturating_sub(1) {
+            let gap_start = merged[i].1;
+            let gap_end = merged[i + 1].0;
+            if gap_end - gap_start >= dur - 0.001 {
+                valid_ranges.push((gap_start, gap_end - dur));
+            }
+        }
+
+        let last_end = merged[merged.len() - 1].1;
+        valid_ranges.push((last_end, f64::INFINITY));
+
+        for (min, max) in &valid_ranges {
+            if target >= *min - 0.001 && target <= *max + 0.001 {
+                return target.clamp(*min, *max);
+            }
+        }
+
+        let mut best_candidate = valid_ranges[0].0;
+        let mut best_dist = f64::INFINITY;
+        for (min, max) in &valid_ranges {
+            let candidate = target.clamp(*min, *max);
+            let dist = (candidate - target).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_candidate = candidate;
+            }
+        }
+
+        best_candidate.max(0.0)
+    }
+
     /// Find a start time near `desired` where `[start, start+dur)` does not overlap others.
-    fn resolve_non_overlapping_start(
+    #[allow(dead_code)]
+    pub fn resolve_non_overlapping_start(
         &self,
         track_id: TrackId,
         desired: f64,
@@ -1550,35 +1637,8 @@ impl TimelineEditor {
             .iter()
             .find(|t| t.id == track_id)
             .ok_or(TimelineError::TrackNotFound(track_id))?;
-
-        let mut start = desired.max(0.0);
-        for _ in 0..64 {
-            let end = start + dur;
-            let mut conflict: Option<&Clip> = None;
-            for other in &track.clips {
-                let o_end = other.end();
-                let overlaps = start < o_end - 1e-9 && end > other.start + 1e-9;
-                if overlaps {
-                    conflict = Some(other);
-                    break;
-                }
-            }
-            let Some(other) = conflict else {
-                return Ok(start);
-            };
-            let snap_after = other.end();
-            let snap_before = (other.start - dur).max(0.0);
-            let use_before =
-                (desired - snap_before).abs() <= (desired - snap_after).abs() && snap_before >= 0.0;
-            let next = if use_before { snap_before } else { snap_after };
-            if (next - start).abs() < 1e-9 {
-                // Stuck — force after.
-                start = snap_after;
-            } else {
-                start = next;
-            }
-        }
-        Ok(start.max(0.0))
+        let obstacles: Vec<(f64, f64)> = track.clips.iter().map(|c| (c.start, c.end())).collect();
+        Ok(self.resolve_non_overlapping_start_for_obstacles(desired, dur, &obstacles))
     }
 
     fn apply_trim_values(
@@ -2747,6 +2807,78 @@ mod tests {
         let _ = left;
         let clips = &ed.timeline.tracks[0].clips;
         assert!(clips.iter().any(|c| c.media_path == "b.mp4" && (c.start - 4.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn move_rejects_insufficient_space_and_avoids_overlap() {
+        let mut ed = TimelineEditor::new();
+        let track_id = ed.timeline.first_track(TrackKind::Video).unwrap();
+        // Clip 1: [0.0, 5.0]
+        ed.apply(EditCommand::AddClip {
+            track_id,
+            media_path: "c1.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        // Clip 2: [7.0, 12.0] (Gap is [5.0, 7.0], size = 2.0s)
+        ed.apply(EditCommand::AddClip {
+            track_id,
+            media_path: "c2.mp4".into(),
+            source_path: None,
+            start: 7.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        // Clip 3: [20.0, 24.0], duration = 4.0s (Cannot fit in the 2.0s gap between 5.0 and 7.0)
+        let c3 = ed
+            .apply(EditCommand::AddClip {
+                track_id,
+                media_path: "c3.mp4".into(),
+                source_path: None,
+                start: 20.0,
+                in_point: 0.0,
+                out_point: 4.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+
+        // Try moving c3 into the 2s gap at desired = 5.5
+        ed.apply(EditCommand::MoveClip {
+            clip_id: c3,
+            new_start: 5.5,
+            sync_linked: false,
+        })
+        .unwrap();
+
+        let track = ed.timeline.tracks.iter().find(|t| t.id == track_id).unwrap();
+        let c3_placed = track.clips.iter().find(|c| c.id == c3).unwrap();
+        // c3 duration is 4.0, gap [5.0, 7.0] is only 2.0.
+        // It must NOT be placed inside [5.0, 7.0] or overlap [0, 5] or [7, 12]!
+        assert!(c3_placed.start >= 12.0 - 1e-6);
+        // Verify NO overlapping clips anywhere on the track:
+        for i in 0..track.clips.len() {
+            for j in (i + 1)..track.clips.len() {
+                let a = &track.clips[i];
+                let b = &track.clips[j];
+                assert!(
+                    a.end() <= b.start + 1e-6 || b.end() <= a.start + 1e-6,
+                    "Clips {:?} and {:?} overlap!",
+                    a,
+                    b
+                );
+            }
+        }
     }
 
     /// End-to-end edit matrix matching the manual smoke checklist (logic layer).

@@ -116,9 +116,11 @@ function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const resumePlayRef = useRef(false);
+  const transitioningRef = useRef(false);
   const playheadRef = useRef(0);
   const playingRef = useRef(false);
   const reverseRafRef = useRef(0);
+  const gapRafRef = useRef(0);
   const playheadUiTimer = useRef(0);
   const videoUnderCache = useRef<UnderPlayhead | null>(null);
   const audioUnderCache = useRef<UnderPlayhead | null>(null);
@@ -141,6 +143,8 @@ function App() {
   } | null>(null);
   const [boot, setBoot] = useState<BootInfo | null>(null);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
+  const timelineRef = useRef<Timeline | null>(null);
+  timelineRef.current = timeline;
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
@@ -272,20 +276,6 @@ function App() {
     }
   }, [timelineAudioPath]);
 
-  const previewClipId = useMemo(() => {
-    if (previewMode === "video") return videoUnderPlayhead?.clip.id ?? null;
-    if (previewMode === "audio") return audioUnderPlayhead?.clip.id ?? null;
-    return null;
-  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
-
-  const previewInPoint = useMemo(() => {
-    if (previewMode === "video") return videoUnderPlayhead?.clip.in_point ?? null;
-    if (previewMode === "audio") return audioUnderPlayhead?.clip.in_point ?? null;
-    return null;
-  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
-
-  const audioClipId = audioUnderPlayhead?.clip.id ?? null;
-
   const projectDuration = useMemo(
     () => (timeline ? timelineDuration(timeline, 10) : 10),
     [timeline],
@@ -304,28 +294,62 @@ function App() {
     }
   }, [previewPath, previewSrc]);
 
-  // Load media into the project monitor elements
+  // Load media into the project monitor elements without flickering on splits of same media
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
     const shouldResume = resumePlayRef.current;
     resumePlayRef.current = false;
 
-    if (!shouldResume) {
+    if (previewMode === "empty") {
+      if (video && !video.paused) video.pause();
+      if (audio && !audio.paused) audio.pause();
+      return;
+    }
+    if (previewMode === "audio") {
+      if (video && !video.paused) video.pause();
+    }
+
+    // Check if the video or audio elements already have these exact sources loaded
+    const videoCurrentSrc = video?.getAttribute("src");
+    const audioCurrentSrc = audio?.getAttribute("src");
+    const videoNeedsChange =
+      previewMode === "video" && video && previewSrc && videoCurrentSrc !== previewSrc;
+    const wantAudioSrc = timelineAudioSrc ?? (previewMode === "audio" ? previewSrc : null);
+    const audioNeedsChange = Boolean(
+      wantAudioSrc && audio && audioCurrentSrc !== wantAudioSrc,
+    );
+
+    // If sources have not changed, do NOT unload or reload the media!
+    if (!videoNeedsChange && !audioNeedsChange) {
+      if (previewMode === "video" && video) {
+        const videoHit = videoUnderRef.current;
+        if (videoHit) {
+          const t = playheadRef.current;
+          const speed = clipSpeed(videoHit.clip);
+          const local = videoHit.clip.in_point + (t - videoHit.clip.start) * speed;
+          const wantTime = Math.max(
+            videoHit.clip.in_point,
+            Math.min(local, videoHit.clip.out_point - 0.01),
+          );
+          // Only seek if out of sync by >0.15s (prevents micro-stutter when playing through splits)
+          if (Math.abs(video.currentTime - wantTime) > 0.15) {
+            video.currentTime = wantTime;
+          }
+        }
+        if (shouldResume && video.paused) {
+          void video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          if (timelineAudioSrc && audio && audio.paused) {
+            void audio.play().catch(() => undefined);
+          }
+        }
+      }
+      return;
+    }
+
+    if (!shouldResume && !playingRef.current) {
       setPlaying(false);
     }
-    if (video) {
-      video.pause();
-      video.muted = true;
-      video.removeAttribute("src");
-      video.load();
-    }
-    if (audio) {
-      audio.pause();
-      audio.removeAttribute("src");
-      audio.load();
-    }
-    if (!previewSrc && !timelineAudioSrc) return;
 
     const syncAudioLocal = () => {
       const audioHit = audioUnderRef.current;
@@ -338,11 +362,11 @@ function App() {
       );
     };
 
-    if (previewMode === "video" && video && previewSrc) {
+    if (previewMode === "video" && video && previewSrc && videoNeedsChange) {
       video.src = previewSrc;
       video.muted = true;
       video.load();
-      if (timelineAudioSrc && audio) {
+      if (timelineAudioSrc && audio && audioCurrentSrc !== timelineAudioSrc) {
         audio.src = timelineAudioSrc;
         audio.load();
       }
@@ -357,30 +381,30 @@ function App() {
           );
         }
         syncAudioLocal();
-        if (shouldResume) {
+        if (shouldResume || playingRef.current) {
           void video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
           if (timelineAudioSrc && audio) {
             void audio.play().catch(() => undefined);
           }
         }
       };
-      video.addEventListener("loadedmetadata", onMeta);
+      video.addEventListener("loadedmetadata", onMeta, { once: true });
       return () => video.removeEventListener("loadedmetadata", onMeta);
     }
 
-    if (previewMode === "audio" && audio && (timelineAudioSrc || previewSrc)) {
-      audio.src = timelineAudioSrc ?? previewSrc!;
+    if (previewMode === "audio" && audio && wantAudioSrc && audioNeedsChange) {
+      audio.src = wantAudioSrc;
       audio.load();
       const onMeta = () => {
         syncAudioLocal();
-        if (shouldResume) {
+        if (shouldResume || playingRef.current) {
           void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
         }
       };
-      audio.addEventListener("loadedmetadata", onMeta);
+      audio.addEventListener("loadedmetadata", onMeta, { once: true });
       return () => audio.removeEventListener("loadedmetadata", onMeta);
     }
-  }, [previewSrc, timelineAudioSrc, previewMode, previewClipId, previewInPoint, audioClipId]);
+  }, [previewSrc, timelineAudioSrc, previewMode]);
 
   const commitPlayhead = useCallback((t: number, immediate = false) => {
     const next = Math.max(0, t);
@@ -439,20 +463,60 @@ function App() {
         }
         const clipEnd = hit.clip.start + clipTimelineDuration(hit.clip);
         if (timelineTime >= clipEnd - 0.02 || active.currentTime >= hit.clip.out_point - 0.02) {
+          const tl = timelineRef.current;
           const next =
-            timeline != null
-              ? nextClipAfter(timeline, clipEnd, previewMode === "video" ? "video" : "audio")
+            tl != null
+              ? nextClipAfter(tl, clipEnd, previewMode === "video" ? "video" : "audio")
               : null;
           if (next && next.clip.id !== hit.clip.id) {
-            resumePlayRef.current = !active.paused || playingRef.current;
-            active.pause();
-            audio?.pause();
-            commitPlayhead(next.clip.start, true);
-          } else {
-            active.pause();
-            audio?.pause();
+            const isSameMedia = next.clip.media_path === hit.clip.media_path;
+            const isContiguousTimeline = next.clip.start <= clipEnd + 0.04;
+            const isContinuousMedia = Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
+
+            if (isSameMedia && isContiguousTimeline && isContinuousMedia) {
+              // Seamless continuous playback across split point:
+              // Keep playing smoothly without pausing or reloading!
+              commitPlayhead(next.clip.start, false);
+              return;
+            } else if (isSameMedia && isContiguousTimeline) {
+              // Same media, but in_point jumped (cut section): seek smoothly within loaded video
+              active.currentTime = next.clip.in_point;
+              commitPlayhead(next.clip.start, false);
+              return;
+            } else if (isContiguousTimeline) {
+              // Contiguous cut of different media
+              resumePlayRef.current = !active.paused || playingRef.current;
+              transitioningRef.current = true;
+              active.pause();
+              audio?.pause();
+              commitPlayhead(next.clip.start, true);
+              window.setTimeout(() => {
+                transitioningRef.current = false;
+              }, 50);
+              return;
+            }
+          }
+
+          // Gap between clips or end of timeline:
+          // Do NOT jump across the gap. Pause active media and let the gap playback
+          // ticker drive the playhead smoothly across the gap showing a blank/black screen!
+          const wasPlaying = playingRef.current;
+          transitioningRef.current = true;
+          active.pause();
+          audio?.pause();
+          window.setTimeout(() => {
+            transitioningRef.current = false;
+          }, 50);
+
+          commitPlayhead(clipEnd, true);
+
+          const dur = tl ? timelineDuration(tl, 10) : 10;
+          if (wasPlaying && clipEnd < dur - 0.05) {
+            playingRef.current = true;
+            setPlaying(true);
+          } else if (wasPlaying) {
+            playingRef.current = false;
             setPlaying(false);
-            commitPlayhead(clipEnd, true);
           }
         }
       } else {
@@ -466,8 +530,11 @@ function App() {
       }
     };
     const onPause = () => {
+      if (transitioningRef.current) return;
       cancelAnimationFrame(reverseRafRef.current);
       reverseRafRef.current = 0;
+      cancelAnimationFrame(gapRafRef.current);
+      gapRafRef.current = 0;
       playingRef.current = false;
       setPlaying(false);
       audio?.pause();
@@ -485,7 +552,69 @@ function App() {
       active.removeEventListener("pause", onPause);
       active.removeEventListener("error", onErr);
     };
-  }, [previewMode, previewClipId, audioClipId, timeline, timelineAudioSrc, commitPlayhead]);
+  }, [previewMode, timelineAudioSrc, commitPlayhead]);
+
+  // Gap playback ticker: drives playhead smoothly across gaps at 1x speed showing blank/black screen
+  useEffect(() => {
+    if (!playing || previewMode === "video") {
+      if (gapRafRef.current) {
+        cancelAnimationFrame(gapRafRef.current);
+        gapRafRef.current = 0;
+      }
+      return;
+    }
+
+    let lastWall = performance.now();
+
+    const tick = (now: number) => {
+      if (!playingRef.current) return;
+      const dt = Math.min(0.1, (now - lastWall) / 1000);
+      lastWall = now;
+
+      const currentPh = playheadRef.current;
+      const nextPh = currentPh + dt;
+
+      const tl = timelineRef.current;
+      const dur = tl ? timelineDuration(tl, 10) : 10;
+      if (nextPh >= dur) {
+        commitPlayhead(dur, true);
+        playingRef.current = false;
+        setPlaying(false);
+        const audio = audioRef.current;
+        if (audio && !audio.paused) audio.pause();
+        return;
+      }
+
+      const vClip = tl ? clipAtPlayhead(tl, nextPh, "video") : null;
+      if (vClip) {
+        // Reached the next video clip!
+        resumePlayRef.current = true;
+        commitPlayhead(nextPh, true);
+        return;
+      }
+
+      // Still in a gap: advance playhead
+      commitPlayhead(nextPh, false);
+
+      const aClip = tl ? clipAtPlayhead(tl, nextPh, "audio") : null;
+      const audio = audioRef.current;
+      if (audio && aClip) {
+        if (audio.paused) void audio.play().catch(() => undefined);
+      } else if (audio && !audio.paused && !aClip) {
+        audio.pause();
+      }
+
+      gapRafRef.current = requestAnimationFrame(tick);
+    };
+
+    gapRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (gapRafRef.current) {
+        cancelAnimationFrame(gapRafRef.current);
+        gapRafRef.current = 0;
+      }
+    };
+  }, [playing, previewMode, commitPlayhead]);
 
   async function importPaths(paths: string[]) {
     const mediaPaths = paths.filter(isMediaPath);
@@ -1163,34 +1292,39 @@ function App() {
     right: number;
     bottom: number;
   }) {
-    if (!selectedClipId || !selectedClip) {
+    let targetClipId = selectedClipId;
+    let targetClip = selectedClip;
+    if (!targetClipId && videoUnderPlayhead) {
+      targetClipId = videoUnderPlayhead.clip.id;
+      targetClip = videoUnderPlayhead;
+      setSelectedClipId(targetClipId);
+    }
+    if (!targetClipId || !targetClip) {
       setStatus("Select a clip to crop");
       return;
     }
     try {
-      let filters = selectedClip.clip.filters ?? [];
+      let filters = targetClip.clip.filters ?? [];
       let cropFilter = filters.find((f) => f.kind === "crop");
       if (!cropFilter) {
         const next = normalizeTimeline(
-          await invoke<Timeline>("add_filter", { clipId: selectedClipId, kind: "crop" }),
+          await invoke<Timeline>("add_filter", { clipId: targetClipId, kind: "crop" }),
         );
         setTimeline(next);
-        const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === selectedClipId);
+        const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === targetClipId);
         cropFilter = clip?.filters.find((f) => f.kind === "crop");
         filters = clip?.filters ?? [];
       }
       if (!cropFilter) return;
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("update_filter", {
-            clipId: selectedClipId,
-            filterId: cropFilter.id,
-            params: crop,
-          }),
-        ),
+      const updated = normalizeTimeline(
+        await invoke<Timeline>("update_filter", {
+          clipId: targetClipId,
+          filterId: cropFilter.id,
+          params: crop,
+        }),
       );
-      setCropTool(false);
-      setStatus("Crop applied");
+      setTimeline(updated);
+      setStatus("Crop updated");
     } catch (e) {
       setStatus(String(e));
     }
@@ -1406,27 +1540,38 @@ function App() {
   function togglePlay() {
     const video = videoRef.current;
     const audio = audioRef.current;
-    if (previewMode === "video" && video && previewSrc) {
-      const stopPlayback = () => {
-        cancelAnimationFrame(reverseRafRef.current);
-        reverseRafRef.current = 0;
-        playingRef.current = false;
-        setPlaying(false);
-        video.pause();
-        audio?.pause();
-      };
 
-      // Gate on playingRef — reverse keeps video.paused true, so !paused is unreliable.
-      if (playingRef.current) {
-        stopPlayback();
-        return;
-      }
+    const stopPlayback = () => {
+      cancelAnimationFrame(reverseRafRef.current);
+      reverseRafRef.current = 0;
+      cancelAnimationFrame(gapRafRef.current);
+      gapRafRef.current = 0;
+      playingRef.current = false;
+      setPlaying(false);
+      video?.pause();
+      audio?.pause();
+    };
 
+    // Gate on playingRef — reverse keeps video.paused true, so !paused is unreliable.
+    if (playingRef.current) {
+      stopPlayback();
+      return;
+    }
+
+    const dur = timeline ? timelineDuration(timeline, 10) : 10;
+    if (playheadRef.current >= dur - 0.05) {
+      commitPlayhead(0, true);
+    }
+
+    const curTime = playheadRef.current;
+    const hit = timeline ? clipAtPlayhead(timeline, curTime, "video") : null;
+    const audioHit = timeline ? clipAtPlayhead(timeline, curTime, "audio") : null;
+
+    if (hit && video && previewSrc) {
       video.muted = true;
-      const hit = videoUnderRef.current;
-      const needsStepped = !!hit?.clip.reverse;
+      const needsStepped = !!hit.clip.reverse;
 
-      if (hit && needsStepped) {
+      if (needsStepped) {
         const clip = hit.clip;
         const speed = clipSpeed(clip);
         const wall0 = performance.now();
@@ -1465,21 +1610,36 @@ function App() {
         return;
       }
 
-      const speed = hit ? clipSpeed(hit.clip) : 1;
+      const speed = clipSpeed(hit.clip);
       try {
         video.playbackRate = speed;
       } catch {
         /* ignore */
       }
-      void video.play();
+      void video.play().catch(() => undefined);
       playingRef.current = true;
       setPlaying(true);
       if (timelineAudioSrc && audio) void audio.play().catch(() => undefined);
       return;
     }
-    if (previewMode === "audio" && audio && (timelineAudioSrc || previewSrc)) {
-      if (audio.paused) void audio.play();
-      else audio.pause();
+
+    if (audioHit && audio && (timelineAudioSrc || previewSrc)) {
+      if (audio.paused) void audio.play().catch(() => undefined);
+      playingRef.current = true;
+      setPlaying(true);
+      return;
+    }
+
+    // Sitting in a gap (no video clip under playhead)
+    if (hasTimelineClips || dur > 0) {
+      playingRef.current = true;
+      setPlaying(true);
+      if (video && !video.paused) video.pause();
+      if (audioHit && audio && timelineAudioSrc) {
+        if (audio.paused) void audio.play().catch(() => undefined);
+      } else if (audio && !audio.paused) {
+        audio.pause();
+      }
     }
   }
 
@@ -1504,9 +1664,13 @@ function App() {
       } catch {
         /* ignore */
       }
+    } else if (videoRef.current && !videoRef.current.paused) {
+      videoRef.current.pause();
     }
     if (audioHit && audioRef.current) {
       audioRef.current.currentTime = audioHit.clip.in_point + (next - audioHit.clip.start);
+    } else if (audioRef.current && !audioRef.current.paused) {
+      audioRef.current.pause();
     }
     applyPreviewFades(next, videoHit?.clip ?? null, audioHit?.clip ?? null);
   }
@@ -1582,8 +1746,9 @@ function App() {
       pitch && typeof pitch.params?.semitones === "number"
         ? (pitch.params.semitones as number)
         : 0;
-    return `${audioClipId ?? "none"}:${pitch ? "1" : "0"}:${st}`;
-  }, [audioClipId, audioUnderPlayhead]);
+    const clipId = audioUnderPlayhead?.clip.id ?? "none";
+    return `${clipId}:${pitch ? "1" : "0"}:${st}`;
+  }, [audioUnderPlayhead]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -1814,7 +1979,8 @@ function App() {
             onCropTool={setCropTool}
             cropDraft={
               (() => {
-                const c = selectedClip?.clip.filters?.find((f) => f.kind === "crop" && f.enabled);
+                const target = selectedClip?.clip ?? videoUnderPlayhead?.clip;
+                const c = target?.filters?.find((f) => f.kind === "crop" && f.enabled);
                 if (!c?.params) return null;
                 const p = c.params as Record<string, number>;
                 return {
@@ -1836,6 +2002,7 @@ function App() {
             onShowClipMonitor={
               clipMonitorOpen ? undefined : () => setClipMonitorOpen(true)
             }
+            hasTimelineClips={hasTimelineClips}
           />
         }
         timeline={

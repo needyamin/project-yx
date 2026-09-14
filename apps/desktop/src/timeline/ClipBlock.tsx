@@ -101,8 +101,11 @@ export function ClipBlock({
         .closest(".tl-clip")
         ?.getBoundingClientRect();
       const x = rect ? e.clientX - rect.left : e.nativeEvent.offsetX;
-      const at = start + x / view.pxPerSec;
-      onRazor(Math.max(start + 0.05, Math.min(start + dur - 0.05, at)));
+      const rawAt = start + x / view.pxPerSec;
+      const frameDur = 1 / 30;
+      const quantized = Math.round(rawAt / frameDur) * frameDur;
+      const at = Number(quantized.toFixed(4));
+      onRazor(Math.max(start + frameDur, Math.min(start + dur - frameDur, at)));
       return;
     }
 
@@ -154,7 +157,10 @@ export function ClipBlock({
       });
     }
 
-    const onMoveWin = (ev: PointerEvent) => {
+    let rafId: number | null = null;
+    let pendingEv: PointerEvent | null = null;
+
+    const processMove = (ev: PointerEvent) => {
       const dx = ev.clientX - originX;
       const dt = dx / view.pxPerSec;
 
@@ -206,7 +212,24 @@ export function ClipBlock({
 
       if (resolved === "move") {
         const rawNext = Math.max(0, originStart + dt);
-        const snapped = view.applySnap(rawNext, anchors);
+        let snapped = view.applySnap(rawNext, anchors);
+        // If left edge did not snap, snap right edge against anchors (flush snapping)
+        if (Math.abs(snapped - rawNext) < 0.001 && view.snap) {
+          const threshold = Math.max(0.05, 10 / view.pxPerSec);
+          let bestRightDist = threshold;
+          let bestRightStart = rawNext;
+          for (const a of anchors) {
+            const d = Math.abs(a - (rawNext + originDur));
+            if (d < bestRightDist) {
+              bestRightDist = d;
+              bestRightStart = Math.max(0, a - originDur);
+            }
+          }
+          if (bestRightDist < threshold) {
+            snapped = bestRightStart;
+            view.setSnapGuide(snapped + originDur);
+          }
+        }
         const next =
           (editMode ?? "normal") === "normal" && obstacles && obstacles.length > 0
             ? resolveNonOverlappingStart(snapped, originDur, obstacles)
@@ -290,10 +313,30 @@ export function ClipBlock({
       });
     };
 
+    const onMoveWin = (ev: PointerEvent) => {
+      pendingEv = ev;
+      if (rafId == null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          if (pendingEv && draggingRef.current) {
+            processMove(pendingEv);
+          }
+        });
+      }
+    };
+
     const onUpWin = () => {
       window.removeEventListener("pointermove", onMoveWin);
       window.removeEventListener("pointerup", onUpWin);
       window.removeEventListener("pointercancel", onUpWin);
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (pendingEv && draggingRef.current) {
+        processMove(pendingEv);
+        pendingEv = null;
+      }
       view.setSnapGuide(null);
       draggingRef.current = false;
       onDragActive?.(false);

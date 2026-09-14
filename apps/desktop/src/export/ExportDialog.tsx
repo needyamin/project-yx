@@ -458,7 +458,7 @@ export function ExportDialog({
                   style={{ width: `${Math.min(100, Math.max(0, progress * 100))}%` }}
                 />
               </div>
-              <p className="export-progress-hint">Running in a background FFmpeg process — UI stays responsive</p>
+              <p className="export-progress-hint">Rendering in the background — UI stays responsive</p>
             </div>
           ) : (
             <p className="export-summary">{summary}</p>
