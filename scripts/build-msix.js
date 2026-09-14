@@ -70,21 +70,80 @@ for (const [srcName, destName] of assetMap) {
   fs.copyFileSync(src, path.join(assetsDir, destName));
 }
 
+function getArg(flag) {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  return null;
+}
+
+// Check for store-identity.json or msix.config.json in ROOT
+let fileConfig = {};
+const configCandidates = [
+  path.join(ROOT, "store-identity.json"),
+  path.join(ROOT, "msix.config.json"),
+];
+for (const cfgPath of configCandidates) {
+  if (fs.existsSync(cfgPath)) {
+    try {
+      fileConfig = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+      console.log(`[yx-dist] Loaded Store identity config from ${path.basename(cfgPath)}`);
+      break;
+    } catch (e) {
+      console.warn(`[yx-dist] WARN: Failed to parse ${cfgPath}:`, e.message);
+    }
+  }
+}
+
 const templatePath = path.join(ROOT, "installer", "msix", "AppxManifest.xml.template");
-const identityName = process.env.YX_MSIX_IDENTITY_NAME || "ProjectYX.Editor";
-const publisher = process.env.YX_MSIX_PUBLISHER || "CN=Project YX Contributors";
+const displayName =
+  getArg("--display-name") ||
+  process.env.YX_MSIX_DISPLAY_NAME ||
+  fileConfig.displayName ||
+  "Project YX - Pro Video Editing for Every Machine";
+
+const description =
+  getArg("--description") ||
+  process.env.YX_MSIX_DESCRIPTION ||
+  fileConfig.description ||
+  "Project YX - Pro Video Editing for Every Machine";
+
+const identityName =
+  getArg("--identity-name") ||
+  process.env.YX_MSIX_IDENTITY_NAME ||
+  fileConfig.identityName ||
+  fileConfig.name ||
+  "ANSNEWTECH.ProjectYX-ProVideoEditingforEveryMachin";
+
+const publisher =
+  getArg("--publisher") ||
+  process.env.YX_MSIX_PUBLISHER ||
+  fileConfig.publisher ||
+  "CN=087A9974-75CB-44FC-B893-8D3999E5E5E5";
+
 const publisherDisplay =
-  process.env.YX_MSIX_PUBLISHER_DISPLAY || "Project YX Contributors";
+  getArg("--publisher-display") ||
+  process.env.YX_MSIX_PUBLISHER_DISPLAY ||
+  fileConfig.publisherDisplayName ||
+  fileConfig.publisherDisplay ||
+  "ANSNEW TECH.";
 
 let manifest = fs.readFileSync(templatePath, "utf8");
 manifest = manifest
   .replaceAll("__VERSION_QUAD__", toVersionQuad(names.version))
   .replaceAll("__EXE_NAME__", mainExe)
+  .replaceAll("__DISPLAY_NAME__", displayName)
+  .replaceAll("__DESCRIPTION__", description)
   .replaceAll("__IDENTITY_NAME__", identityName)
   .replaceAll("__PUBLISHER__", publisher)
   .replaceAll("__PUBLISHER_DISPLAY__", publisherDisplay);
 fs.writeFileSync(path.join(layout, "AppxManifest.xml"), manifest);
-console.log(`[yx-dist] MSIX identity: ${identityName} / ${publisher}`);
+console.log(`[yx-dist] MSIX package identity:
+  Display Name:     ${displayName}
+  Identity Name:    ${identityName}
+  Publisher:        ${publisher}
+  PublisherDisplay: ${publisherDisplay}`);
 
 const makeappx = requireMakeAppx();
 ensureDist();

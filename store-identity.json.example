@@ -1,0 +1,6 @@
+{
+  "_comment": "Fill in these 3 fields directly from Microsoft Partner Center -> Apps & games -> Your App -> Product management -> Product identity",
+  "identityName": "YourPackageIdentityName",
+  "publisher": "CN=Your-Publisher-ID-From-Partner-Center",
+  "publisherDisplayName": "ANSNEW TECH."
+}
