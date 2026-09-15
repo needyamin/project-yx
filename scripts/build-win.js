@@ -11,11 +11,13 @@ import { artifactBase } from "./lib/version.js";
 import { ensureBuild } from "./lib/paths.js";
 import { copyToDist } from "./lib/copy-artifact.js";
 import { findIscc } from "./lib/inno.js";
+import { prepareBundledBinaries } from "./prepare-binaries.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const force = process.argv.includes("--force");
 
 ensureBuild();
+prepareBundledBinaries();
 ensureTauriBuild({ bundles: ["nsis"], force });
 
 const names = artifactBase();

@@ -24,7 +24,9 @@ const iscc = requireIscc();
 const iss = path.join(ROOT, "installer", "project-yx.iss");
 ensureDist();
 
-const outputBase = names.setup.replace(/\.exe$/i, "");
+// Distinct output name: the NSIS setup is the canonical
+// Project-YX-Setup-<version>.exe; Inno must not overwrite it.
+const outputBase = `${names.setup.replace(/\.exe$/i, "")}-inno`;
 
 runIscc(iscc, iss, {
   MyAppVersion: names.version,
@@ -35,9 +37,9 @@ runIscc(iscc, iss, {
   MyAppIcon: iconIcoPath(),
 });
 
-const out = path.join(DIST_DIR, names.setup);
+const out = path.join(DIST_DIR, `${outputBase}.exe`);
 if (!fs.existsSync(out)) {
   throw new Error(`Expected Inno output missing: ${out}`);
 }
-console.log(`[yx-dist] → dist/${names.setup}`);
+console.log(`[yx-dist] → dist/${outputBase}.exe`);
 console.log("[yx-dist] Inno Setup packaging finished");

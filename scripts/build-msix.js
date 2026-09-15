@@ -14,6 +14,7 @@ import {
 } from "./lib/paths.js";
 import { stagePortableApp, portableStagingPath } from "./lib/portable.js";
 import { requireMakeAppx, findSignTool } from "./lib/msix.js";
+import { prepareBundledBinaries } from "./prepare-binaries.js";
 
 const force = process.argv.includes("--force");
 const skipBuild = process.argv.includes("--reuse");
@@ -28,6 +29,7 @@ function toVersionQuad(version) {
 }
 
 ensureBuild();
+prepareBundledBinaries();
 if (!skipBuild) {
   ensureTauriBuild({ bundles: ["nsis"], force });
 }

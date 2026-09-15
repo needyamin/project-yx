@@ -68,5 +68,7 @@ procedure InitializeWizard;
 begin
   WizardForm.WelcomeLabel2.Caption :=
     'This will install Project YX on your computer.' + #13#10 + #13#10 +
-    'FFmpeg and ffprobe must be available on PATH for media import and export.';
+    'FFmpeg and ffprobe are included — no internet or extra downloads needed.' + #13#10 +
+    'The WebView2 Runtime must be present (it is preinstalled on Windows 10/11).' + #13#10 +
+    'For fully offline machines without WebView2, use the NSIS setup instead.';
 end;
