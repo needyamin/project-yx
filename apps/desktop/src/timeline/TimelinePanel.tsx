@@ -11,6 +11,8 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { subscribeBinDrag } from "../bin/binDrag";
 import { ClipBlock, type ClipEditAction } from "./ClipBlock";
+import { VoiceoverButton } from "./VoiceoverButton";
+import { ScreenRecorderButton } from "./ScreenRecorderButton";
 import {
   TimelineContextMenu,
   type ContextMenuState,
@@ -24,6 +26,7 @@ import {
   fileName,
   findLinkPartner,
   clipTimelineDuration,
+  isImagePath,
   timelineDuration,
   type Clip,
   type EditMode,
@@ -79,6 +82,8 @@ type Props = {
   ) => void;
   /** Register the imperative playhead mover (called every animation frame). */
   onRegisterPlayhead?: (fn: ((t: number) => void) | null) => void;
+  /** Place a file path (e.g. saved voiceover) at a timeline position. */
+  onAddMediaPath?: (path: string, start: number, label: string) => void;
   library?: LibraryItem[];
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
@@ -109,6 +114,7 @@ export function TimelinePanel({
   onRegisterDropResolver,
   onRegisterViewControls,
   onRegisterPlayhead,
+  onAddMediaPath,
   onAdvancedAudio,
   onAdvancedVideo,
 }: Props) {
@@ -133,6 +139,11 @@ export function TimelinePanel({
       out_point: number;
     };
   } | null>(null);
+  /** Live voiceover recording: grows a red region at the playhead. */
+  const [voiceRec, setVoiceRec] = useState<{ wallStart: number } | null>(null);
+  const recWrapRef = useRef<HTMLDivElement | null>(null);
+  const recBarRef = useRef<HTMLDivElement | null>(null);
+  const recLabelRef = useRef<HTMLSpanElement | null>(null);
   const duration = timelineDuration(timeline, 10);
   const view = useTimelineView(duration);
 
@@ -216,10 +227,15 @@ export function TimelinePanel({
         const ownEnd = clip.start + clipTimelineDuration(clip);
         const libItem =
           libIndex.get(clip.media_path) ?? libIndex.get(fileName(clip.media_path));
+        // Stills and GIFs loop at export, so their timeline length is not
+        // capped by the probed (near-zero) image duration.
+        const stillVisual = isImagePath(clip.media_path);
         map.set(clip.id, {
           obstacles,
           anchors: snapAnchors.filter((a) => a !== ownStart && a !== ownEnd),
-          maxMediaDuration: libItem?.duration ?? Infinity,
+          maxMediaDuration: stillVisual
+            ? Infinity
+            : (libItem?.duration ?? Infinity),
         });
       }
     }
@@ -875,6 +891,49 @@ export function TimelinePanel({
 
   const totalRulerDuration = duration + 120;
 
+  /* Live voiceover recording region on the first audio lane. */
+  useEffect(() => {
+    if (!voiceRec) return;
+    const canvas = scrollerRef.current?.querySelector(".tl-canvas") ?? null;
+    const lane = scrollerRef.current?.querySelector(
+      ".tl-lane.track-audio:not(.collapsed)",
+    ) as HTMLElement | null;
+    const wrap = recWrapRef.current;
+    if (wrap) {
+      if (canvas) {
+        canvas.classList.add("recording-active");
+      }
+      wrap.style.top = `${lane?.offsetTop ?? 0}px`;
+      wrap.style.height = `${lane?.offsetHeight ?? 48}px`;
+    }
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const pps = viewRef.current.pxPerSec;
+      const elapsed = (performance.now() - voiceRec.wallStart) / 1000;
+      const x = playheadRef.current * pps;
+      const bar = recBarRef.current;
+      if (bar) {
+        bar.style.left = `${x}px`;
+        bar.style.width = `${Math.max(2, elapsed * pps)}px`;
+      }
+      const label = recLabelRef.current;
+      if (label) {
+        label.style.left = `${x + 4}px`;
+        label.textContent = `REC ${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`;
+      }
+      const sc = scrollerRef.current;
+      if (sc && x > sc.scrollLeft + sc.clientWidth - 80) {
+        sc.scrollLeft = x - sc.clientWidth + 160;
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      canvas?.classList.remove("recording-active");
+    };
+  }, [voiceRec]);
+
   /* Linked-partner live preview: only the partner clip re-renders. */
   const handleLiveDrag = useCallback(
     (phase: "start" | "move" | "end", clipId: string, draft: {
@@ -1002,6 +1061,48 @@ export function TimelinePanel({
         onAddVideoTrack={() => void run("add_track", { kind: "video" }, "Video track added")}
         onAddAudioTrack={() => void run("add_track", { kind: "audio" }, "Audio track added")}
         pxPerSec={view.pxPerSec}
+        voiceover={
+          <>
+            <VoiceoverButton
+              onStatus={onStatus}
+              onRecordingChange={(rec) =>
+                setVoiceRec(rec ? { wallStart: performance.now() } : null)
+              }
+              onSaved={(path) => {
+                onAddMediaPath?.(
+                  path,
+                  playheadRef.current,
+                  `Voiceover added at ${formatTime(playheadRef.current)}`,
+                );
+                // Bring the fresh clip into view.
+                const sc = scrollerRef.current;
+                if (sc) {
+                  const x = playheadRef.current * viewRef.current.pxPerSec;
+                  if (x < sc.scrollLeft + 80 || x > sc.scrollLeft + sc.clientWidth - 160) {
+                    sc.scrollTo({ left: Math.max(0, x - sc.clientWidth * 0.4), behavior: "smooth" });
+                  }
+                }
+              }}
+            />
+            <ScreenRecorderButton
+              onStatus={onStatus}
+              onSaved={(path) => {
+                onAddMediaPath?.(
+                  path,
+                  playheadRef.current,
+                  `Screen recording added at ${formatTime(playheadRef.current)}`,
+                );
+                const sc = scrollerRef.current;
+                if (sc) {
+                  const x = playheadRef.current * viewRef.current.pxPerSec;
+                  if (x < sc.scrollLeft + 80 || x > sc.scrollLeft + sc.clientWidth - 160) {
+                    sc.scrollTo({ left: Math.max(0, x - sc.clientWidth * 0.4), behavior: "smooth" });
+                  }
+                }
+              }}
+            />
+          </>
+        }
       />
 
       <div
@@ -1096,6 +1197,15 @@ export function TimelinePanel({
               registerPlayheadEl={registerPlayheadEl}
               registerSnapGuideEl={view.registerSnapGuideEl}
             />
+
+            {voiceRec && (
+              <div ref={recWrapRef} className="tl-rec-overlay" aria-hidden>
+                <div ref={recBarRef} className="tl-rec-bar" />
+                <span ref={recLabelRef} className="tl-rec-label">
+                  REC 0:00
+                </span>
+              </div>
+            )}
 
             {timeline.tracks.map((track) => {
               const h = trackHeight(track);

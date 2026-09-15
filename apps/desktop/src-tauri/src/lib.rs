@@ -6,8 +6,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use yx_detect::{probe_and_policy, HardwareProfile, PerformancePolicy};
 use yx_media::{
-    export_file_with_progress, export_timeline_with_progress, probe_media, ExportCodec, ExportFit,
-    ExportFilter, ExportRequest, ExportSegment, MediaInfo, TimelineExportRequest, VideoEncoder,
+    export_file_with_progress, export_timeline_with_progress, is_image_path, probe_media,
+    ExportCodec, ExportFit, ExportFilter, ExportRequest, ExportSegment, MediaInfo,
+    TimelineExportRequest, VideoEncoder,
 };
 use yx_proxy::{ProxyJob, ProxyManager};
 use yx_timeline::{
@@ -125,7 +126,12 @@ fn place_media_on_timeline(
     start: f64,
 ) -> Result<Timeline, String> {
     let info = cached_probe(state, PathBuf::from(&media_path).as_path())?;
-    let out_point = if info.duration > 0.0 {
+    let is_still = is_image_path(Path::new(&media_path));
+    // Images get a 5s still duration; animated GIFs keep their real length
+    // when ffprobe reports a usable one.
+    let out_point = if is_still && info.duration < 0.5 {
+        5.0
+    } else if info.duration > 0.0 {
         info.duration
     } else {
         5.0
@@ -172,10 +178,50 @@ fn place_media_on_timeline(
             })
             .map_err(|e| e.to_string())?;
     } else if info.has_audio {
-        let audio_track = editor
-            .timeline()
-            .first_track(TrackKind::Audio)
-            .ok_or_else(|| "no audio track".to_string())?;
+        // Voiceovers/overdubs: prefer the first audio track whose range at the
+        // drop point is FREE, so they land exactly at the playhead instead of
+        // stacking on top of existing music. Falls back to the first track.
+        // First FREE audio track at the drop point; when every track is busy
+        // (e.g. voiceover over a full music bed), add a fresh track instead
+        // of stacking invisibly on top of existing clips.
+        let mut audio_track = {
+            let timeline = editor.timeline();
+            let candidates: Vec<TrackId> = timeline
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Audio && !t.hidden && !t.locked)
+                .map(|t| t.id)
+                .collect();
+            candidates
+                .iter()
+                .copied()
+                .find(|tid| {
+                    timeline
+                        .tracks
+                        .iter()
+                        .find(|t| t.id == *tid)
+                        .map(|t| {
+                            t.clips.iter().all(|c| {
+                                c.end() <= start + 1e-6 || c.start >= start + out_point - 1e-6
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or_default()
+        };
+        if audio_track.is_nil() {
+            editor
+                .apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
+                .map_err(|e| e.to_string())?;
+            audio_track = editor
+                .timeline()
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Audio)
+                .last()
+                .map(|t| t.id)
+                .ok_or_else(|| "no audio track".to_string())?;
+        }
         editor
             .apply(EditCommand::AddClip {
                 track_id: audio_track,
@@ -269,6 +315,22 @@ fn split_clip_at(
             at,
             sync_linked: sync_linked.unwrap_or(true),
         })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+/// Cross dissolve: overlap the clip left over the previous one and attach a
+/// Transition filter. Rendered as an alpha fade in the export overlay chain.
+#[tauri::command]
+fn add_transition(
+    clip_id: String,
+    duration: f64,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::AddTransition { clip_id, duration })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
 }
@@ -520,6 +582,16 @@ fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
         "lut" => FilterKind::Lut,
         "fade" => FilterKind::Fade,
         "text" => FilterKind::Text,
+        "temperature" => FilterKind::Temperature,
+        "hue" => FilterKind::Hue,
+        "vignette" => FilterKind::Vignette,
+        "sharpen" => FilterKind::Sharpen,
+        "vdenoise" => FilterKind::VideoDenoise,
+        "stabilize" => FilterKind::Stabilize,
+        "lut3d" => FilterKind::Lut3d,
+        "normalize" => FilterKind::Normalize,
+        "transition" => FilterKind::Transition,
+        "deesser" => FilterKind::Deesser,
         other => return Err(format!("unknown filter: {other}")),
     })
 }
@@ -590,6 +662,130 @@ fn list_proxies(state: State<'_, AppState>) -> Vec<ProxyJob> {
     state.proxies.list()
 }
 
+/// Render a clip's audio through the FULL export effect chain into a wav
+/// file, so the Advanced Audio Tools dialog can play the true export sound
+/// ("Hear processed result") instead of an approximation.
+#[tauri::command]
+fn render_audio_preview(
+    source: String,
+    in_point: f64,
+    duration: f64,
+    filters: Vec<ExportFilter>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let _ = state;
+    let chain = yx_media::build_audio_effect_chain(&ExportSegment {
+        path: PathBuf::from(&source),
+        in_point,
+        out_point: in_point + duration.max(0.2),
+        start: 0.0,
+        fade_in: 0.0,
+        fade_out: 0.0,
+        reverse: false,
+        speed: 1.0,
+        filters,
+        is_image: false,
+    });
+    let dir = dirs_cache().with_file_name("audio-previews");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{in_point:.3}|{duration:.3}|{chain}").hash(&mut hasher);
+    let out = dir.join(format!("preview_{:016x}.wav", hasher.finish()));
+
+    if !out.exists() {
+        let status = yx_detect::command_ffmpeg()
+            .args([
+                "-ss",
+                &format!("{in_point:.3}"),
+                "-t",
+                &format!("{duration:.3}"),
+                "-i",
+                &source,
+                "-af",
+                &chain,
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-threads",
+                "1",
+                out.to_str().ok_or("bad output path")?,
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !status.status.success() {
+            return Err(format!(
+                "audio preview render failed: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+    }
+    Ok(out.display().to_string())
+}
+
+/// Finalize a MediaRecorder take: write the raw bytes, then stream-copy
+/// remux them through FFmpeg. Recorded webm files carry no duration metadata
+/// (FFprobe reports N/A -> clips would import as 5s stubs); the remux
+/// regenerates proper headers so the real length is known. Falls back to the
+/// raw file if FFmpeg is unavailable.
+fn finalize_media_recording(
+    bytes: &[u8],
+    ext: &str,
+    prefix: &str,
+) -> Result<PathBuf, String> {
+    let dir = dirs_cache().with_file_name("recordings");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let raw = dir.join(format!("{prefix}_{nanos}_raw.{ext}"));
+    std::fs::write(&raw, bytes).map_err(|e| e.to_string())?;
+    let final_path = dir.join(format!("{prefix}_{nanos}.{ext}"));
+    let status = yx_detect::command_ffmpeg()
+        .args([
+            "-y",
+            "-i",
+            raw.to_str().ok_or("bad raw path")?,
+            "-c",
+            "copy",
+            final_path.to_str().ok_or("bad final path")?,
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if status.status.success() {
+        let _ = std::fs::remove_file(&raw);
+    } else {
+        std::fs::rename(&raw, &final_path).map_err(|e| e.to_string())?;
+    }
+    Ok(final_path)
+}
+
+/// Persist a screen recording (MediaRecorder webm bytes) and return its path
+/// so the frontend can place it on the timeline as a normal video clip.
+#[tauri::command]
+fn save_screen_recording(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+    let ext = match ext.to_ascii_lowercase().as_str() {
+        "webm" | "mkv" | "mp4" => ext.to_ascii_lowercase(),
+        _ => "webm".to_string(),
+    };
+    finalize_media_recording(&bytes, &ext, "screen").map(|p| p.display().to_string())
+}
+
+/// Persist a microphone recording (MediaRecorder bytes) and return its path
+/// so the frontend can place it on the timeline like any imported audio.
+#[tauri::command]
+fn save_voiceover(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+    let ext = match ext.to_ascii_lowercase().as_str() {
+        "webm" | "wav" | "ogg" | "m4a" | "mp3" => ext.to_ascii_lowercase(),
+        _ => "webm".to_string(),
+    };
+    finalize_media_recording(&bytes, &ext, "voiceover").map(|p| p.display().to_string())
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportProgressPayload {
@@ -647,6 +843,7 @@ fn collect_export_segments(
                 fade_out: c.fade_out.max(0.0),
                 reverse: c.reverse,
                 speed: c.clamped_speed(),
+                is_image: is_image_path(&source),
                 filters: c
                     .filters
                     .iter()
@@ -674,6 +871,16 @@ fn collect_export_segments(
                             FilterKind::Lut => "lut",
                             FilterKind::Fade => "fade",
                             FilterKind::Text => "text",
+                            FilterKind::Temperature => "temperature",
+                            FilterKind::Hue => "hue",
+                            FilterKind::Vignette => "vignette",
+                            FilterKind::Sharpen => "sharpen",
+                            FilterKind::VideoDenoise => "vdenoise",
+                            FilterKind::Stabilize => "stabilize",
+                            FilterKind::Lut3d => "lut",
+                            FilterKind::Normalize => "normalize",
+                            FilterKind::Transition => "transition",
+                            FilterKind::Deesser => "deesser",
                         }
                         .into(),
                         enabled: f.enabled,
@@ -1167,6 +1374,7 @@ pub fn run() {
             move_clip,
             trim_clip,
             split_clip_at,
+            add_transition,
             remove_clip,
             ripple_delete,
             unlink_clip,
@@ -1197,6 +1405,9 @@ pub fn run() {
             undo,
             redo,
             list_proxies,
+            save_voiceover,
+            save_screen_recording,
+            render_audio_preview,
             export_media,
         ])
         .run(tauri::generate_context!())

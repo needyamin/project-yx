@@ -882,3 +882,52 @@ body.resizing-tl-headers {
   outline-offset: -2px;
   background: rgba(255, 71, 87, 0.06);
 }
+
+/* Live voiceover recording region */
+.tl-canvas {
+  position: relative;
+}
+
+.tl-rec-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 45;
+  pointer-events: none;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(239, 68, 68, 0.08);
+  outline: 1px solid rgba(239, 68, 68, 0.55);
+}
+
+.tl-rec-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(239, 68, 68, 0.32),
+    rgba(239, 68, 68, 0.32) 8px,
+    rgba(239, 68, 68, 0.18) 8px,
+    rgba(239, 68, 68, 0.18) 16px
+  );
+  border-right: 2px solid #ef4444;
+}
+
+.tl-rec-label {
+  position: absolute;
+  top: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  font-weight: 800;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.85);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.tl-canvas.recording-active .tl-playhead {
+  background: #ef4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.8);
+}

@@ -109,6 +109,9 @@ pub struct ExportSegment {
     /// Ordered effect stack copied from the clip (WYSIWYG with preview).
     #[serde(default)]
     pub filters: Vec<ExportFilter>,
+    /// Still image (png/jpg/webp/bmp/gif): decoded with `-loop 1 -t dur`.
+    #[serde(default)]
+    pub is_image: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +152,31 @@ impl ExportSegment {
 
 /// Build FFmpeg video filter pieces (no labels) from the effect stack + fades.
 /// Applied after decode trim, before setpts/overlay.
+/// Resolve a usable TrueType font for FFmpeg `drawtext` and escape it for a
+/// filtergraph string. Windows fonts need `:` escaped inside filters.
+fn resolve_fontfile() -> Option<String> {
+    let candidates = [
+        r"C:\Windows\Fonts\arial.ttf".to_string(),
+        r"C:\Windows\Fonts\segoeui.ttf".to_string(),
+        r"C:\Windows\Fonts\calibri.ttf".to_string(),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".to_string(),
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf".to_string(),
+        "/System/Library/Fonts/Supplemental/Arial.ttf".to_string(),
+    ];
+    candidates
+        .iter()
+        .find(|c| std::path::Path::new(c).is_file())
+        .map(|c| c.replace('\\', "/").replace(':', "\\:"))
+}
+
+/// Escape a drawtext text payload for a filtergraph string.
+fn escape_drawtext(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\\'")
+        .replace('%', "\\%")
+}
+
 pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32) -> String {
     let mut parts: Vec<String> = Vec::new();
     let fw = frame_w.max(2) as f64;
@@ -210,6 +238,100 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 }
                 if bool_p(p, "vertical", false) {
                     parts.push("vflip".into());
+                }
+            }
+            "temperature" => {
+                let kelvin = num(p, "kelvin", 6500.0).clamp(1500.0, 40000.0);
+                if (kelvin - 6500.0).abs() > 1.0 {
+                    parts.push(format!("colortemperature=temperature={kelvin:.0}"));
+                }
+            }
+            "hue" => {
+                let degrees = num(p, "degrees", 0.0).clamp(-180.0, 180.0);
+                if degrees.abs() > 0.05 {
+                    parts.push(format!("hue=h={degrees:.2}"));
+                }
+            }
+            "vignette" => {
+                let amount = num(p, "amount", 0.0).clamp(0.0, 1.0);
+                if amount > 0.01 {
+                    // FFmpeg vignette angle: PI/5 default; stronger angle = darker.
+                    let angle = 0.2 + amount * 1.0;
+                    parts.push(format!("vignette=angle=PI*{angle:.3}/5"));
+                }
+            }
+            "sharpen" => {
+                let amount = num(p, "amount", 0.0).clamp(0.0, 3.0);
+                if amount > 0.01 {
+                    parts.push(format!(
+                        "unsharp=5:5:{amount:.3}:5:5:0.0"
+                    ));
+                }
+            }
+            "vdenoise" => {
+                let amount = num(p, "amount", 0.0).clamp(0.0, 10.0);
+                if amount > 0.01 {
+                    let amount2 = amount * 0.75;
+                    parts.push(format!("hqdn3d={amount:.1}:{amount2:.1}:6:4.5"));
+                }
+            }
+            "stabilize" => {
+                let strength = num(p, "strength", 0.0).clamp(0.0, 256.0);
+                if strength > 1.0 {
+                    let rx = strength.clamp(16.0, 256.0) as i32;
+                    parts.push(format!(
+                        "deshake=rx={rx}:ry={rx}:edge=mirror"
+                    ));
+                }
+            }
+            "lut" | "lut3d" => {
+                let lut_path = p
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !lut_path.is_empty() {
+                    let escaped = lut_path.replace('\\', "/").replace(':', "\\:").replace('\'', "\\'");
+                    parts.push(format!("lut3d=file='{escaped}'"));
+                }
+            }
+            "text" => {
+                let text = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.trim().is_empty() {
+                    let font = resolve_fontfile()
+                        .unwrap_or_else(|| "C\\:/Windows/Fonts/arial.ttf".to_string());
+                    let size_pct = num(p, "size", 6.0).clamp(1.0, 30.0);
+                    let color = p
+                        .get("color")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("#ffffff")
+                        .trim_start_matches('#')
+                        .to_string();
+                    let x = num(p, "x", 0.0).clamp(-1.0, 1.0);
+                    let y = num(p, "y", 0.0).clamp(-1.0, 1.0);
+                    let boxed = bool_p(p, "box", true);
+                    let payload = escape_drawtext(text);
+                    let mut dt = format!(
+                        "drawtext=fontfile='{font}':text='{payload}':fontsize='h*{size_pct:.2}/100':fontcolor=#{color}:x='(w/2)-(tw/2)+({x:.4}*w/2)':y='(h/2)-(th/2)+({y:.4}*h/2)'"
+                    );
+                    if boxed {
+                        dt.push_str(":box=1:boxcolor=black@0.45:boxborderw=14");
+                    }
+                    parts.push(dt);
+                }
+            }
+            "transition" => {
+                let t_kind = p
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("dissolve")
+                    .to_string();
+                let dur = num(p, "duration", 0.5).clamp(0.1, 5.0);
+                if t_kind == "dissolve" {
+                    // Alpha fade-in over the overlap; the overlay chain blends
+                    // this clip over the previous one = cross dissolve.
+                    parts.push(format!("format=yuva420p,fade=t=in:st=0:d={dur:.3}:alpha=1"));
                 }
             }
             "chromakey" => {
@@ -282,7 +404,7 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
     parts.join(",")
 }
 
-fn build_audio_effect_chain(seg: &ExportSegment) -> String {
+pub fn build_audio_effect_chain(seg: &ExportSegment) -> String {
     let mut parts: Vec<String> = Vec::new();
     for f in &seg.filters {
         if !f.enabled {
@@ -339,6 +461,18 @@ fn build_audio_effect_chain(seg: &ExportSegment) -> String {
                 let nf = num(&f.params, "nf", -25.0).clamp(-80.0, -20.0);
                 let nr = num(&f.params, "nr", 12.0).clamp(0.01, 97.0);
                 parts.push(format!("afftdn=nf={nf:.1}:nr={nr:.1}"));
+            }
+            "normalize" => {
+                let target = num(&f.params, "target", -16.0).clamp(-30.0, -8.0);
+                parts.push(format!(
+                    "loudnorm=I={target:.1}:TP=-1.5:LRA=11"
+                ));
+            }
+            "deesser" => {
+                let amount = num(&f.params, "amount", 0.0).clamp(0.0, 1.0);
+                if amount > 0.01 {
+                    parts.push(format!("deesser=i={amount:.2}"));
+                }
             }
             "limiter" => {
                 let limit = num(&f.params, "limit", 0.95).clamp(0.1, 1.0);
@@ -449,6 +583,18 @@ impl ExportRequest {
             match_source: true,
         }
     }
+}
+
+/// True when the file is a still/animated image handled via `<img>` preview
+/// and `-loop 1` image inputs at export time.
+pub fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif")
+    )
 }
 
 pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
@@ -706,14 +852,26 @@ pub fn build_timeline_export_args(
                 "video segment has zero duration".into(),
             ));
         }
-        args.extend([
-            "-ss".into(),
-            format!("{:.6}", seg.in_point.max(0.0)),
-            "-t".into(),
-            format!("{:.6}", dur),
-            "-i".into(),
-            seg.path.display().to_string(),
-        ]);
+        if seg.is_image {
+            // Still images (and looping GIFs) need an image input, not a seek.
+            args.extend([
+                "-loop".into(),
+                "1".into(),
+                "-t".into(),
+                format!("{:.6}", dur),
+                "-i".into(),
+                seg.path.display().to_string(),
+            ]);
+        } else {
+            args.extend([
+                "-ss".into(),
+                format!("{:.6}", seg.in_point.max(0.0)),
+                "-t".into(),
+                format!("{:.6}", dur),
+                "-i".into(),
+                seg.path.display().to_string(),
+            ]);
+        }
     }
 
     for seg in &req.audio {
@@ -1083,6 +1241,7 @@ mod tests {
         let req = TimelineExportRequest {
             video: vec![
                 ExportSegment {
+            is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 0.0,
                     out_point: 2.5,
@@ -1092,6 +1251,7 @@ mod tests {
                 reverse: false, speed: 1.0, filters: vec![],
                 },
                 ExportSegment {
+            is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 5.0,
                     out_point: 8.0,
@@ -1103,6 +1263,7 @@ mod tests {
             ],
             audio: vec![
                 ExportSegment {
+            is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 0.0,
                     out_point: 2.5,
@@ -1112,6 +1273,7 @@ mod tests {
                 reverse: false, speed: 1.0, filters: vec![],
                 },
                 ExportSegment {
+            is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 5.0,
                     out_point: 8.0,
@@ -1154,6 +1316,7 @@ mod tests {
         }
         let req = TimelineExportRequest {
             video: vec![ExportSegment {
+            is_image: false,
                 path: PathBuf::from("v.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
@@ -1163,6 +1326,7 @@ mod tests {
             reverse: false, speed: 1.0, filters: vec![],
             }],
             audio: vec![ExportSegment {
+            is_image: false,
                 path: PathBuf::from("a.mp4"),
                 in_point: 0.0,
                 out_point: 3.0,
@@ -1198,6 +1362,7 @@ mod tests {
         }
         let req = TimelineExportRequest {
             video: vec![ExportSegment {
+            is_image: false,
                 path: PathBuf::from("v.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
@@ -1207,6 +1372,7 @@ mod tests {
             reverse: false, speed: 1.0, filters: vec![],
             }],
             audio: vec![ExportSegment {
+            is_image: false,
                 path: PathBuf::from("a.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
@@ -1239,6 +1405,7 @@ mod tests {
     #[test]
     fn effect_chain_includes_eq_blur_crop_key() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("v.mp4"),
             in_point: 0.0,
             out_point: 4.0,
@@ -1278,6 +1445,7 @@ mod tests {
     #[test]
     fn video_effect_chain_includes_reverse() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("v.mp4"),
             in_point: 1.0,
             out_point: 3.0,
@@ -1295,6 +1463,7 @@ mod tests {
     #[test]
     fn video_effect_chain_includes_setpts_for_speed() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("v.mp4"),
             in_point: 0.0,
             out_point: 4.0,
@@ -1313,6 +1482,7 @@ mod tests {
     #[test]
     fn video_effect_chain_speed_then_reverse() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("v.mp4"),
             in_point: 0.0,
             out_point: 2.0,
@@ -1332,6 +1502,7 @@ mod tests {
     #[test]
     fn audio_effect_chain_includes_denoise_and_pitch() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("a.wav"),
             in_point: 0.0,
             out_point: 2.0,
@@ -1361,6 +1532,7 @@ mod tests {
     #[test]
     fn denoise_nf_clamped_to_ffmpeg_max() {
         let seg = ExportSegment {
+            is_image: false,
             path: PathBuf::from("a.wav"),
             in_point: 0.0,
             out_point: 1.0,

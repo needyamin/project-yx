@@ -5395,7 +5395,7 @@ dependencies = [
 
 [[package]]
 name = "yx-compositor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -5405,7 +5405,7 @@ dependencies = [
 
 [[package]]
 name = "yx-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -5428,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "yx-detect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5438,7 +5438,7 @@ dependencies = [
 
 [[package]]
 name = "yx-media"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -5450,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "yx-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "yx-timeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "parking_lot",
  "serde",

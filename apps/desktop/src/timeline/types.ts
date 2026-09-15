@@ -41,6 +41,16 @@ export type Clip = {
   filters: { id: string; kind: string; enabled: boolean; params?: Record<string, unknown> }[];
 };
 
+/** Still image / animated GIF extensions importable as visual clips. */
+export const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
+/** True when the media file previews as an image (`<img>`), not a `<video>`. */
+export function isImagePath(path: string | null | undefined): boolean {
+  if (!path) return false;
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTENSIONS.includes(ext);
+}
+
 /** Timeline duration for a clip, accounting for speed. */
 export function clipTimelineDuration(
   clip: Pick<Clip, "in_point" | "out_point" | "speed">,
@@ -174,16 +184,19 @@ export function timelineDuration(timeline: Timeline, fallback = 10): number {
 }
 
 export function clipAtPlayhead(timeline: Timeline, playhead: number, kind: "video" | "audio") {
+  let found: { track: Track; clip: Clip } | null = null;
   for (const track of timeline.tracks) {
     if (track.kind !== kind || track.muted || track.hidden) continue;
     for (const clip of track.clips) {
       const end = clip.start + clipTimelineDuration(clip);
+      // Keep the LAST match: later track / later clip = top-most layer, so
+      // transition overlaps preview the incoming clip.
       if (playhead >= clip.start && playhead < end) {
-        return { track, clip };
+        found = { track, clip };
       }
     }
   }
-  return null;
+  return found;
 }
 
 /** Next clip on a track of `kind` whose start is at/after `time` (sequence playback). */

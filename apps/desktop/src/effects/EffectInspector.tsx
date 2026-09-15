@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import {
   defaultParams,
@@ -20,6 +21,11 @@ const EXPORT_ONLY = new Set([
   "limiter",
   "reverb",
   "invert",
+  "normalize",
+  "sharpen",
+  "vdenoise",
+  "stabilize",
+  "lut3d",
 ]);
 
 type Props = {
@@ -126,7 +132,7 @@ export function EffectInspector({
       {filters.length === 0 ? (
         <div className="ei-empty">
           <p>No effects on this clip.</p>
-          <p className="ei-hint">Add from the Effects tab or Advanced Audio.</p>
+          <p className="ei-hint">Add from the Effects tab or Advanced Audio Tools.</p>
         </div>
       ) : (
         <div className="ei-body">
@@ -162,7 +168,7 @@ export function EffectInspector({
                     >
                       <span className="ei-row-name">{effectLabel(f.kind)}</span>
                       {exportOnly && (
-                        <span className="ei-badge" title="Heard on export, not in monitor preview">
+                        <span className="ei-badge" title="Applies on export, not in monitor preview">
                           Export
                         </span>
                       )}
@@ -384,6 +390,122 @@ function ParamEditors({
       );
     case "invert":
       return <p className="ei-hint">Inverts polarity (phase flip). No parameters.</p>;
+    case "text":
+      return (
+        <div className="ei-params">
+          <label className="ei-color">
+            Text
+            <input
+              type="text"
+              value={typeof params.text === "string" ? params.text : "Your title"}
+              onChange={(e) => set("text", e.target.value)}
+              style={{ width: "100%" }}
+            />
+          </label>
+          <label className="ei-color">
+            Color
+            <input
+              type="color"
+              value={typeof params.color === "string" ? params.color : "#ffffff"}
+              onChange={(e) => set("color", e.target.value)}
+            />
+          </label>
+          <Slider label="Size (% frame height)" min={1} max={25} step={0.5} value={num("size", 6)} onChange={(v) => set("size", v)} />
+          <Slider label="X position" min={-1} max={1} step={0.01} value={num("x", 0)} onChange={(v) => set("x", v)} />
+          <Slider label="Y position" min={-1} max={1} step={0.01} value={num("y", 0.55)} onChange={(v) => set("y", v)} />
+          <div className="ei-params ei-checks">
+            <label>
+              <input
+                type="checkbox"
+                checked={params.box !== false}
+                onChange={(e) => set("box", e.target.checked)}
+              />{" "}
+              Background box
+            </label>
+          </div>
+          <p className="ei-hint">Visible in the Project Monitor and burned in on export.</p>
+        </div>
+      );
+    case "temperature":
+      return (
+        <div className="ei-params">
+          <Slider label="Kelvin (6500 = neutral)" min={2000} max={40000} step={100} value={num("kelvin", 6500)} onChange={(v) => set("kelvin", v)} />
+          <p className="ei-hint">Warm below 6500K, cool above. Preview is approximate; export is exact.</p>
+        </div>
+      );
+    case "hue":
+      return (
+        <div className="ei-params">
+          <Slider label="Degrees" min={-180} max={180} step={1} value={num("degrees", 0)} onChange={(v) => set("degrees", v)} />
+        </div>
+      );
+    case "vignette":
+      return (
+        <div className="ei-params">
+          <Slider label="Amount" min={0} max={1} step={0.01} value={num("amount", 0.5)} onChange={(v) => set("amount", v)} />
+        </div>
+      );
+    case "sharpen":
+      return (
+        <div className="ei-params">
+          <Slider label="Amount" min={0} max={3} step={0.05} value={num("amount", 0.8)} onChange={(v) => set("amount", v)} />
+          <p className="ei-hint">Export only — applied when rendering the final video.</p>
+        </div>
+      );
+    case "vdenoise":
+      return (
+        <div className="ei-params">
+          <Slider label="Amount" min={0} max={10} step={0.5} value={num("amount", 4)} onChange={(v) => set("amount", v)} />
+          <p className="ei-hint">Export only — grain/noise reduction applied on render.</p>
+        </div>
+      );
+    case "stabilize":
+      return (
+        <div className="ei-params">
+          <Slider label="Strength" min={16} max={256} step={8} value={num("strength", 64)} onChange={(v) => set("strength", v)} />
+          <p className="ei-hint">Export only — basic shake reduction on render.</p>
+        </div>
+      );
+    case "lut3d":
+      return (
+        <div className="ei-params">
+          <p className="ei-hint">
+            {typeof params.path === "string" && params.path
+              ? params.path
+              : "No .cube file chosen yet."}
+          </p>
+          <div className="ei-param-actions">
+            <button
+              type="button"
+              className="ei-reset-full"
+              onClick={async () => {
+                const picked = await open({
+                  multiple: false,
+                  filters: [{ name: "LUT", extensions: ["cube"] }],
+                });
+                if (typeof picked === "string") set("path", picked);
+              }}
+            >
+              Choose .cube file…
+            </button>
+          </div>
+          <p className="ei-hint">Export only — the look is applied when rendering.</p>
+        </div>
+      );
+    case "normalize":
+      return (
+        <div className="ei-params">
+          <Slider label="Target loudness (LUFS)" min={-30} max={-8} step={1} value={num("target", -16)} onChange={(v) => set("target", v)} />
+          <p className="ei-hint">Export only — evens out quiet/loud voice to broadcast level.</p>
+        </div>
+      );
+    case "transition":
+      return (
+        <div className="ei-params">
+          <Slider label="Dissolve duration (s)" min={0.1} max={3} step={0.05} value={num("duration", 0.5)} onChange={(v) => set("duration", v)} />
+          <p className="ei-hint">Best added via right-click → Add Cross Dissolve (creates the overlap automatically).</p>
+        </div>
+      );
     case "pitch":
       return (
         <div className="ei-params">
@@ -431,7 +553,7 @@ function ParamEditors({
               })
             }
           />
-          <p className="ei-hint">Heard on export. Preview voice in Advanced Audio → Play.</p>
+          <p className="ei-hint">Heard on export. Preview voice in Advanced Audio Tools → Play.</p>
         </div>
       );
     default:

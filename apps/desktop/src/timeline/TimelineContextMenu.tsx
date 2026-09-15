@@ -64,6 +64,8 @@ type Props = {
   onHideTrack: (trackId: string, hidden: boolean) => void;
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
+  /** Cross dissolve with the previous clip on the same track. */
+  onAddTransition?: (clipId: string, duration: number) => void;
 };
 
 export function TimelineContextMenu({
@@ -89,6 +91,7 @@ export function TimelineContextMenu({
   onHideTrack,
   onAdvancedAudio,
   onAdvancedVideo,
+  onAddTransition,
 }: Props) {
   const ref = useRef<HTMLDivElement | null>(null);
 
@@ -129,6 +132,7 @@ export function TimelineContextMenu({
     onHideTrack,
     onAdvancedAudio,
     onAdvancedVideo,
+    onAddTransition,
   });
 
   const left = Math.min(menu.x, window.innerWidth - 220);
@@ -188,6 +192,7 @@ function buildItems(p: {
   onHideTrack: (trackId: string, hidden: boolean) => void;
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
+  onAddTransition?: (clipId: string, duration: number) => void;
 }): Item[] {
   const { menu } = p;
   const t = menu.target;
@@ -264,6 +269,11 @@ function buildItems(p: {
       },
       {
         type: "item",
+        label: "Add Cross Dissolve (0.5s)",
+        action: () => p.onAddTransition?.(t.clipId, 0.5),
+      },
+      {
+        type: "item",
         label: "Delete clip",
         danger: true,
         hint: "Del",
@@ -288,7 +298,10 @@ function buildItems(p: {
       items.push(
         {
           type: "item",
-          label: t.role === "video" ? "Advanced Audio (linked)…" : "Advanced Audio…",
+          label:
+            t.role === "video"
+              ? "Advanced Audio Tools (linked)…"
+              : "Advanced Audio Tools…",
           action: () => p.onAdvancedAudio?.(t.clipId, "overview"),
         },
         {

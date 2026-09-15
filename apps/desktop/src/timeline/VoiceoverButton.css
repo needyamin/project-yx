@@ -1,0 +1,77 @@
+.vo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--line, #2a2a32);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.vo-btn.start:hover {
+  border-color: var(--accent, #4f46e5);
+  color: var(--accent, #4f46e5);
+}
+
+.vo-error {
+  color: #ef4444;
+  font-weight: 800;
+}
+
+.vo-recording {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.vo-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ef4444;
+  animation: vo-pulse 1s ease-in-out infinite;
+}
+
+@keyframes vo-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.vo-timer {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 700;
+  color: #ef4444;
+  min-width: 74px;
+}
+
+.vo-btn.stop,
+.vo-btn.cancel {
+  padding: 3px 9px;
+  font-size: 12px;
+}
+
+.vo-btn.stop {
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
+.vo-btn.stop:hover {
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.vo-btn.cancel {
+  border-color: var(--line, #2a2a32);
+  color: var(--muted, #8a8a95);
+}

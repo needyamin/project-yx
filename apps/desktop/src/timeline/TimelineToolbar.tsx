@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { EditMode, TimelineTool } from "./types";
 import {
   IconMore,
@@ -42,6 +42,8 @@ type Props = {
   onAddVideoTrack: () => void;
   onAddAudioTrack: () => void;
   pxPerSec?: number;
+  /** Optional slot at the toolbar's right end (e.g. voiceover recorder). */
+  voiceover?: ReactNode;
 };
 
 export function TimelineToolbar({
@@ -69,7 +71,15 @@ export function TimelineToolbar({
   onAddVideoTrack,
   onAddAudioTrack,
   pxPerSec,
+  voiceover,
 }: Props) {
+  // Lift / Extract and second-space command remain available from the top
+  // menubar and lane context menus — intentionally not repeated here.
+  void onLiftZone;
+  void onExtractZone;
+  void onRemoveAllSpacesAfterCursor;
+  void onAddVideoTrack;
+  void onAddAudioTrack;
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement | null>(null);
 
@@ -177,6 +187,8 @@ export function TimelineToolbar({
         )}
       </div>
 
+      {voiceover && <div className="tl-tool-group tl-voiceover-group">{voiceover}</div>}
+
       <div className="tl-tool-group tl-more-wrap" ref={moreRef}>
         <button
           type="button"
@@ -209,38 +221,22 @@ export function TimelineToolbar({
             ))}
 
             <div className="tl-more-sep" />
-            <p className="tl-more-label">Zone</p>
+            <p className="tl-more-label">Markers &amp; zone</p>
             <button type="button" role="menuitem" onClick={() => run(onSetZoneIn)}>
               Set In (I)
             </button>
             <button type="button" role="menuitem" onClick={() => run(onSetZoneOut)}>
               Set Out (O)
             </button>
-            <button type="button" role="menuitem" onClick={() => run(onLiftZone)}>
-              Lift
-            </button>
-            <button type="button" role="menuitem" onClick={() => run(onExtractZone)}>
-              Extract
-            </button>
             <button type="button" role="menuitem" onClick={() => run(onAddMarker)}>
-              Marker
+              Add Marker (M)
             </button>
 
             <div className="tl-more-sep" />
-            <p className="tl-more-label">Space</p>
+            <p className="tl-more-label">Quick actions</p>
             <button type="button" role="menuitem" onClick={() => run(onRemoveSpaceAllTracks)}>
               Remove Space in All Tracks
             </button>
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => run(onRemoveAllSpacesAfterCursor)}
-            >
-              Remove All Spaces After Cursor
-            </button>
-
-            <div className="tl-more-sep" />
-            <p className="tl-more-label">Edit</p>
             <button
               type="button"
               role="menuitem"
@@ -249,14 +245,14 @@ export function TimelineToolbar({
             >
               {linked ? "Unlink A/V" : "Link A/V"}
             </button>
-            <button type="button" role="menuitem" onClick={() => run(onRippleDelete)}>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!canLinkToggle}
+              title={canLinkToggle ? undefined : "Select a clip first"}
+              onClick={() => run(onRippleDelete)}
+            >
               Ripple delete
-            </button>
-            <button type="button" role="menuitem" onClick={() => run(onAddVideoTrack)}>
-              Add video track
-            </button>
-            <button type="button" role="menuitem" onClick={() => run(onAddAudioTrack)}>
-              Add audio track
             </button>
           </div>
         )}

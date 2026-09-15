@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { effectMeta, effectShortLabel } from "../effects/effects";
 import { formatTime, type LibraryItem } from "../timeline/types";
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
@@ -74,9 +74,11 @@ export function ProjectBin({
   onApplyEffect,
   selectedClipSummary = null,
 }: Props) {
+  // Media tab = every imported asset (video, audio, images). Audio tab =
+  // audio-only view. Nothing can "go missing" after import.
   const items =
     filter === "media"
-      ? library.filter((m) => m.has_video)
+      ? library
       : filter === "audio"
         ? library.filter((m) => m.has_audio && !m.has_video)
         : [];
@@ -84,7 +86,7 @@ export function ProjectBin({
   const selected = library.find((m) => m.id === selectedMediaId) ?? null;
   const canAdd =
     selected &&
-    ((filter === "media" && selected.has_video) ||
+    ((filter === "media" && (selected.has_video || selected.has_audio)) ||
       (filter === "audio" && selected.has_audio && !selected.has_video));
 
   const [ghost, setGhost] = useState<{
@@ -93,6 +95,7 @@ export function ProjectBin({
     y: number;
   } | null>(null);
   const [ctx, setCtx] = useState<BinCtx | null>(null);
+  const [effectSearch, setEffectSearch] = useState("");
   const [ghostOverTimeline, setGhostOverTimeline] = useState(false);
   const didDragRef = useRef(false);
 
@@ -167,12 +170,21 @@ export function ProjectBin({
     window.addEventListener("keydown", onKey);
   }
 
-  function revealInFolder(path: string) {
-    const normalized = path.replace(/\\/g, "/");
-    const slash = normalized.lastIndexOf("/");
-    const dir = slash >= 0 ? normalized.slice(0, slash) : normalized;
-    const url = dir.match(/^[A-Za-z]:/) ? `file:///${dir}` : `file://${dir}`;
-    void openUrl(url).catch(() => undefined);
+  async function revealInFolder(path: string) {
+    try {
+      // Opens the OS file manager with the file selected (Explorer/Finder).
+      await revealItemInDir(path);
+    } catch {
+      // Fallback: open the containing folder.
+      try {
+        const normalized = path.replace(/\\/g, "/");
+        const slash = normalized.lastIndexOf("/");
+        const dir = slash >= 0 ? normalized.slice(0, slash) : normalized;
+        await openPath(dir);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   function binMenuItems(): ContextMenuItem[] {
@@ -229,7 +241,7 @@ export function ProjectBin({
         { type: "sep" },
         {
           type: "item",
-          label: "Advanced Audio…",
+          label: "Advanced Audio Tools…",
           action: () => onAdvancedAudio?.(item, "overview"),
         },
         {
@@ -250,7 +262,7 @@ export function ProjectBin({
           className={filter === "media" ? "active" : ""}
           onClick={() => onFilter("media")}
         >
-          Media
+          All
         </button>
         <button
           type="button"
@@ -287,8 +299,22 @@ export function ProjectBin({
           {!effectsEnabled && (
             <p className="empty-hint">Select a timeline clip to apply effects.</p>
           )}
+          <input
+            type="search"
+            className="effect-search"
+            placeholder="Search effects…"
+            value={effectSearch}
+            onChange={(e) => setEffectSearch(e.target.value)}
+          />
           <div className="effect-grid">
-            {effects.map((f) => {
+            {effects
+              .filter(
+                (f) =>
+                  !effectSearch.trim() ||
+                  f.label.toLowerCase().includes(effectSearch.trim().toLowerCase()) ||
+                  effectShortLabel(f.id).toLowerCase().includes(effectSearch.trim().toLowerCase()),
+              )
+              .map((f) => {
               const meta = effectMeta(f.id);
               return (
                 <button
@@ -317,8 +343,14 @@ export function ProjectBin({
                   <span className="effect-label">{effectShortLabel(f.id)}</span>
                 </button>
               );
-            })}
+              })}
           </div>
+          {effects.every(
+            (f) =>
+              effectSearch.trim() !== "" &&
+              !f.label.toLowerCase().includes(effectSearch.trim().toLowerCase()) &&
+              !effectShortLabel(f.id).toLowerCase().includes(effectSearch.trim().toLowerCase()),
+          ) && <p className="empty-hint">No effects match “{effectSearch}”.</p>}
           {selectedClipSummary && (
             <p className="bin-clip-hint">Target: {selectedClipSummary}</p>
           )}

@@ -982,3 +982,56 @@ button:disabled {
     padding: 0.35rem;
   }
 }
+
+/* Transform tool: monitor shows move cursor + subtle frame hint */
+.monitor-frame.transform-mode {
+  outline: 1px dashed rgba(79, 70, 229, 0.55);
+  outline-offset: -1px;
+}
+
+/* Text filter overlay in the Project Monitor (drawtext preview) */
+.monitor-text-overlay {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  padding: 0.15em 0.6em;
+  border-radius: 4px;
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+  font-weight: 700;
+  text-align: center;
+  white-space: pre-wrap;
+  max-width: 92%;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  line-height: 1.25;
+}
+
+/* Effects search input (Project Bin → Effects tab) */
+.effect-search {
+  width: 100%;
+  margin-bottom: 0.6rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line, #2a2a32);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-family: inherit;
+  font-size: 12.5px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.effect-search:focus {
+  border-color: var(--accent, #4f46e5);
+}
+
+.effect-search::placeholder {
+  color: var(--muted, #8a8a95);
+}
+
+.boot-by {
+  margin: 0.35rem 0 0 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted, #8a8a95);
+}

@@ -43,6 +43,8 @@ type Props = {
   tier: PerformanceTier;
   preferHw: boolean;
   previewAspect: "landscape" | "tiktok";
+  /** Snapshot of the current source frame — shown in the output preview. */
+  previewFrame: string | null;
   onClose: () => void;
   onExport: (settings: ExportSettings) => void;
 };
@@ -168,6 +170,7 @@ export function ExportDialog({
   tier,
   preferHw,
   previewAspect,
+  previewFrame,
   onClose,
   onExport,
 }: Props) {
@@ -246,6 +249,51 @@ export function ExportDialog({
         </header>
 
         <div className="export-modal-body">
+          <section className="export-preview">
+            <div
+              className={`export-preview-frame ${settings.height > settings.width ? "vertical" : ""}`}
+              style={{ aspectRatio: `${Math.max(2, settings.width)} / ${Math.max(2, settings.height)}` }}
+            >
+              {previewFrame ? (
+                <img
+                  src={previewFrame}
+                  alt="Export output preview"
+                  style={{ objectFit: settings.fit === "cover" ? "cover" : "contain" }}
+                />
+              ) : (
+                <div className="export-preview-placeholder">
+                  <span>Output frame preview</span>
+                  <small>Play the clip once so a frame is available</small>
+                </div>
+              )}
+              <span className="export-preview-badge">
+                {settings.width}×{settings.height}
+                {settings.fps ? ` · ${settings.fps}fps` : ""}
+              </span>
+            </div>
+            <div className="export-preview-info">
+              <h3>Output preview</h3>
+              <p>
+                {settings.fit === "cover"
+                  ? "Fill (crop) — the frame is scaled to fill, edges are cropped."
+                  : "Fit (letterbox) — the whole frame is kept, empty space is black."}
+              </p>
+              <p className="export-preview-orient">
+                Orientation:{" "}
+                <strong>
+                  {settings.width > settings.height
+                    ? "Landscape"
+                    : settings.height > settings.width
+                      ? "Vertical (9:16 style)"
+                      : "Square"}
+                </strong>
+              </p>
+              <p className="export-preview-hint">
+                Change the preset or resolution to see how the exported file will be framed.
+              </p>
+            </div>
+          </section>
+
           <section className="export-presets">
             <h3>Preset</h3>
             <div className="export-preset-grid">

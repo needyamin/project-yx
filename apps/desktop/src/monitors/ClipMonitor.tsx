@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { subscribeBinDrag } from "../bin/binDrag";
-import { formatTime, type LibraryItem } from "../timeline/types";
+import { formatTime, isImagePath, type LibraryItem } from "../timeline/types";
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import type { PreviewAspect } from "./ProjectMonitor";
 
@@ -24,8 +24,14 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
   const [fullView, setFullView] = useState(false);
   const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
 
-  const mode =
-    media?.has_video ? ("video" as const) : media?.has_audio ? ("audio" as const) : ("empty" as const);
+  const isImage = isImagePath(media?.path);
+  const mode = isImage
+    ? ("image" as const)
+    : media?.has_video
+      ? ("video" as const)
+      : media?.has_audio
+        ? ("audio" as const)
+        : ("empty" as const);
 
   const duration = Math.max(0.001, media?.duration ?? 0);
 
@@ -69,6 +75,7 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
       if (media?.path) setError("Could not convert media path for preview.");
       return;
     }
+    if (mode === "image") return;
     if (mode === "video" && video) {
       video.src = src;
       video.load();
@@ -79,6 +86,7 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
   }, [src, mode, media?.path]);
 
   useEffect(() => {
+    if (mode === "image") return;
     const el = mode === "video" ? videoRef.current : mode === "audio" ? audioRef.current : null;
     if (!el) return;
     const onTime = () => setTime(el.currentTime);
@@ -122,6 +130,7 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
   }, [fullView]);
 
   function togglePlay() {
+    if (mode === "image") return;
     const el = mode === "video" ? videoRef.current : mode === "audio" ? audioRef.current : null;
     if (!el || !src) return;
     if (el.paused) void el.play();
@@ -129,6 +138,7 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
   }
 
   function seekRatio(ratio: number) {
+    if (mode === "image") return;
     const el = mode === "video" ? videoRef.current : mode === "audio" ? audioRef.current : null;
     if (!el || !src) return;
     el.currentTime = ratio * duration;
@@ -217,6 +227,9 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
             preload="metadata"
             style={{ display: mode === "video" && src ? "block" : "none" }}
           />
+          {mode === "image" && src && (
+            <img className="monitor-video" src={src} alt={media?.name ?? "Image"} draggable={false} />
+          )}
           <div
             className="monitor-audio-only"
             style={{ display: mode === "audio" && src ? "grid" : "none" }}
@@ -235,20 +248,22 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
         {error && <div className="preview-error">{error}</div>}
       </div>
       <div className="monitor-transport">
-        <button type="button" className="play-btn sm" onClick={togglePlay} disabled={!src}>
+        <button type="button" className="play-btn sm" onClick={togglePlay} disabled={!src || mode === "image"}>
           {playing ? "❚❚" : "▶"}
         </button>
-        <span className="timecode">{formatTime(time)}</span>
+        <span className="timecode">{mode === "image" ? "Still" : formatTime(time)}</span>
         <input
           className="scrub"
           type="range"
           min={0}
           max={1000}
           value={Math.round((time / duration) * 1000)}
-          disabled={!src}
+          disabled={!src || mode === "image"}
           onChange={(e) => seekRatio(Number(e.target.value) / 1000)}
         />
-        <span className="timecode muted-tc">{formatTime(media?.duration ?? 0)}</span>
+        <span className="timecode muted-tc">
+          {mode === "image" ? "5s on timeline" : formatTime(media?.duration ?? 0)}
+        </span>
         <button
           type="button"
           className={`vol-btn sm ${muted || volume === 0 ? "is-muted" : ""}`}

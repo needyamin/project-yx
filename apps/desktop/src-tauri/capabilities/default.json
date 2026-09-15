@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -15,6 +17,8 @@
     "opener:default",
     "dialog:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "opener:allow-reveal-item-in-dir",
+    "opener:allow-open-path"
   ]
 }

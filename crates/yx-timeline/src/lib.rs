@@ -187,11 +187,34 @@ pub enum FilterKind {
     Lut,
     Fade,
     Text,
+    // Daily-use color/quality effects (FFmpeg: colortemperature, hue,
+    // vignette, unsharp, hqdn3d, deshake, lut3d, loudnorm).
+    Temperature,
+    Hue,
+    Vignette,
+    Sharpen,
+    VideoDenoise,
+    Stabilize,
+    Lut3d,
+    Normalize,
+    /// Cross dissolve with the previous clip on the same track.
+    Transition,
+    /// De-esser: tames harsh "s" sounds in voice.
+    Deesser,
 }
 
 impl FilterKind {
     pub fn is_heavy(self) -> bool {
-        matches!(self, Self::Blur | Self::Denoise | Self::Lut | Self::Chromakey)
+        matches!(
+            self,
+            Self::Blur
+                | Self::Denoise
+                | Self::Lut
+                | Self::Chromakey
+                | Self::VideoDenoise
+                | Self::Stabilize
+                | Self::Lut3d
+        )
     }
 
     pub fn default_params(self) -> serde_json::Value {
@@ -244,7 +267,25 @@ impl FilterKind {
             Self::Reverb => serde_json::json!({ "delay": 40.0, "decay": 0.3 }),
             Self::Invert => serde_json::json!({}),
             Self::Pitch => serde_json::json!({ "semitones": 0.0, "preset": "custom" }),
-            Self::Lut | Self::Fade | Self::Text => serde_json::json!({}),
+            Self::Lut | Self::Fade => serde_json::json!({}),
+            Self::Text => serde_json::json!({
+                "text": "Your title",
+                "size": 6.0,
+                "color": "#ffffff",
+                "x": 0.0,
+                "y": 0.55,
+                "box": true
+            }),
+            Self::Temperature => serde_json::json!({ "kelvin": 6500.0 }),
+            Self::Hue => serde_json::json!({ "degrees": 0.0 }),
+            Self::Vignette => serde_json::json!({ "amount": 0.5 }),
+            Self::Sharpen => serde_json::json!({ "amount": 0.8 }),
+            Self::VideoDenoise => serde_json::json!({ "amount": 4.0 }),
+            Self::Stabilize => serde_json::json!({ "strength": 64.0 }),
+            Self::Lut3d => serde_json::json!({ "path": "" }),
+            Self::Normalize => serde_json::json!({ "target": -16.0 }),
+            Self::Transition => serde_json::json!({ "kind": "dissolve", "duration": 0.5 }),
+            Self::Deesser => serde_json::json!({ "amount": 0.5 }),
         }
     }
 }
@@ -478,6 +519,12 @@ pub enum EditCommand {
         clip_id: ClipId,
         kind: FilterKind,
         params: serde_json::Value,
+    },
+    /// Cross dissolve with the previous clip on the same track: overlaps this
+    /// clip left by up to `duration` seconds and attaches a Transition filter.
+    AddTransition {
+        clip_id: ClipId,
+        duration: f64,
     },
     UpdateFilter {
         clip_id: ClipId,
@@ -958,6 +1005,48 @@ impl TimelineEditor {
                 }
                 Ok(EditResult {
                     primary_clip_id: None,
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::AddTransition { clip_id, duration } => {
+                let (track, idx) = self.timeline.find_clip(clip_id)?;
+                if track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                if idx == 0 {
+                    return Err(TimelineError::NoGap);
+                }
+                let prev = &track.clips[idx - 1];
+                let clip = &track.clips[idx];
+                let prev_dur = prev.duration();
+                let clip_dur = clip.duration();
+                let overlap = duration
+                    .max(0.05)
+                    .min(prev_dur * 0.4)
+                    .min(clip_dur * 0.4)
+                    .min((clip.start - prev.start).max(0.05));
+                if overlap < 0.05 {
+                    return Err(TimelineError::NoGap);
+                }
+                let new_start = (clip.start - overlap).max(prev.start + 0.05);
+                let actual = clip.start - new_start;
+
+                // Re-borrow mutably and apply.
+                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+                let clip = &mut track.clips[idx];
+                clip.start = new_start;
+                clip.filters.push(FilterInstance {
+                    id: Uuid::new_v4(),
+                    kind: FilterKind::Transition,
+                    enabled: true,
+                    params: serde_json::json!({
+                        "kind": "dissolve",
+                        "duration": (actual * 100.0).round() / 100.0
+                    }),
+                });
+                Timeline::sort_track(track);
+                Ok(EditResult {
+                    primary_clip_id: Some(clip_id),
                     secondary_clip_id: None,
                 })
             }
@@ -2221,6 +2310,133 @@ mod tests {
             .find(|t| t.kind == TrackKind::Audio)
             .unwrap();
         assert!((a.clips[0].start - 3.0).abs() < 1e-9);
+    }
+
+    /// Every command behind the toolbar "More" menu, exercised end to end.
+    #[test]
+    fn more_menu_commands_end_to_end() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+
+        // Content: two AV pairs with a gap between them.
+        let r1 = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 4.0,
+            })
+            .unwrap();
+        ed.apply(EditCommand::AddAvPair {
+            video_track_id: v1,
+            audio_track_id: a1,
+            media_path: "b.mp4".into(),
+            source_path: None,
+            start: 6.0,
+            in_point: 0.0,
+            out_point: 10.0,
+        })
+        .unwrap();
+
+        // --- Edit mode switching ---
+        for mode in [EditMode::Normal, EditMode::Insert, EditMode::Overwrite] {
+            ed.apply(EditCommand::SetEditMode { mode })
+                .unwrap();
+            assert_eq!(ed.timeline.edit_mode, mode);
+        }
+        ed.apply(EditCommand::SetEditMode { mode: EditMode::Normal })
+            .unwrap();
+
+        // --- Zone in / out ---
+        ed.apply(EditCommand::SetZone {
+            zone_in: Some(1.0),
+            zone_out: Some(8.0),
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.zone_in, Some(1.0));
+        assert_eq!(ed.timeline.zone_out, Some(8.0));
+
+        // --- Marker ---
+        ed.apply(EditCommand::AddMarker {
+            time: 2.0,
+            label: "M1".into(),
+        })
+        .unwrap();
+        assert_eq!(ed.timeline.markers.len(), 1);
+
+        // --- Link / Unlink A/V ---
+        let vid = r1.primary_clip_id.unwrap();
+        let aud = r1.secondary_clip_id.unwrap();
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
+            .unwrap();
+        ed.apply(EditCommand::LinkClips {
+            clip_a: vid,
+            clip_b: aud,
+        })
+        .unwrap();
+
+        // --- Close gap at 4s (all tracks): clip B should move to 4.0 ---
+        ed.apply(EditCommand::CloseGap {
+            track_id: None,
+            at: 4.5,
+        })
+        .unwrap();
+        let v1_clip_b = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == v1)
+            .unwrap()
+            .clips
+            .iter()
+            .find(|c| c.media_path == "b.mp4")
+            .unwrap();
+        assert!(
+            (v1_clip_b.start - 4.0).abs() < 1e-6,
+            "gap should close, b at {}",
+            v1_clip_b.start
+        );
+
+        // --- Ripple delete clip A (video) — B shifts back to 0 ---
+        ed.apply(EditCommand::RippleDelete {
+            clip_id: vid,
+            remove_linked: true,
+        })
+        .unwrap();
+        let v1 = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == v1)
+            .unwrap();
+        assert!(
+            v1.clips.iter().all(|c| c.id != vid),
+            "ripple-deleted clip must be gone"
+        );
+        let a_track = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .unwrap();
+        let b_start_after = a_track
+            .clips
+            .iter()
+            .find(|c| c.media_path == "b.mp4")
+            .map(|c| c.start)
+            .unwrap();
+        assert!(
+            b_start_after < 1.0,
+            "followers ripple back, b at {}",
+            b_start_after
+        );
+
+        // --- Undo everything still works after the chain ---
+        assert!(ed.undo().is_ok());
     }
 
     #[test]

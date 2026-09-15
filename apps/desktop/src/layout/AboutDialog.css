@@ -1,9 +1,11 @@
+/* About Project YX — polished minimal design */
+
 .aboutus-overlay {
   position: fixed;
   inset: 0;
   z-index: 500;
-  background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(3px);
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(5px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -13,17 +15,16 @@
 .aboutus-card {
   position: relative;
   width: 100%;
-  max-width: 480px;
+  max-width: 380px;
   max-height: calc(100vh - 48px);
   overflow-y: auto;
   background: var(--panel, #17171c);
   border: 1px solid var(--line, #2a2a32);
-  border-radius: 16px;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
-  padding: 1.6rem 1.7rem 1.7rem;
-  display: flex;
-  flex-direction: column;
-  gap: 1.05rem;
+  border-radius: 18px;
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.02);
+  padding: 0 26px 22px;
 }
 
 .aboutus-close {
@@ -33,187 +34,197 @@
   width: 30px;
   height: 30px;
   border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted, #8a8a95);
-  font-size: 19px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 18px;
   line-height: 1;
   cursor: pointer;
+  z-index: 2;
 }
 
 .aboutus-close:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text, #fff);
+  background: rgba(0, 0, 0, 0.4);
+  color: #ffffff;
 }
 
-/* App identity */
-.aboutus-identity {
+/* Brand banner */
+.aboutus-banner {
+  margin: 0 -26px 4px;
+  padding: 20px 26px 30px;
+  background: linear-gradient(135deg, #4f46e5 0%, #06b6d4 100%);
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding-right: 32px;
+  gap: 12px;
 }
 
-.aboutus-app-logo {
-  width: 48px;
-  height: 48px;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #4f46e5, #06b6d4);
+.aboutus-app-mark {
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.28);
   color: #ffffff;
   font-weight: 800;
-  font-size: 17px;
+  font-size: 15px;
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
-  box-shadow: 0 2px 10px rgba(79, 70, 229, 0.35);
 }
 
 .aboutus-app-name {
-  margin: 0;
-  font-size: 1.3rem;
+  color: #ffffff;
+  font-size: 1.1rem;
   font-weight: 800;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
+  flex: 1;
 }
 
-.aboutus-app-version {
-  margin: 3px 0 0 0;
-  font-size: 0.78rem;
-  color: var(--muted, #8a8a95);
-}
-
-.aboutus-divider {
-  border: none;
-  border-top: 1px solid var(--line, #2a2a32);
-  margin: 0;
-}
-
-/* Developer profile */
-.aboutus-maintained {
-  margin: 0 0 2px 0;
-  font-size: 0.7rem;
+.aboutus-app-ver {
+  color: rgba(255, 255, 255, 0.85);
+  font-family: monospace;
+  font-size: 11.5px;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  color: var(--muted, #8a8a95);
+  background: rgba(0, 0, 0, 0.18);
+  padding: 2px 9px;
+  border-radius: 9999px;
 }
 
-.aboutus-head {
+/* Developer profile — only the PHOTO overlaps the banner edge; the text
+   starts below it (padding matches the 22px pull-up). */
+.aboutus-profile {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
+  margin-top: -22px;
+  padding: 0 2px;
+}
+
+.aboutus-id {
+  padding-top: 26px;
 }
 
 .aboutus-photo {
-  width: 104px;
-  height: 104px;
-  border-radius: 16px;
+  width: 84px;
+  height: 84px;
+  border-radius: 18px;
   object-fit: cover;
-  border: 2px solid var(--line, #2a2a32);
+  border: 3px solid var(--panel, #17171c);
   flex-shrink: 0;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.aboutus-id {
+  min-width: 0;
 }
 
 .aboutus-name {
-  margin: 0 0 3px 0;
-  font-size: 1.28rem;
+  margin: 4px 0 0 0;
+  font-size: 1.12rem;
   font-weight: 800;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.015em;
+  color: var(--text, #e6e6ea);
 }
 
 .aboutus-role {
-  margin: 0;
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: var(--accent, #4f46e5);
-}
-
-.aboutus-loc {
-  margin: 2px 0 0 0;
-  font-size: 0.83rem;
+  margin: 4px 0 0 0;
+  font-size: 0.76rem;
   color: var(--muted, #8a8a95);
+  line-height: 1.45;
 }
 
 .aboutus-bio {
-  margin: 0;
-  font-size: 0.88rem;
+  margin: 14px 0 0 0;
+  font-size: 0.79rem;
   line-height: 1.6;
-  color: var(--text-dim, #b9b9c2);
-}
-
-.aboutus-section-title {
-  font-size: 0.72rem;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: var(--muted, #8a8a95);
+  padding: 0 2px;
 }
 
+/* Links */
 .aboutus-links {
   display: flex;
-  flex-direction: column;
-  gap: 7px;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0 0 0;
 }
 
-.aboutus-link {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 14px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--line, #2a2a32);
-  border-radius: 10px;
-  color: inherit;
+.aboutus-links button {
+  flex: 1 1 auto;
+  min-width: 72px;
   font-family: inherit;
-  text-align: left;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text, #e6e6ea);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line, #2a2a32);
+  border-radius: 9px;
+  padding: 8px 10px;
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
-.aboutus-link:hover {
+.aboutus-links button:hover {
   border-color: var(--accent, #4f46e5);
-  background: rgba(79, 70, 229, 0.1);
+  background: rgba(79, 70, 229, 0.12);
+  color: #a5b4fc;
 }
 
-.aboutus-link-label {
-  font-size: 0.88rem;
+/* Company + license */
+.aboutus-footer {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line, #2a2a32);
+}
+
+.aboutus-company {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aboutus-company-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted, #8a8a95);
   font-weight: 700;
 }
 
-.aboutus-link-url {
-  font-size: 0.73rem;
+.aboutus-company-name {
+  font-size: 0.88rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  background: linear-gradient(135deg, #818cf8, #22d3ee);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.aboutus-license {
+  margin: 8px 0 0 0;
+  font-size: 0.68rem;
   color: var(--muted, #8a8a95);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.aboutus-note {
-  margin: 0;
-  padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.04);
-  border-left: 3px solid var(--accent, #4f46e5);
-  border-radius: 10px;
-  font-size: 0.82rem;
-  line-height: 1.55;
-  color: var(--text-dim, #b9b9c2);
-}
-
-/* White interface theme support */
+/* White interface theme */
 :root.theme-white .aboutus-card {
   background: #ffffff;
-  border-color: var(--line, #e2e8f0);
 }
 
-:root.theme-white .aboutus-link {
-  background: #f8fafc;
+:root.theme-white .aboutus-links button {
+  background: #f1f5f9;
 }
 
-:root.theme-white .aboutus-link:hover {
+:root.theme-white .aboutus-links button:hover {
   background: #eef2ff;
 }
 
-:root.theme-white .aboutus-note {
-  background: #f8fafc;
+:root.theme-white .aboutus-photo {
+  border-color: #ffffff;
+}
+
+:root.theme-white .aboutus-foot {
+  border-color: var(--line, #e2e8f0);
 }

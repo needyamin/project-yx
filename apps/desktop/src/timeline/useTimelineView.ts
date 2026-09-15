@@ -50,16 +50,22 @@ export function useTimelineView(durationSec: number) {
     [durationSec],
   );
 
-  /** Auto-fit when timeline becomes much longer (e.g. first long clip). */
+  /**
+   * Auto-fit when the timeline GROWS (new recording/import added): the whole
+   * sequence comes into view automatically. This ignores manual zoom on
+   * purpose — new material must always be visible; manual zoom still applies
+   * for resize events (see the panel's resize fit).
+   */
   const maybeAutoFit = useCallback(
     (viewportWidth: number) => {
-      if (userZoomedRef.current) return;
       if (durationSec <= 0) return;
-      const grew =
-        lastFitDuration.current === 0 ||
-        durationSec > lastFitDuration.current * 1.15 ||
-        durationSec * pxPerSec > viewportWidth * 1.05;
-      if (grew) {
+      const firstFit = lastFitDuration.current === 0;
+      const grew = lastFitDuration.current > 0 && durationSec >= lastFitDuration.current + 1.0;
+      if (firstFit || grew) {
+        zoomFit(viewportWidth);
+        return;
+      }
+      if (!userZoomedRef.current && durationSec * pxPerSec > viewportWidth * 1.05) {
         zoomFit(viewportWidth);
       }
     },

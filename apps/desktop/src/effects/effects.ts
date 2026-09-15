@@ -19,7 +19,17 @@ export type EffectKind =
   | "limiter"
   | "reverb"
   | "invert"
-  | "pitch";
+  | "pitch"
+  | "text"
+  | "temperature"
+  | "hue"
+  | "vignette"
+  | "sharpen"
+  | "vdenoise"
+  | "stabilize"
+  | "lut3d"
+  | "normalize"
+  | "transition";
 
 export type FilterInstance = {
   id: string;
@@ -53,6 +63,16 @@ export const EFFECT_CATALOG: {
   { id: "reverb", label: "Reverb", roles: ["audio"] },
   { id: "invert", label: "Invert phase", roles: ["audio"] },
   { id: "pitch", label: "Change voice", roles: ["audio"] },
+  { id: "text", label: "Text / Title", roles: ["video"] },
+  { id: "temperature", label: "Temperature", roles: ["video"] },
+  { id: "hue", label: "Hue rotate", roles: ["video"] },
+  { id: "vignette", label: "Vignette", roles: ["video"] },
+  { id: "sharpen", label: "Sharpen", roles: ["video"] },
+  { id: "vdenoise", label: "Video denoise", heavy: true, roles: ["video"] },
+  { id: "stabilize", label: "Stabilize", heavy: true, roles: ["video"] },
+  { id: "lut3d", label: "LUT (.cube)", heavy: true, roles: ["video"] },
+  { id: "transition", label: "Cross Dissolve", roles: ["video"] },
+  { id: "normalize", label: "Normalize (loudness)", roles: ["audio"] },
 ];
 
 export function defaultParams(kind: string): Record<string, unknown> {
@@ -95,6 +115,26 @@ export function defaultParams(kind: string): Record<string, unknown> {
       return {};
     case "pitch":
       return { semitones: 0, preset: "custom" };
+    case "text":
+      return { text: "Your title", size: 6, color: "#ffffff", x: 0, y: 0.55, box: true };
+    case "temperature":
+      return { kelvin: 6500 };
+    case "hue":
+      return { degrees: 0 };
+    case "vignette":
+      return { amount: 0.5 };
+    case "sharpen":
+      return { amount: 0.8 };
+    case "vdenoise":
+      return { amount: 4 };
+    case "stabilize":
+      return { strength: 64 };
+    case "lut3d":
+      return { path: "" };
+    case "normalize":
+      return { target: -16 };
+    case "transition":
+      return { kind: "dissolve", duration: 0.5 };
     default:
       return {};
   }
@@ -215,6 +255,11 @@ export function previewVideoStyle(
   transform: string;
   opacity: number;
   clipPath?: string;
+  boxShadow?: string;
+  /** Crop preview: CSS object-view-box zooms the cropped region to fill the
+   * frame — identical to the export's crop+scale behavior. */
+  objectViewBox?: string;
+  objectFit?: string;
 } {
   const parts: string[] = [];
   let opacity = fadeGain;
@@ -223,6 +268,9 @@ export function previewVideoStyle(
   let tx = 0;
   let ty = 0;
   let clipPath: string | undefined;
+  let objectViewBox: string | undefined;
+  let objectFit: string | undefined;
+  let vignette = 0;
 
   for (const f of filters) {
     if (!f.enabled) continue;
@@ -257,13 +305,38 @@ export function previewVideoStyle(
         opacity *= n(p, "opacity", 1);
         break;
       }
+      case "hue": {
+        const d = n(p, "degrees", 0);
+        if (Math.abs(d) > 0.05) parts.push(`hue-rotate(${d}deg)`);
+        break;
+      }
+      case "temperature": {
+        const k = n(p, "kelvin", 6500);
+        const delta = k - 6500;
+        if (delta > 200) {
+          parts.push(`sepia(${Math.min(0.35, delta / 20000).toFixed(3)}) saturate(1.08)`);
+        } else if (delta < -200) {
+          parts.push(`hue-rotate(${(delta / 1200).toFixed(2)}deg) saturate(1.05)`);
+        }
+        break;
+      }
+      case "vignette": {
+        const a = n(p, "amount", 0);
+        if (a > 0.01) {
+          vignette = Math.round(20 + a * 90);
+        }
+        break;
+      }
       case "crop": {
         const left = n(p, "left", 0) * 100;
         const top = n(p, "top", 0) * 100;
         const right = n(p, "right", 0) * 100;
         const bottom = n(p, "bottom", 0) * 100;
         if (left + top + right + bottom > 0.01) {
-          clipPath = `inset(${top}% ${right}% ${bottom}% ${left}%)`;
+          // object-view-box = the cropped region becomes the full frame,
+          // matching the export's crop+scale-to-fill (no letterbox).
+          objectViewBox = `inset(${top}% ${right}% ${bottom}% ${left}%)`;
+          objectFit = "fill";
         }
         break;
       }
@@ -290,6 +363,10 @@ export function previewVideoStyle(
     transform: transforms.join(" "),
     opacity: Math.max(0, Math.min(1, opacity)),
     clipPath,
+    objectViewBox,
+    objectFit,
+    boxShadow:
+      vignette > 0 ? `inset 0 0 ${Math.round(vignette * 1.4)}px rgba(0,0,0,${Math.min(0.9, vignette / 100)})` : undefined,
   };
 }
 

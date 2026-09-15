@@ -38,6 +38,7 @@ import {
   fileName,
   findLinkPartner,
   formatTime,
+  isImagePath,
   nextClipAfter,
   timelineDuration,
   type BootInfo,
@@ -67,15 +68,50 @@ const MEDIA_EXTENSIONS = [
   "m4a",
   "flac",
   "ogg",
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "bmp",
+  "gif",
 ] as const;
 
-const UPSERT_FILTER_KINDS = new Set(["denoise", "pitch", "volume"]);
+const UPSERT_FILTER_KINDS = new Set([
+  "denoise",
+  "pitch",
+  "volume",
+  "equalizer",
+  "compressor",
+  "highpass",
+  "gate",
+  "normalize",
+  "deesser",
+]);
 
 /** React-state playhead refresh while playing (the live playhead is moved
  * imperatively every frame; this only feeds timecode/sliders). */
 const PLAYHEAD_UI_MS = 250;
 
 type UnderPlayhead = NonNullable<ReturnType<typeof clipAtPlayhead>>;
+
+/** Second audio clip under the playhead on a DIFFERENT track (overdub layer,
+ * e.g. voiceover over music) — null when none exists. */
+function secondAudioAt(
+  timeline: Timeline | null,
+  t: number,
+  primaryClipId: string | null,
+) {
+  if (!timeline) return null;
+  for (const track of timeline.tracks) {
+    if (track.kind !== "audio" || track.muted || track.hidden) continue;
+    for (const clip of track.clips) {
+      if (primaryClipId && clip.id === primaryClipId) continue;
+      const end = clip.start + clipTimelineDuration(clip);
+      if (t >= clip.start && t < end) return { track, clip };
+    }
+  }
+  return null;
+}
 
 const FILTERS = EFFECT_CATALOG.map((e) => ({
   id: e.id,
@@ -129,7 +165,12 @@ function stableUnderPlayhead(
 function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const shadowVideoRef = useRef<HTMLVideoElement | null>(null);
+  const monitorImageRef = useRef<HTMLImageElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audio2Ref = useRef<HTMLAudioElement | null>(null);
+  const audioUnder2Cache = useRef<UnderPlayhead | null>(null);
+  const audioUnder2Ref = useRef<UnderPlayhead | null>(null);
+  const lastAudio2Volume = useRef(-1);
   const resumePlayRef = useRef(false);
   const transitioningRef = useRef(false);
   const playheadRef = useRef(0);
@@ -150,6 +191,8 @@ function App() {
     transform: "",
     opacity: "",
     clipPath: "",
+    objectViewBox: "",
+    objectFit: "",
   });
   const lastAudioVolume = useRef(-1);
   const timelineDropRef = useRef<((clientX: number) => number) | null>(null);
@@ -289,15 +332,44 @@ function App() {
     [timeline, playhead],
   );
 
+  const audioUnderPlayhead2 = useMemo(() => {
+    if (!timeline) {
+      audioUnder2Cache.current = null;
+      return null;
+    }
+    const hit = secondAudioAt(
+      timeline,
+      playhead,
+      audioUnderPlayhead?.clip.id ?? null,
+    );
+    const prev = audioUnder2Cache.current;
+    if (hit && prev && prev.clip.id === hit.clip.id && prev.clip === hit.clip) {
+      return prev;
+    }
+    audioUnder2Cache.current = hit;
+    return hit;
+  }, [timeline, playhead, audioUnderPlayhead]);
+
+  const timelineAudio2Src = useMemo(() => {
+    const clip = audioUnderPlayhead2?.clip;
+    if (!clip) return null;
+    try {
+      return convertFileSrc(clip.media_path);
+    } catch {
+      return null;
+    }
+  }, [audioUnderPlayhead2]);
+
   useEffect(() => {
     videoUnderRef.current = videoUnderPlayhead;
     audioUnderRef.current = audioUnderPlayhead;
+    audioUnder2Ref.current = audioUnderPlayhead2;
     previewModeRef.current = videoUnderPlayhead
       ? "video"
       : audioUnderPlayhead
         ? "audio"
         : "empty";
-  }, [videoUnderPlayhead, audioUnderPlayhead]);
+  }, [videoUnderPlayhead, audioUnderPlayhead, audioUnderPlayhead2]);
 
   const previewMode: PreviewMode = videoUnderPlayhead
     ? "video"
@@ -310,6 +382,8 @@ function App() {
     if (previewMode === "audio") return audioUnderPlayhead?.clip.media_path ?? null;
     return null;
   }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
+
+  const previewIsImage = useMemo(() => isImagePath(previewPath), [previewPath]);
 
   /** Timeline A-track path for Project Monitor (video is muted; this drives sound). */
   const timelineAudioPath = useMemo(() => {
@@ -379,9 +453,43 @@ function App() {
     }
 
     const wantAudioSrc = timelineAudioSrc ?? (previewMode === "audio" ? previewSrc : null);
+    const audio2 = audio2Ref.current;
+    const wantAudio2Src = timelineAudio2Src;
+    const syncAudio2 = () => {
+      if (!audio2) return;
+      const hit = audioUnder2Ref.current;
+      if (!wantAudio2Src || !hit) {
+        if (audio2.getAttribute("src")) {
+          audio2.pause();
+          audio2.removeAttribute("src");
+          audio2.load();
+        }
+        return;
+      }
+      if (audio2.getAttribute("src") !== wantAudio2Src) {
+        audio2.src = wantAudio2Src;
+        audio2.load();
+      }
+      const want = Math.max(
+        hit.clip.in_point,
+        Math.min(
+          hit.clip.in_point + (playheadRef.current - hit.clip.start),
+          hit.clip.out_point - 0.01,
+        ),
+      );
+      try {
+        if (Math.abs(audio2.currentTime - want) > 0.15) audio2.currentTime = want;
+      } catch {
+        /* metadata not ready yet */
+      }
+      if (playingRef.current && audio2.paused) {
+        void audio2.play().catch(() => undefined);
+      }
+    };
     const needVideoLoad =
       previewMode === "video" &&
       !!previewSrc &&
+      !isImagePath(previewSrc) &&
       front?.getAttribute("src") !== previewSrc &&
       back?.getAttribute("src") !== previewSrc;
     const needAudioLoad = Boolean(
@@ -398,6 +506,7 @@ function App() {
       );
     };
 
+    syncAudio2();
     if (!needVideoLoad && !needAudioLoad) {
       // Sources already loaded — seek only when out of sync (no reload).
       if (previewMode === "video" && front) {
@@ -455,6 +564,7 @@ function App() {
         shadowVideoRef.current = front;
         if (!front.paused) front.pause();
         setVideoEpoch((e) => e + 1);
+        syncAudio2();
         if (shouldResume || playingRef.current) {
           void back
             .play()
@@ -484,7 +594,7 @@ function App() {
       audio.addEventListener("loadedmetadata", onMeta, { once: true });
       return () => audio.removeEventListener("loadedmetadata", onMeta);
     }
-  }, [previewSrc, timelineAudioSrc, previewMode]);
+  }, [previewSrc, timelineAudioSrc, timelineAudio2Src, previewMode, audioUnderPlayhead2]);
 
   const commitPlayhead = useCallback((t: number, immediate = false) => {
     const next = Math.max(0, t);
@@ -524,6 +634,9 @@ function App() {
       if (active.paused) return;
       const hit = mode === "video" ? videoUnderRef.current : audioUnderRef.current;
       if (!hit) return;
+      // Still images have no media clock — the gap ticker advances the
+      // playhead across them while the monitor shows the picture.
+      if (mode === "video" && isImagePath(hit.clip.media_path)) return;
 
       const speed = clipSpeed(hit.clip);
       const reversed = mode === "video" && !!hit.clip.reverse;
@@ -536,6 +649,23 @@ function App() {
       // Keep A-track audio locked to the video clock.
       const audio = audioRef.current;
       const audioHit = audioUnderRef.current;
+      // Overdub layer (voiceover on another track) follows the same clock.
+      const audio2 = audio2Ref.current;
+      const audioHit2 = audioUnder2Ref.current;
+      if (mode === "video" && audio2 && audioHit2) {
+        const want2 = audioHit2.clip.in_point + (timelineTime - audioHit2.clip.start);
+        const clamped2 = Math.max(
+          audioHit2.clip.in_point,
+          Math.min(want2, audioHit2.clip.out_point - 0.01),
+        );
+        if (audio2.getAttribute("src")) {
+          if (audio2.paused) {
+            if (playingRef.current) void audio2.play().catch(() => undefined);
+          } else if (Math.abs(audio2.currentTime - clamped2) > 0.12) {
+            audio2.currentTime = clamped2;
+          }
+        }
+      }
       if (mode === "video" && audio && audioHit && !audio.paused) {
         const pitchRate = previewPitchRate(
           (audioHit.clip.filters ?? []) as FilterInstance[],
@@ -582,6 +712,7 @@ function App() {
             transitioningRef.current = true;
             active.pause();
             audioRef.current?.pause();
+            audio2Ref.current?.pause();
             commitPlayhead(next.clip.start, true);
             window.setTimeout(() => {
               transitioningRef.current = false;
@@ -595,6 +726,7 @@ function App() {
         transitioningRef.current = true;
         active.pause();
         audioRef.current?.pause();
+        audio2Ref.current?.pause();
         window.setTimeout(() => {
           transitioningRef.current = false;
         }, 50);
@@ -645,6 +777,7 @@ function App() {
       playingRef.current = false;
       setPlaying(false);
       audio?.pause();
+      audio2Ref.current?.pause();
       commitPlayhead(playheadRef.current, true);
     };
     const onErr = (ev: Event) => {
@@ -662,9 +795,13 @@ function App() {
     };
   }, [previewMode, timelineAudioSrc, commitPlayhead, videoEpoch]);
 
-  // Gap playback ticker: drives playhead across gaps at 1x (blank frame).
+  // Gap playback ticker: drives playhead across gaps AND still-image clips
+  // at 1x (blank frame / picture) when no real video is playing.
   useEffect(() => {
-    if (!playing || previewMode === "video") {
+    const videoUnder = videoUnderRef.current;
+    const realVideoPlaying =
+      previewMode === "video" && !!videoUnder && !isImagePath(videoUnder.clip.media_path);
+    if (!playing || realVideoPlaying) {
       if (gapRafRef.current) {
         cancelAnimationFrame(gapRafRef.current);
         gapRafRef.current = 0;
@@ -693,7 +830,8 @@ function App() {
         return;
       }
 
-      const vClip = tl ? clipAtPlayhead(tl, nextPh, "video") : null;
+      const vHit = tl ? clipAtPlayhead(tl, nextPh, "video") : null;
+      const vClip = vHit && !isImagePath(vHit.clip.media_path) ? vHit : null;
       if (vClip) {
         // Reached the next video clip!
         resumePlayRef.current = true;
@@ -710,6 +848,13 @@ function App() {
         if (audio.paused) void audio.play().catch(() => undefined);
       } else if (audio && !audio.paused && !aClip) {
         audio.pause();
+      }
+      const audio2 = audio2Ref.current;
+      const aHit2 = secondAudioAt(tl, nextPh, aClip?.clip.id ?? null);
+      if (audio2 && aHit2 && audio2.getAttribute("src")) {
+        if (audio2.paused) void audio2.play().catch(() => undefined);
+      } else if (audio2 && !audio2.paused && !aHit2) {
+        audio2.pause();
       }
 
       gapRafRef.current = requestAnimationFrame(tick);
@@ -746,7 +891,7 @@ function App() {
       const last = imported[0];
       if (last) {
         setSelectedMediaId(last.id);
-        setBinFilter(last.has_video ? "media" : "audio");
+        setBinFilter("media");
       }
       setStatus(
         imported.length === 1
@@ -765,10 +910,13 @@ function App() {
       const selected = await open({
         multiple: true,
         filters: [
+          { name: "All Media", extensions: [...MEDIA_EXTENSIONS] },
           {
-            name: "Media",
-            extensions: [...MEDIA_EXTENSIONS],
+            name: "Video",
+            extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v"],
           },
+          { name: "Audio", extensions: ["mp3", "wav", "aac", "m4a", "flac", "ogg"] },
+          { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] },
         ],
       });
       if (!selected) return;
@@ -926,7 +1074,9 @@ function App() {
       return;
     }
     if (kind === "pitch") {
-      setStatus("Add Change voice, then set semitones under Applied (or use Advanced Audio)");
+      setStatus(
+        "Add Change voice, then set semitones under Applied (or use Advanced Audio Tools)",
+      );
     }
     await upsertClipFilter(selectedClipId, kind, undefined);
   }
@@ -1138,12 +1288,13 @@ function App() {
       volumeGain: gain,
       sourceMode: false,
       appliedKinds,
+      audioFilters: (hit.clip.filters ?? []) as FilterInstance[],
       initialSemitones,
       initialVoicePreset,
       initialTab: tab,
     });
     if (resolvedFromVideo) {
-      setStatus("Advanced Audio edits the linked audio clip (not video)");
+      setStatus("Advanced Audio Tools edits the linked audio clip (not video)");
     }
   }
 
@@ -1170,6 +1321,7 @@ function App() {
       volumeGain: 1,
       sourceMode: true,
       appliedKinds: [],
+      audioFilters: [],
       initialTab: tab,
     });
   }
@@ -1330,6 +1482,53 @@ function App() {
     });
   }, [timeline, advancedVideo?.clipId]);
 
+  // Keep Advanced Audio state in sync with timeline writes (fades, gain,
+  // applied kinds and filter params).
+  useEffect(() => {
+    if (!advancedAudio?.clipId || !timeline) return;
+    let found: (typeof timeline.tracks)[0]["clips"][0] | null = null;
+    for (const track of timeline.tracks) {
+      const c = track.clips.find((x) => x.id === advancedAudio.clipId);
+      if (c) {
+        found = c;
+        break;
+      }
+    }
+    if (!found || found.role !== "audio") return;
+    const volFilter = (found.filters ?? []).find((f) => f.kind === "volume");
+    const gainVal =
+      volFilter && typeof (volFilter.params ?? {}).gain === "number"
+        ? ((volFilter.params as Record<string, number>).gain as number)
+        : null;
+    const appliedKinds = [
+      ...new Set((found.filters ?? []).map((f) => f.kind).filter(Boolean)),
+    ];
+    setAdvancedAudio((prev) => {
+      if (!prev || prev.clipId !== found!.id) return prev;
+      const fadeIn = found!.fade_in ?? prev.fadeIn;
+      const fadeOut = found!.fade_out ?? prev.fadeOut;
+      const filtersChanged = (prev.audioFilters ?? []) !== (found!.filters ?? []);
+      if (
+        prev.fadeIn === fadeIn &&
+        prev.fadeOut === fadeOut &&
+        gainVal !== null &&
+        Math.abs(prev.volumeGain - gainVal) < 1e-6 &&
+        (prev.appliedKinds ?? []).join(",") === appliedKinds.join(",") &&
+        !filtersChanged
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        fadeIn,
+        fadeOut,
+        volumeGain: gainVal ?? prev.volumeGain,
+        appliedKinds,
+        audioFilters: (found!.filters ?? []) as FilterInstance[],
+      };
+    });
+  }, [timeline, advancedAudio?.clipId]);
+
   async function cutAudioSelection(clipId: string, selStart: number, selEnd: number) {
     const hit = findClipById(clipId);
     if (!hit) return;
@@ -1455,12 +1654,75 @@ function App() {
 
   const canExport = hasTimelineClips || !!exportSource;
 
+  /** Snapshot of the current monitor frame for the export output preview. */
+  const captureExportFrame = useCallback(async (): Promise<string | null> => {
+    const video = videoRef.current;
+    const img = monitorImageRef.current;
+    const isVideo = !!video && video.videoWidth > 0;
+    const srcEl: HTMLVideoElement | HTMLImageElement | null = isVideo
+      ? video
+      : img && img.naturalWidth > 0
+        ? img
+        : null;
+    if (!srcEl) return null;
+    const w = isVideo ? (video as HTMLVideoElement).videoWidth : (img as HTMLImageElement).naturalWidth;
+    const h = isVideo ? (video as HTMLVideoElement).videoHeight : (img as HTMLImageElement).naturalHeight;
+    const assetSrc = srcEl.getAttribute("src");
+    const draw = (el: HTMLVideoElement | HTMLImageElement): string => {
+      const canvas = document.createElement("canvas");
+      const scale = Math.min(1, 960 / Math.max(w, h));
+      canvas.width = Math.max(2, Math.round(w * scale));
+      canvas.height = Math.max(2, Math.round(h * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no 2d context");
+      ctx.drawImage(el, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL("image/jpeg", 0.85);
+    };
+    try {
+      return draw(srcEl);
+    } catch {
+      /* frame is CORS-tainted — retry with a clean cross-origin probe */
+    }
+    if (!assetSrc) return null;
+    return new Promise<string | null>((resolve) => {
+      const probe = document.createElement("video");
+      probe.crossOrigin = "anonymous";
+      probe.muted = true;
+      probe.preload = "auto";
+      const finish = (result: string | null) => {
+        window.clearTimeout(timer);
+        resolve(result);
+      };
+      const timer = window.setTimeout(() => finish(null), 4000);
+      probe.addEventListener(
+        "loadeddata",
+        () => {
+          window.setTimeout(() => {
+            try {
+              finish(draw(probe));
+            } catch {
+              finish(null);
+            }
+          }, 80);
+        },
+        { once: true },
+      );
+      probe.addEventListener("error", () => finish(null), { once: true });
+      probe.src = assetSrc;
+    });
+  }, []);
+
+  const [exportPreviewFrame, setExportPreviewFrame] = useState<string | null>(null);
+
   function openExportDialog() {
     if (!canExport) {
       setStatus("Add media to the timeline (or select a file) to export");
       return;
     }
     setExportOpen(true);
+    void captureExportFrame()
+      .then((frame) => setExportPreviewFrame(frame))
+      .catch(() => setExportPreviewFrame(null));
   }
 
   async function runExport(settings: ExportSettings) {
@@ -1648,6 +1910,97 @@ function App() {
     }
   }
 
+  /** Enabled Text filter on the clip under the playhead — monitor overlay. */
+  const monitorText = useMemo(() => {
+    const clip = videoUnderPlayhead?.clip;
+    if (!clip) return null;
+    const f = (clip.filters ?? []).find((x) => x.kind === "text" && x.enabled);
+    if (!f) return null;
+    const p = (f.params ?? {}) as Record<string, unknown>;
+    const str = (v: unknown, d: string) => (typeof v === "string" && v.trim() ? v : d);
+    const num = (v: unknown, d: number) =>
+      typeof v === "number" && Number.isFinite(v) ? v : d;
+    return {
+      text: str(p.text, "Your title"),
+      size: num(p.size, 6),
+      color: str(p.color, "#ffffff"),
+      x: num(p.x, 0),
+      y: num(p.y, 0.55),
+      box: p.box !== false,
+    };
+  }, [videoUnderPlayhead]);
+
+  /** Transform filter on the selected (or under-playhead) clip — drives the
+   * monitor drag/scale interactions; export reads the same filter (WYSIWYG). */
+  const monitorTransform = useMemo(() => {
+    const target = selectedClip?.clip ?? videoUnderPlayhead?.clip ?? null;
+    if (!target) return null;
+    const f = (target.filters ?? []).find((x) => x.kind === "transform" && x.enabled);
+    if (!f) return null;
+    const p = (f.params ?? {}) as Record<string, unknown>;
+    const num = (v: unknown, d: number) =>
+      typeof v === "number" && Number.isFinite(v) ? v : d;
+    return {
+      clipId: target.id,
+      filterId: f.id,
+      x: num(p.x, 0),
+      y: num(p.y, 0),
+      scale: num(p.scale, 1),
+      rotation: num(p.rotation, 0),
+      opacity: num(p.opacity, 1),
+    };
+  }, [selectedClip, videoUnderPlayhead]);
+
+  const commitTransform = useCallback(
+    async (patch: { x?: number; y?: number; scale?: number }) => {
+      const t = monitorTransform;
+      if (!t) return;
+      const params = {
+        x: t.x,
+        y: t.y,
+        scale: t.scale,
+        rotation: t.rotation,
+        opacity: t.opacity,
+        ...patch,
+      };
+      try {
+        setTimeline(
+          normalizeTimeline(
+            await invoke<Timeline>("update_filter", {
+              clipId: t.clipId,
+              filterId: t.filterId,
+              params,
+            }),
+          ),
+        );
+      } catch (e) {
+        setStatus(String(e));
+      }
+    },
+    [monitorTransform],
+  );
+
+  /** Place any file path (e.g. a saved voiceover) on the timeline. */
+  const addMediaPathToTimeline = useCallback(
+    async (path: string, start: number, label: string) => {
+      try {
+        const next = await invoke<Timeline>("add_media_to_timeline", {
+          mediaPath: path,
+          start,
+        });
+        setTimeline(normalizeTimeline(next));
+        const first = next.tracks
+          .flatMap((tr) => tr.clips)
+          .sort((a, b) => b.start - a.start)[0];
+        if (first) setSelectedClipId(first.id);
+        setStatus(label);
+      } catch (e) {
+        setStatus(String(e));
+      }
+    },
+    [],
+  );
+
   const applyPreviewFades = useCallback(
     (
       t: number,
@@ -1668,34 +2021,70 @@ function App() {
         filters?: FilterInstance[];
       } | null,
     ) => {
-      const video = videoRef.current;
-      const audio = audioRef.current;
-      if (video) {
+      const applyVisual = (el: HTMLElement | null) => {
+        if (!el) return;
         const fade = videoClip ? clipFadeGain(videoClip, t) : 1;
+        // Cross-dissolve ramp: fade the incoming clip in over the overlap.
+        let transitionRamp = 1;
+        if (videoClip) {
+          const tr = (videoClip.filters ?? []).find(
+            (f) => f.kind === "transition" && f.enabled,
+          );
+          if (tr) {
+            const d =
+              typeof (tr.params ?? {}).duration === "number"
+                ? ((tr.params as Record<string, number>).duration as number)
+                : 0.5;
+            const local = t - videoClip.start;
+            if (local < d) transitionRamp = Math.max(0.04, local / d);
+          }
+        }
         const style = previewVideoStyle(
           (videoClip?.filters ?? []) as FilterInstance[],
-          fade,
+          fade * transitionRamp,
         );
         const opacity = String(style.opacity);
         const clipPath = style.clipPath ?? "";
+        const objectViewBox = style.objectViewBox ?? "";
+        const objectFit = style.objectFit ?? "";
         const prev = lastVideoStyle.current;
         if (prev.filter !== style.filter) {
-          video.style.filter = style.filter;
+          el.style.filter = style.filter;
           prev.filter = style.filter;
         }
         if (prev.transform !== style.transform) {
-          video.style.transform = style.transform;
+          el.style.transform = style.transform;
           prev.transform = style.transform;
         }
         if (prev.opacity !== opacity) {
-          video.style.opacity = opacity;
+          el.style.opacity = opacity;
           prev.opacity = opacity;
         }
         if (prev.clipPath !== clipPath) {
-          video.style.clipPath = clipPath;
+          el.style.clipPath = clipPath;
           prev.clipPath = clipPath;
         }
+        // Crop fills the frame exactly like the export (crop + scale-to-fill).
+        if (prev.objectViewBox !== objectViewBox) {
+          el.style.setProperty("object-view-box", objectViewBox);
+          prev.objectViewBox = objectViewBox;
+        }
+        if (prev.objectFit !== objectFit) {
+          el.style.objectFit = objectFit;
+          prev.objectFit = objectFit;
+        }
+        const shadow = style.boxShadow ?? "";
+        if ((el.dataset.shadow ?? "") !== shadow) {
+          el.style.boxShadow = shadow;
+          el.dataset.shadow = shadow;
+        }
+      };
+      const video = videoRef.current;
+      const audio = audioRef.current;
+      if (video) {
+        applyVisual(video);
       }
+      applyVisual(monitorImageRef.current);
       if (audio) {
         const fade = audioClip ? clipFadeGain(audioClip, t) : 1;
         const vol = monitorMutedRef.current
@@ -1708,6 +2097,22 @@ function App() {
         if (Math.abs(lastAudioVolume.current - vol) > 0.001) {
           audio.volume = vol;
           lastAudioVolume.current = vol;
+        }
+      }
+      const audio2 = audio2Ref.current;
+      if (audio2) {
+        const clip2 = audioUnder2Ref.current?.clip ?? null;
+        const fade2 = clip2 ? clipFadeGain(clip2, t) : 1;
+        const vol2 = monitorMutedRef.current
+          ? 0
+          : Math.min(
+              1,
+              previewVolumeGain((clip2?.filters ?? []) as FilterInstance[], fade2) *
+                monitorVolumeRef.current,
+            );
+        if (Math.abs(lastAudio2Volume.current - vol2) > 0.001) {
+          audio2.volume = vol2;
+          lastAudio2Volume.current = vol2;
         }
       }
     },
@@ -1727,6 +2132,7 @@ function App() {
       setPlaying(false);
       video?.pause();
       audio?.pause();
+      audio2Ref.current?.pause();
     };
 
     // Gate on playingRef — reverse keeps video.paused true, so !paused is unreliable.
@@ -1745,7 +2151,7 @@ function App() {
     const hit = tl ? clipAtPlayhead(tl, curTime, "video") : null;
     const audioHit = tl ? clipAtPlayhead(tl, curTime, "audio") : null;
 
-    if (hit && video && previewSrc) {
+    if (hit && video && previewSrc && !isImagePath(hit.clip.media_path)) {
       video.muted = true;
       const needsStepped = !!hit.clip.reverse;
 
@@ -1795,6 +2201,23 @@ function App() {
 
     if (audioHit && audio && (timelineAudioSrc || previewSrc)) {
       if (audio.paused) void audio.play().catch(() => undefined);
+      const audio2 = audio2Ref.current;
+      const audioHit2 = secondAudioAt(timelineRef.current, playheadRef.current, audioHit.clip.id);
+      if (audio2 && audioHit2 && audio2.getAttribute("src")) {
+        const want = Math.max(
+          audioHit2.clip.in_point,
+          Math.min(
+            audioHit2.clip.in_point + (playheadRef.current - audioHit2.clip.start),
+            audioHit2.clip.out_point - 0.01,
+          ),
+        );
+        try {
+          if (Math.abs(audio2.currentTime - want) > 0.15) audio2.currentTime = want;
+        } catch {
+          /* ignore */
+        }
+        if (audio2.paused) void audio2.play().catch(() => undefined);
+      }
       playingRef.current = true;
       setPlaying(true);
       return;
@@ -1810,6 +2233,13 @@ function App() {
       } else if (audio && !audio.paused) {
         audio.pause();
       }
+      const audio2 = audio2Ref.current;
+      const audioHit2 = secondAudioAt(timelineRef.current, playheadRef.current, audioHit?.clip.id ?? null);
+      if (audio2 && audioHit2 && audio2.getAttribute("src")) {
+        if (audio2.paused) void audio2.play().catch(() => undefined);
+      } else if (audio2 && !audio2.paused) {
+        audio2.pause();
+      }
     }
   }
 
@@ -1820,9 +2250,13 @@ function App() {
       const tl = timelineRef.current;
       const videoHit = tl ? clipAtPlayhead(tl, next, "video") : null;
       const audioHit = tl ? clipAtPlayhead(tl, next, "audio") : null;
-      if (videoHit && videoRef.current) {
+      if (videoHit && videoRef.current && !isImagePath(videoHit.clip.media_path)) {
         videoRef.current.muted = true;
-        videoRef.current.currentTime = mediaTimeForClip(videoHit.clip, next);
+        try {
+          videoRef.current.currentTime = mediaTimeForClip(videoHit.clip, next);
+        } catch {
+          /* ignore */
+        }
         try {
           videoRef.current.playbackRate = videoHit.clip.reverse ? 1 : clipSpeed(videoHit.clip);
         } catch {
@@ -1835,6 +2269,28 @@ function App() {
         audioRef.current.currentTime = audioHit.clip.in_point + (next - audioHit.clip.start);
       } else if (audioRef.current && !audioRef.current.paused) {
         audioRef.current.pause();
+      }
+      const audio2 = audio2Ref.current;
+      const audioHit2 = secondAudioAt(tl, next, audioHit?.clip.id ?? null);
+      if (audio2) {
+        if (audioHit2) {
+          const want = Math.max(
+            audioHit2.clip.in_point,
+            Math.min(
+              audioHit2.clip.in_point + (next - audioHit2.clip.start),
+              audioHit2.clip.out_point - 0.01,
+            ),
+          );
+          try {
+            if (audio2.getAttribute("src") && Math.abs(audio2.currentTime - want) > 0.15) {
+              audio2.currentTime = want;
+            }
+          } catch {
+            /* ignore */
+          }
+        } else if (!audio2.paused) {
+          audio2.pause();
+        }
       }
       applyPreviewFades(next, videoHit?.clip ?? null, audioHit?.clip ?? null);
     },
@@ -1957,6 +2413,7 @@ function App() {
           <div className="logo big">YX</div>
           <h1>Project YX</h1>
           <p>{status}</p>
+          <p className="boot-by">by ANSNEW TECH.</p>
         </div>
       </div>
     );
@@ -2105,7 +2562,23 @@ function App() {
             onAspect={setPreviewAspect}
             videoRef={videoRef}
             shadowVideoRef={shadowVideoRef}
+            imageRef={monitorImageRef}
+            previewIsImage={previewIsImage}
             audioRef={audioRef}
+            audio2Ref={audio2Ref}
+            textOverlay={monitorText}
+            transformParams={
+              monitorTransform
+                ? {
+                    x: monitorTransform.x,
+                    y: monitorTransform.y,
+                    scale: monitorTransform.scale,
+                    rotation: monitorTransform.rotation,
+                  }
+                : null
+            }
+            transformActive={!!monitorTransform && !cropTool}
+            onTransformCommit={(patch) => void commitTransform(patch)}
             onTogglePlay={togglePlay}
             onSeekRatio={(ratio) => seekTimeline(ratio * projectDuration)}
             volume={monitorVolume}
@@ -2173,6 +2646,9 @@ function App() {
               if (api) setSnapOn(api.snap);
             }}
             onRegisterPlayhead={handleRegisterPlayhead}
+            onAddMediaPath={(path, start, label) =>
+              void addMediaPathToTimeline(path, start, label)
+            }
             onAdvancedAudio={(clipId, tab) => openAdvancedAudioForClip(clipId, tab)}
             onAdvancedVideo={(clipId) => openAdvancedVideoForClip(clipId)}
           />
@@ -2280,6 +2756,7 @@ function App() {
         tier={boot.policy.tier}
         preferHw={boot.policy.prefer_hw_encode}
         previewAspect={previewAspect}
+        previewFrame={exportPreviewFrame}
         onClose={() => !busy && setExportOpen(false)}
         onExport={(settings) => void runExport(settings)}
       />

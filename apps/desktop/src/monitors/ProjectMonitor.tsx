@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject, type WheelEvent as ReactWheelEvent } from "react";
 import { formatTime } from "../timeline/types";
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import "./ProjectMonitor.css";
@@ -20,7 +20,28 @@ type Props = {
   videoRef: RefObject<HTMLVideoElement | null>;
   /** Hidden second video used to preload the next clip for gapless cuts. */
   shadowVideoRef: RefObject<HTMLVideoElement | null>;
+  /** Still-image preview element (image/gif clips). */
+  imageRef?: RefObject<HTMLImageElement | null>;
+  /** When true the under-playhead visual is a still image, not a video. */
+  previewIsImage?: boolean;
   audioRef: RefObject<HTMLAudioElement | null>;
+  /** Overdub layer: second simultaneous audio clip (voiceover over music). */
+  audio2Ref?: RefObject<HTMLAudioElement | null>;
+  /** Enabled Text filter on the previewed clip — burned-in overlay preview. */
+  textOverlay?: {
+    text: string;
+    size: number;
+    color: string;
+    x: number;
+    y: number;
+    box: boolean;
+  } | null;
+  /** Live transform filter params for the selected/under-playhead clip. */
+  transformParams?: { x: number; y: number; scale: number; rotation: number } | null;
+  /** Transform gestures enabled (transform filter present, crop tool off). */
+  transformActive?: boolean;
+  /** Commit transform patches (x/y normalized -1..1, scale multiplier). */
+  onTransformCommit?: (patch: { x?: number; y?: number; scale?: number }) => void;
   onTogglePlay: () => void;
   onSeekRatio: (ratio: number) => void;
   volume: number;
@@ -50,7 +71,14 @@ export function ProjectMonitor({
   onAspect,
   videoRef,
   shadowVideoRef,
+  imageRef,
+  previewIsImage = false,
   audioRef,
+  audio2Ref,
+  textOverlay = null,
+  transformParams = null,
+  transformActive = false,
+  onTransformCommit,
   onTogglePlay,
   onSeekRatio,
   volume,
@@ -85,12 +113,106 @@ export function ProjectMonitor({
   }, [fullView]);
 
   const [activeCrop, setActiveCrop] = useState<CropRect | null>(null);
+  const [frameH, setFrameH] = useState(0);
+
+  useEffect(() => {
+    const el = frameRef.current;
+    if (!el) return;
+    const measure = () => setFrameH(el.clientHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     setActiveCrop(cropDraft ?? null);
   }, [cropDraft]);
 
   const currentCrop = activeCrop ?? cropDraft ?? { left: 0, top: 0, right: 0, bottom: 0 };
+
+  /* --- Transform: drag to move, wheel to scale, double-click to reset --- */
+  const wheelCommitTimer = useRef(0);
+
+  function transformCss(p: { x: number; y: number; scale: number; rotation: number }) {
+    return `translate(${(p.x * 50).toFixed(3)}%, ${(p.y * 50).toFixed(3)}%) rotate(${p.rotation}deg) scale(${p.scale.toFixed(4)})`;
+  }
+
+  function activeVisualEl(): HTMLElement | null {
+    return previewIsImage
+      ? (imageRef?.current ?? null)
+      : (videoRef.current ?? null);
+  }
+
+  function beginTransformDrag(e: ReactPointerEvent) {
+    if (!transformActive || !transformParams || cropTool) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const el = activeVisualEl();
+    const frame = frameRef.current;
+    if (!el || !frame) return;
+    const rect = frame.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const base = { ...transformParams };
+    el.style.transform = transformCss(base);
+
+    const onMove = (ev: PointerEvent) => {
+      const next = {
+        ...base,
+        x: Math.max(-1, Math.min(1, base.x + ((ev.clientX - startX) / Math.max(1, rect.width)) * 2)),
+        y: Math.max(-1, Math.min(1, base.y + ((ev.clientY - startY) / Math.max(1, rect.height)) * 2)),
+      };
+      el.style.transform = transformCss(next);
+      currentTransformRef.current = next;
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      const end = currentTransformRef.current;
+      currentTransformRef.current = null;
+      if (end && (Math.abs(end.x - base.x) > 0.001 || Math.abs(end.y - base.y) > 0.001)) {
+        onTransformCommit?.({ x: end.x, y: end.y });
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // Latest gesture state committed on pointerup / wheel debounce.
+  const currentTransformRef = useRef<{ x: number; y: number; scale: number; rotation: number } | null>(null);
+
+  function onFrameWheel(e: ReactWheelEvent) {
+    if (!transformActive || !transformParams || cropTool || !onTransformCommit) return;
+    e.preventDefault();
+    const el = activeVisualEl();
+    if (!el) return;
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const base = currentTransformRef.current ?? transformParams;
+    const next = {
+      ...base,
+      scale: Math.max(0.05, Math.min(8, base.scale * factor)),
+    };
+    el.style.transform = transformCss(next);
+    currentTransformRef.current = next;
+    window.clearTimeout(wheelCommitTimer.current);
+    wheelCommitTimer.current = window.setTimeout(() => {
+      const end = currentTransformRef.current;
+      currentTransformRef.current = null;
+      if (end && Math.abs(end.scale - transformParams.scale) > 0.001) {
+        onTransformCommit({ scale: end.scale });
+      }
+    }, 400);
+  }
+
+  function onFrameDoubleClick() {
+    if (!transformActive || !transformParams || cropTool || !onTransformCommit) return;
+    const el = activeVisualEl();
+    const reset = { x: 0, y: 0, scale: 1, rotation: transformParams.rotation };
+    if (el) el.style.transform = transformCss(reset);
+    window.clearTimeout(wheelCommitTimer.current);
+    onTransformCommit({ x: 0, y: 0, scale: 1 });
+  }
   const cropWidth = Math.max(0.05, 1 - currentCrop.left - currentCrop.right);
   const cropHeight = Math.max(0.05, 1 - currentCrop.top - currentCrop.bottom);
 
@@ -156,13 +278,17 @@ export function ProjectMonitor({
       current = next;
       setActiveCrop(next);
 
-      // Live visual preview on video element
-      if (videoRef.current) {
+      // Live visual preview on the active video/image element.
+      // object-view-box = the cropped region zooms to fill the frame, the
+      // same crop+scale-to-fill the export renders.
+      const visual = previewIsImage ? (imageRef?.current ?? null) : videoRef.current;
+      if (visual) {
         const topPct = (next.top * 100).toFixed(2);
         const rightPct = (next.right * 100).toFixed(2);
         const bottomPct = (next.bottom * 100).toFixed(2);
         const leftPct = (next.left * 100).toFixed(2);
-        videoRef.current.style.clipPath = `inset(${topPct}% ${rightPct}% ${bottomPct}% ${leftPct}%)`;
+        visual.style.setProperty("object-view-box", `inset(${topPct}% ${rightPct}% ${bottomPct}% ${leftPct}%)`);
+        visual.style.objectFit = "fill";
       }
     };
 
@@ -300,8 +426,17 @@ export function ProjectMonitor({
       <div className="monitor-stage">
         <div
           ref={frameRef}
-          className={`monitor-frame ${tiktok ? "phone" : "wide"} ${cropTool ? "crop-mode" : ""}`}
-          onPointerDown={(e) => startCropDrag("new", e)}
+          className={`monitor-frame ${tiktok ? "phone" : "wide"} ${cropTool ? "crop-mode" : ""} ${transformActive ? "transform-mode" : ""}`}
+          onPointerDown={(e) => {
+            if (cropTool) {
+              startCropDrag("new", e);
+              return;
+            }
+            beginTransformDrag(e);
+          }}
+          onWheel={onFrameWheel}
+          onDoubleClick={onFrameDoubleClick}
+          title={transformActive ? "Drag to move · wheel to scale · double-click to reset" : undefined}
         >
           <video
             ref={videoRef}
@@ -311,8 +446,8 @@ export function ProjectMonitor({
             preload="metadata"
             onClick={onVideoClick}
             style={{
-              display: previewMode === "video" && previewSrc ? "block" : "none",
-              cursor: chromakeyActive ? "crosshair" : undefined,
+              display: previewMode === "video" && previewSrc && !previewIsImage ? "block" : "none",
+              cursor: chromakeyActive ? "crosshair" : transformActive ? "move" : undefined,
             }}
           />
           {/* Buffer: preloads the next clip so cuts don't stall the pipeline. */}
@@ -323,9 +458,39 @@ export function ProjectMonitor({
             muted
             preload="metadata"
             style={{
-              display: previewMode === "video" && previewSrc ? "block" : "none",
+              display: previewMode === "video" && previewSrc && !previewIsImage ? "block" : "none",
             }}
           />
+          {/* Text filter overlay (WYSIWYG with drawtext export) */}
+          {textOverlay && previewMode === "video" && frameH > 0 && (
+            <div
+              className="monitor-text-overlay"
+              style={{
+                left: `${50 + textOverlay.x * 50}%`,
+                top: `${50 + textOverlay.y * 50}%`,
+                transform: "translate(-50%, -50%)",
+                fontSize: `${Math.max(10, (textOverlay.size / 100) * frameH)}px`,
+                color: textOverlay.color,
+                background: textOverlay.box ? "rgba(0,0,0,0.45)" : "transparent",
+              }}
+            >
+              {textOverlay.text}
+            </div>
+          )}
+          {/* Still image / GIF clip preview */}
+          {imageRef && (
+            <img
+              ref={imageRef}
+              className="monitor-video is-front"
+              src={previewIsImage ? (previewSrc ?? undefined) : undefined}
+              alt=""
+              draggable={false}
+              style={{
+                display: previewMode === "video" && previewSrc && previewIsImage ? "block" : "none",
+                cursor: transformActive ? "move" : undefined,
+              }}
+            />
+          )}
           {cropTool && previewMode === "video" && (
             <div
               className="crop-box"
@@ -409,8 +574,10 @@ export function ProjectMonitor({
                     e.stopPropagation();
                     const zero = { left: 0, top: 0, right: 0, bottom: 0 };
                     setActiveCrop(zero);
-                    if (videoRef.current) {
-                      videoRef.current.style.clipPath = "";
+                    const visual = previewIsImage ? (imageRef?.current ?? null) : videoRef.current;
+                    if (visual) {
+                      visual.style.setProperty("object-view-box", "");
+                      visual.style.objectFit = "";
                     }
                     onCropCommit?.(zero);
                   }}
@@ -432,6 +599,7 @@ export function ProjectMonitor({
             </div>
           )}
           <audio ref={audioRef} preload="metadata" className="monitor-timeline-audio" />
+          <audio ref={audio2Ref} preload="metadata" className="monitor-timeline-audio" />
           <div
             className="monitor-audio-only"
             style={{ display: !hasTimelineClips && previewMode === "audio" && previewSrc ? "grid" : "none" }}

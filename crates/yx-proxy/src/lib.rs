@@ -128,6 +128,21 @@ impl ProxyManager {
         }
 
         let info = probe_media(source)?;
+        // Audio-only files and images never need proxies — edit the original.
+        if !info.has_video || yx_media::is_image_path(source) {
+            let id = Uuid::new_v4();
+            let job = ProxyJob {
+                id,
+                source_path: source.to_path_buf(),
+                proxy_path: source.to_path_buf(),
+                status: ProxyStatus::Skipped,
+                progress: 1.0,
+                error: None,
+                source_info: Some(info),
+            };
+            self.inner.lock().insert(id, job.clone());
+            return Ok(job);
+        }
         // Already small enough — edit the original.
         if info.height > 0 && info.height <= policy.proxy.height {
             let id = Uuid::new_v4();

@@ -10,7 +10,7 @@ const PROFILE_LINKS = [
 ];
 
 type Props = {
-  /** App version string from Tauri (shown in the identity header). */
+  /** App version string from Tauri. */
   version?: string;
   onClose: () => void;
 };
@@ -34,10 +34,7 @@ export function AboutDialog({ version, onClose }: Props) {
       aria-label="About Project YX"
       onMouseDown={onClose}
     >
-      <div
-        className="aboutus-card"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+      <div className="aboutus-card" onMouseDown={(e) => e.stopPropagation()}>
         <button
           type="button"
           className="aboutus-close"
@@ -47,30 +44,26 @@ export function AboutDialog({ version, onClose }: Props) {
           ×
         </button>
 
-        <div className="aboutus-identity">
-          <span className="aboutus-app-logo">YX</span>
-          <div>
-            <h2 className="aboutus-app-name">Project YX</h2>
-            <p className="aboutus-app-version">
-              Version {version || "…"} · Open-source desktop video editor
-            </p>
-          </div>
+        {/* Brand banner */}
+        <div className="aboutus-banner">
+          <span className="aboutus-app-mark">YX</span>
+          <span className="aboutus-app-name">Project YX</span>
+          <span className="aboutus-app-ver">{version ? `v${version}` : ""}</span>
         </div>
 
-        <hr className="aboutus-divider" />
-
-        <div className="aboutus-head">
+        {/* Developer */}
+        <div className="aboutus-profile">
           <img
             className="aboutus-photo"
             src="developer.jpg"
             alt="Md. Yamin Hossain"
             draggable={false}
           />
-          <div>
-            <p className="aboutus-maintained">Created &amp; maintained by</p>
-            <h3 className="aboutus-name">Md. Yamin Hossain</h3>
-            <p className="aboutus-role">Senior Software Engineer</p>
-            <p className="aboutus-loc">Dhaka, Bangladesh</p>
+          <div className="aboutus-id">
+            <h2 className="aboutus-name">Md. Yamin Hossain</h2>
+            <p className="aboutus-role">
+              Senior Software Engineer · Dhaka, Bangladesh
+            </p>
           </div>
         </div>
 
@@ -79,30 +72,28 @@ export function AboutDialog({ version, onClose }: Props) {
           automation, and intuitive user experiences.
         </p>
 
-        <div className="aboutus-section-title">Profile Links</div>
+        {/* Links */}
         <div className="aboutus-links">
           {PROFILE_LINKS.map((link) => (
             <button
               key={link.label}
               type="button"
-              className="aboutus-link"
               onClick={() => void openUrl(link.url)}
               title={link.url}
             >
-              <span className="aboutus-link-label">{link.label}</span>
-              <span className="aboutus-link-url">{link.url}</span>
+              {link.label}
             </button>
           ))}
         </div>
 
-        <p className="aboutus-note">
-          This open-source desktop app focuses on simple, reliable media
-          editing with a clean user experience. Free forever under GPL-3.0.
-        </p>
-
-        <button type="button" className="ghost-btn" onClick={onClose}>
-          Close
-        </button>
+        {/* Company + license */}
+        <div className="aboutus-footer">
+          <div className="aboutus-company">
+            <span className="aboutus-company-label">A product of</span>
+            <span className="aboutus-company-name">ANSNEW TECH.</span>
+          </div>
+          <p className="aboutus-license">Open source under GPL-3.0</p>
+        </div>
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { formatTime } from "../timeline/types";
 import {
   pitchRatio,
@@ -23,6 +23,9 @@ export type AdvancedAudioTarget = {
   sourceMode: boolean;
   /** Filter kinds already on the clip (e.g. denoise, pitch). */
   appliedKinds?: string[];
+  /** The clip's full audio filter list — powers Voice Clean sliders and the
+   * processed-sound preview. */
+  audioFilters?: import("../effects/effects").FilterInstance[];
   /** Existing pitch on the clip (for Done / UI restore). */
   initialSemitones?: number;
   initialVoicePreset?: VoicePreset;
@@ -64,6 +67,7 @@ export function AdvancedAudioDialog({
   onSetVolume,
   onApplyEffect,
   onRemoveEffect,
+  onCutSelection,
   onStatus,
 }: Props) {
   const inPoint = Math.max(0, target.inPoint);
@@ -158,6 +162,140 @@ export function AdvancedAudioDialog({
   const selHi = sel ? Math.max(sel.a, sel.b) : dur;
   const hasSel = sel != null && selHi - selLo > 0.02;
   const canEdit = Boolean(target.clipId) && !target.sourceMode;
+
+  /* ---- Voice Clean & Boost ---- */
+  const [processed, setProcessed] = useState<{ path: string; url: string } | null>(null);
+  const [processingPreview, setProcessingPreview] = useState(false);
+  const processedAudioRef = useRef<HTMLAudioElement | null>(null);
+  const vcTimer = useRef(0);
+
+  const AUDIO_CHAIN_KINDS = new Set([
+    "volume",
+    "equalizer",
+    "compressor",
+    "highpass",
+    "lowpass",
+    "gate",
+    "denoise",
+    "limiter",
+    "reverb",
+    "pitch",
+    "normalize",
+    "deesser",
+  ]);
+
+  const audioFilters = target.audioFilters ?? [];
+  const filterParam = (kind: string, key: string, d: number): number => {
+    const f = audioFilters.find((x) => x.kind === kind && x.enabled);
+    const v = (f?.params ?? {})[key];
+    return typeof v === "number" && Number.isFinite(v) ? v : d;
+  };
+  const hasFilter = (kind: string) => appliedKinds.includes(kind);
+
+  const filterSignature = JSON.stringify(
+    audioFilters.filter((f) => f.enabled && AUDIO_CHAIN_KINDS.has(f.kind)),
+  );
+  useEffect(() => {
+    setProcessed(null);
+  }, [filterSignature]);
+
+  const VC_CHAINS = {
+    clean: [
+      ["highpass", { freq: 100 }],
+      ["denoise", { nf: -30, nr: 20 }],
+      ["equalizer", { bass: -1, mid: 0, treble: 3 }],
+      ["compressor", { threshold: -24, ratio: 3, attack: 15, release: 200 }],
+    ],
+    strong: [
+      ["highpass", { freq: 120 }],
+      ["gate", { threshold: -45, ratio: 12, attack: 5, release: 150 }],
+      ["denoise", { nf: -34, nr: 35 }],
+      ["equalizer", { bass: -1.5, mid: 0.5, treble: 4 }],
+      ["compressor", { threshold: -26, ratio: 4, attack: 10, release: 180 }],
+    ],
+    podcast: [
+      ["highpass", { freq: 85 }],
+      ["gate", { threshold: -40, ratio: 10, attack: 10, release: 150 }],
+      ["denoise", { nf: -30, nr: 25 }],
+      ["equalizer", { bass: 1, mid: 1, treble: 2.5 }],
+      ["compressor", { threshold: -22, ratio: 4, attack: 12, release: 200 }],
+      ["deesser", { amount: 0.6 }],
+    ],
+  } as const;
+
+  async function applyVoiceChain(preset: keyof typeof VC_CHAINS) {
+    if (!canEdit) {
+      onStatus("Add this audio to the timeline to apply voice cleanup");
+      return;
+    }
+    onStatus("Applying voice cleanup…");
+    for (const [kind, params] of VC_CHAINS[preset]) {
+      await Promise.resolve(onApplyEffect(kind, params as Record<string, unknown>));
+    }
+    onStatus(
+      "Voice cleanup applied — press ▶ Hear processed result to hear the export sound",
+    );
+  }
+
+  async function clearVoiceCleanup() {
+    if (!canEdit) return;
+    for (const kind of ["gate", "denoise", "highpass", "equalizer", "compressor", "deesser", "normalize"]) {
+      if (hasFilter(kind)) {
+        await Promise.resolve(onRemoveEffect?.(kind));
+      }
+    }
+    setAppliedKinds((k) =>
+      k.filter(
+        (x) =>
+          !["gate", "denoise", "highpass", "equalizer", "compressor", "deesser", "normalize"].includes(x),
+      ),
+    );
+    onStatus("Voice cleanup cleared");
+  }
+
+  function scheduleVoiceParam(kind: string, params: Record<string, unknown>) {
+    if (!canEdit) {
+      onStatus("Add this audio to the timeline to edit cleanup");
+      return;
+    }
+    window.clearTimeout(vcTimer.current);
+    vcTimer.current = window.setTimeout(() => {
+      void Promise.resolve(onApplyEffect(kind, params));
+    }, 260);
+  }
+
+  async function hearProcessed() {
+    const filters = audioFilters
+      .filter((f) => f.enabled && AUDIO_CHAIN_KINDS.has(f.kind))
+      .map((f) => ({ kind: f.kind, enabled: true, params: f.params ?? {} }));
+    if (filters.length === 0) {
+      onStatus("Apply a cleanup preset first, then hear the processed result");
+      return;
+    }
+    stopSource();
+    playingRef.current = false;
+    setPlaying(false);
+    processedAudioRef.current?.pause();
+    setProcessingPreview(true);
+    try {
+      const path = await invoke<string>("render_audio_preview", {
+        source: target.mediaPath,
+        inPoint,
+        duration: dur,
+        filters,
+      });
+      const url = convertFileSrc(path);
+      setProcessed({ path, url });
+      window.setTimeout(() => {
+        void processedAudioRef.current?.play().catch(() => undefined);
+      }, 120);
+      onStatus("Playing the exact export sound of this clip");
+    } catch (e) {
+      onStatus(String(e));
+    } finally {
+      setProcessingPreview(false);
+    }
+  }
 
   function ensureGraph(): { ctx: AudioContext; gain: GainNode } | null {
     let ctx = ctxRef.current;
@@ -579,7 +717,7 @@ export function AdvancedAudioDialog({
         setAppliedKinds((k) => k.filter((x) => x !== "pitch"));
         onStatus("Voice cleared from clip");
       } else {
-        onStatus("Advanced Audio closed — fades/volume saved");
+        onStatus("Advanced Audio Tools closed — fades/volume saved");
       }
     }
     onClose();
@@ -615,12 +753,12 @@ export function AdvancedAudioDialog({
       <div
         className="aad-modal"
         role="dialog"
-        aria-label="Advanced Audio"
+        aria-label="Advanced Audio Tools"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <header className="aad-head">
           <div>
-            <strong>Advanced Audio</strong>
+            <strong>Advanced Audio Tools</strong>
             <p>
               {target.name} · {formatTime(dur)}
               {target.sourceMode ? " · source preview" : ""}
@@ -655,11 +793,189 @@ export function AdvancedAudioDialog({
             </span>
           )}
           <button type="button" className="ghost" onClick={() => setSel(null)} disabled={!sel}>
-            Clear sel
+            Clear selection
           </button>
+          {hasSel && canEdit && (
+            <button
+              type="button"
+              className="primary"
+              title="Remove the selected range from the clip (ripple)"
+              onClick={() => {
+                stopSource();
+                playingRef.current = false;
+                setPlaying(false);
+                onCutSelection(selLo, selHi);
+              }}
+            >
+              Cut selection
+            </button>
+          )}
         </div>
 
         <div className="aad-body">
+          <div className="aad-voiceclean">
+            <div className="aad-vc-head">
+              <span className="aad-vc-title">Voice Clean &amp; Boost</span>
+              <span className="aad-vc-sub">
+                Remove noise · cut background · boost clarity · even out level
+              </span>
+            </div>
+            <div className="aad-actions wrap">
+              <button
+                type="button"
+                className="primary"
+                disabled={!canEdit}
+                onClick={() => void applyVoiceChain("clean")}
+              >
+                Clean &amp; Optimize Voice
+              </button>
+              <button
+                type="button"
+                disabled={!canEdit}
+                onClick={() => void applyVoiceChain("strong")}
+              >
+                Strong noise removal
+              </button>
+              <button
+                type="button"
+                disabled={!canEdit}
+                onClick={() => void applyVoiceChain("podcast")}
+              >
+                Podcast voice
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={!canEdit}
+                onClick={() => void clearVoiceCleanup()}
+              >
+                Clear cleanup
+              </button>
+            </div>
+
+            <div className="aad-vc-sliders">
+              {hasFilter("denoise") && (
+                <label className="aad-slider">
+                  <span>
+                    Noise removal <em>{filterParam("denoise", "nr", 20).toFixed(0)}</em>
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={60}
+                    step={1}
+                    value={filterParam("denoise", "nr", 20)}
+                    onChange={(e) =>
+                      scheduleVoiceParam("denoise", {
+                        nf: filterParam("denoise", "nf", -30),
+                        nr: Number(e.target.value),
+                      })
+                    }
+                  />
+                </label>
+              )}
+              {hasFilter("gate") && (
+                <label className="aad-slider">
+                  <span>
+                    Background cut (gate) <em>{filterParam("gate", "threshold", -40).toFixed(0)} dB</em>
+                  </span>
+                  <input
+                    type="range"
+                    min={-60}
+                    max={-20}
+                    step={1}
+                    value={filterParam("gate", "threshold", -40)}
+                    onChange={(e) =>
+                      scheduleVoiceParam("gate", {
+                        threshold: Number(e.target.value),
+                        ratio: filterParam("gate", "ratio", 10),
+                        attack: filterParam("gate", "attack", 10),
+                        release: filterParam("gate", "release", 150),
+                      })
+                    }
+                  />
+                </label>
+              )}
+              {hasFilter("equalizer") && (
+                <label className="aad-slider">
+                  <span>
+                    Voice clarity <em>+{filterParam("equalizer", "treble", 0).toFixed(1)} dB</em>
+                  </span>
+                  <input
+                    type="range"
+                    min={-6}
+                    max={8}
+                    step={0.5}
+                    value={filterParam("equalizer", "treble", 0)}
+                    onChange={(e) =>
+                      scheduleVoiceParam("equalizer", {
+                        bass: filterParam("equalizer", "bass", 0),
+                        mid: filterParam("equalizer", "mid", 0),
+                        treble: Number(e.target.value),
+                      })
+                    }
+                  />
+                </label>
+              )}
+              {hasFilter("compressor") && (
+                <label className="aad-slider">
+                  <span>
+                    Even out level <em>ratio {filterParam("compressor", "ratio", 3).toFixed(1)}:1</em>
+                  </span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={8}
+                    step={0.5}
+                    value={filterParam("compressor", "ratio", 3)}
+                    onChange={(e) =>
+                      scheduleVoiceParam("compressor", {
+                        threshold: filterParam("compressor", "threshold", -22),
+                        ratio: Number(e.target.value),
+                        attack: filterParam("compressor", "attack", 15),
+                        release: filterParam("compressor", "release", 200),
+                      })
+                    }
+                  />
+                </label>
+              )}
+              {hasFilter("deesser") && (
+                <label className="aad-slider">
+                  <span>
+                    De-esser (harsh S) <em>{filterParam("deesser", "amount", 0.5).toFixed(2)}</em>
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={filterParam("deesser", "amount", 0.5)}
+                    onChange={(e) => scheduleVoiceParam("deesser", { amount: Number(e.target.value) })}
+                  />
+                </label>
+              )}
+            </div>
+
+            <div className="aad-vc-preview">
+              <button
+                type="button"
+                className="primary"
+                disabled={!canEdit || processingPreview}
+                onClick={() => void hearProcessed()}
+              >
+                {processingPreview
+                  ? "Rendering processed sound…"
+                  : "▶ Hear processed result (export sound)"}
+              </button>
+              {processed && !processingPreview && (
+                <span className="aad-hint">
+                  Playing the exact sound the exported file will have.
+                </span>
+              )}
+              <audio ref={processedAudioRef} src={processed?.url ?? undefined} preload="auto" />
+            </div>
+          </div>
+
           {(hasDenoise || hasPitch) && (
             <div className="aad-on-clip">
               <span className="aad-on-label">On this audio clip</span>
