@@ -1,4 +1,4 @@
-/** Cached, chunked waveform peak extraction — keeps the UI thread responsive. */
+/** Cached waveform peak extraction — decodes each media file ONCE. */
 
 export type PeakData = {
   peaks: Float32Array;
@@ -7,11 +7,22 @@ export type PeakData = {
   buffer: AudioBuffer | null;
 };
 
+/** Full-file decode cache: trimming a clip must NOT re-download/re-decode. */
+const decodedCache = new Map<string, AudioBuffer>();
+/** Per-window peak cache (peaks are cheap to recompute from a decoded buffer). */
 const cache = new Map<string, PeakData>();
 
 const BINS = 256;
 const MAX_SAMPLES = 2_500_000;
 const BINS_PER_CHUNK = 32;
+
+let sharedCtx: AudioContext | null = null;
+function audioContext(): AudioContext {
+  if (!sharedCtx || sharedCtx.state === "closed") {
+    sharedCtx = new AudioContext();
+  }
+  return sharedCtx;
+}
 
 function yieldToUi(): Promise<void> {
   return new Promise((resolve) => {
@@ -56,8 +67,8 @@ export function getCachedPeaks(
 }
 
 /**
- * Fetch + decode audio, then extract peaks in rAF chunks for [inPoint, outPoint].
- * Also caches a sliced AudioBuffer for preview playback.
+ * Fetch + decode audio once per file, then extract peaks in rAF chunks for
+ * [inPoint, outPoint]. Also caches a sliced AudioBuffer for preview playback.
  */
 export async function loadWaveformPeaks(
   src: string,
@@ -82,22 +93,32 @@ export async function loadWaveformPeaks(
   const { signal } = opts;
   if (signal?.aborted) return null;
 
-  const res = await fetch(src, { signal });
-  if (signal?.aborted) return null;
-  const buf = await res.arrayBuffer();
-  if (signal?.aborted) return null;
+  // Decode once per media file (survives trim changes / reopens).
+  let decoded = decodedCache.get(src);
+  if (!decoded) {
+    const res = await fetch(src, { signal });
+    if (signal?.aborted) return null;
+    const buf = await res.arrayBuffer();
+    if (signal?.aborted) return null;
 
-  await yieldToUi();
-  if (signal?.aborted) return null;
+    await yieldToUi();
+    if (signal?.aborted) return null;
 
-  const ctx = new AudioContext();
-  let decoded: AudioBuffer;
-  try {
-    decoded = await ctx.decodeAudioData(buf.slice(0));
-  } finally {
-    await ctx.close().catch(() => undefined);
+    const ctx = audioContext();
+    decoded = await ctx.decodeAudioData(buf);
+    if (signal?.aborted) return null;
+    decodedCache.set(src, decoded);
+    // Keep the cache bounded (decoded PCM is large).
+    if (decodedCache.size > 24) {
+      const oldest = decodedCache.keys().next().value;
+      if (oldest !== undefined) {
+        decodedCache.delete(oldest);
+        for (const k of [...cache.keys()]) {
+          if (k.startsWith(oldest.split("|")[0] + "|")) cache.delete(k);
+        }
+      }
+    }
   }
-  if (signal?.aborted) return null;
 
   const clipBuffer = sliceClipBuffer(decoded, inPoint, outPoint);
   const ch = clipBuffer.getChannelData(0);

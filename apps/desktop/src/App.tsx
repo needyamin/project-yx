@@ -10,7 +10,7 @@ import { TopMenubar } from "./layout/TopMenubar";
 import { checkForAppUpdate } from "./update/checkUpdate";
 import { UpdateDialog } from "./update/UpdateDialog";
 import { ClipMonitor } from "./monitors/ClipMonitor";
-import { ProjectMonitor, type PreviewAspect } from "./monitors/ProjectMonitor";
+import { ProjectMonitor, type PreviewAspect, type PreviewMode } from "./monitors/ProjectMonitor";
 import { EffectInspector } from "./effects/EffectInspector";
 import {
   EFFECT_CATALOG,
@@ -71,8 +71,9 @@ const MEDIA_EXTENSIONS = [
 
 const UPSERT_FILTER_KINDS = new Set(["denoise", "pitch", "volume"]);
 
-/** UI playhead updates while playing (ms). Keep media clock on playheadRef. */
-const PLAYHEAD_UI_MS = 80;
+/** React-state playhead refresh while playing (the live playhead is moved
+ * imperatively every frame; this only feeds timecode/sliders). */
+const PLAYHEAD_UI_MS = 250;
 
 type UnderPlayhead = NonNullable<ReturnType<typeof clipAtPlayhead>>;
 
@@ -86,6 +87,19 @@ const FILTERS = EFFECT_CATALOG.map((e) => ({
 function isMediaPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return (MEDIA_EXTENSIONS as readonly string[]).includes(ext);
+}
+
+/** Media-file time for timeline position t within a clip (handles speed + reverse). */
+function mediaTimeForClip(
+  clip: { start: number; in_point: number; out_point: number; reverse?: boolean; speed?: number },
+  t: number,
+): number {
+  const speed = clipSpeed(clip);
+  const local = t - clip.start;
+  const media = clip.reverse
+    ? clip.out_point - local * speed
+    : clip.in_point + local * speed;
+  return Math.max(clip.in_point, Math.min(media, clip.out_point - 0.01));
 }
 
 /** Reuse prior {track,clip} when still the same clip object (avoids effect thrash). */
@@ -114,6 +128,7 @@ function stableUnderPlayhead(
 
 function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const shadowVideoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const resumePlayRef = useRef(false);
   const transitioningRef = useRef(false);
@@ -122,10 +137,14 @@ function App() {
   const reverseRafRef = useRef(0);
   const gapRafRef = useRef(0);
   const playheadUiTimer = useRef(0);
+  const movePlayheadRef = useRef<((t: number) => void) | null>(null);
+  const previewModeRef = useRef<PreviewMode>("empty");
   const videoUnderCache = useRef<UnderPlayhead | null>(null);
   const audioUnderCache = useRef<UnderPlayhead | null>(null);
   const videoUnderRef = useRef<UnderPlayhead | null>(null);
   const audioUnderRef = useRef<UnderPlayhead | null>(null);
+  const monitorVolumeRef = useRef(1);
+  const monitorMutedRef = useRef(false);
   const lastVideoStyle = useRef({
     filter: "",
     transform: "",
@@ -144,7 +163,6 @@ function App() {
   const [boot, setBoot] = useState<BootInfo | null>(null);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const timelineRef = useRef<Timeline | null>(null);
-  timelineRef.current = timeline;
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
@@ -155,8 +173,8 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
-  playingRef.current = playing;
-  playheadRef.current = playhead;
+  /** Bumped whenever the monitor's active video element changes (buffer swap). */
+  const [videoEpoch, setVideoEpoch] = useState(0);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewAspect, setPreviewAspect] = useState<PreviewAspect>("landscape");
   const [exportOpen, setExportOpen] = useState(false);
@@ -171,6 +189,19 @@ function App() {
   const [advancedAudio, setAdvancedAudio] = useState<AdvancedAudioTarget | null>(null);
   const [advancedVideo, setAdvancedVideo] = useState<AdvancedVideoTarget | null>(null);
 
+  // Refs used inside event handlers / animation loops are synced in effects,
+  // never during render (safe under concurrent rendering).
+  useEffect(() => {
+    timelineRef.current = timeline;
+  }, [timeline]);
+  useEffect(() => {
+    playingRef.current = playing;
+  }, [playing]);
+  useEffect(() => {
+    monitorVolumeRef.current = monitorVolume;
+    monitorMutedRef.current = monitorMuted;
+  }, [monitorVolume, monitorMuted]);
+
   const refreshBoot = useCallback(async () => {
     const info = await invoke<BootInfo>("get_boot_info");
     setBoot(info);
@@ -181,6 +212,26 @@ function App() {
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
+
+  // Background proxy finished → hot-swap timeline clips onto the proxy so
+  // playback gets smoother without any user action.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ sourcePath: string; proxyPath: string }>("proxy-ready", (event) => {
+      const { sourcePath, proxyPath } = event.payload;
+      void invoke<Timeline>("swap_timeline_media", { sourcePath, proxyPath })
+        .then((next) => {
+          setTimeline(normalizeTimeline(next));
+          setStatus("Proxy ready — preview now plays the proxy file");
+        })
+        .catch(() => undefined);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   // Silent update check after launch.
   useEffect(() => {
@@ -237,14 +288,22 @@ function App() {
     () => stableUnderPlayhead(timeline, playhead, "audio", audioUnderCache),
     [timeline, playhead],
   );
-  videoUnderRef.current = videoUnderPlayhead;
-  audioUnderRef.current = audioUnderPlayhead;
 
-  const previewMode = useMemo(() => {
-    if (videoUnderPlayhead) return "video" as const;
-    if (audioUnderPlayhead) return "audio" as const;
-    return "empty" as const;
+  useEffect(() => {
+    videoUnderRef.current = videoUnderPlayhead;
+    audioUnderRef.current = audioUnderPlayhead;
+    previewModeRef.current = videoUnderPlayhead
+      ? "video"
+      : audioUnderPlayhead
+        ? "audio"
+        : "empty";
   }, [videoUnderPlayhead, audioUnderPlayhead]);
+
+  const previewMode: PreviewMode = videoUnderPlayhead
+    ? "video"
+    : audioUnderPlayhead
+      ? "audio"
+      : "empty";
 
   const previewPath = useMemo(() => {
     if (previewMode === "video") return videoUnderPlayhead?.clip.media_path ?? null;
@@ -294,51 +353,66 @@ function App() {
     }
   }, [previewPath, previewSrc]);
 
-  // Load media into the project monitor elements without flickering on splits of same media
+  /**
+   * Load media into the project monitor.
+   *
+   * Video sources load into the hidden buffer element and are revealed only
+   * after `loadedmetadata`, then the front/back roles swap — cuts between
+   * different files no longer tear down the playing decoder.
+   */
   useEffect(() => {
-    const video = videoRef.current;
     const audio = audioRef.current;
+    const front = videoRef.current;
+    const back = shadowVideoRef.current;
     const shouldResume = resumePlayRef.current;
     resumePlayRef.current = false;
 
     if (previewMode === "empty") {
-      if (video && !video.paused) video.pause();
+      if (front && !front.paused) front.pause();
+      if (back && !back.paused) back.pause();
       if (audio && !audio.paused) audio.pause();
       return;
     }
     if (previewMode === "audio") {
-      if (video && !video.paused) video.pause();
+      if (front && !front.paused) front.pause();
+      if (back && !back.paused) back.pause();
     }
 
-    // Check if the video or audio elements already have these exact sources loaded
-    const videoCurrentSrc = video?.getAttribute("src");
-    const audioCurrentSrc = audio?.getAttribute("src");
-    const videoNeedsChange =
-      previewMode === "video" && video && previewSrc && videoCurrentSrc !== previewSrc;
     const wantAudioSrc = timelineAudioSrc ?? (previewMode === "audio" ? previewSrc : null);
-    const audioNeedsChange = Boolean(
-      wantAudioSrc && audio && audioCurrentSrc !== wantAudioSrc,
+    const needVideoLoad =
+      previewMode === "video" &&
+      !!previewSrc &&
+      front?.getAttribute("src") !== previewSrc &&
+      back?.getAttribute("src") !== previewSrc;
+    const needAudioLoad = Boolean(
+      wantAudioSrc && audio && audio.getAttribute("src") !== wantAudioSrc,
     );
 
-    // If sources have not changed, do NOT unload or reload the media!
-    if (!videoNeedsChange && !audioNeedsChange) {
-      if (previewMode === "video" && video) {
-        const videoHit = videoUnderRef.current;
-        if (videoHit) {
-          const t = playheadRef.current;
-          const speed = clipSpeed(videoHit.clip);
-          const local = videoHit.clip.in_point + (t - videoHit.clip.start) * speed;
-          const wantTime = Math.max(
-            videoHit.clip.in_point,
-            Math.min(local, videoHit.clip.out_point - 0.01),
-          );
-          // Only seek if out of sync by >0.15s (prevents micro-stutter when playing through splits)
-          if (Math.abs(video.currentTime - wantTime) > 0.15) {
-            video.currentTime = wantTime;
+    const syncAudioLocal = () => {
+      const audioHit = audioUnderRef.current;
+      if (!audio || !audioHit || !wantAudioSrc) return;
+      const t = playheadRef.current;
+      audio.currentTime = Math.max(
+        audioHit.clip.in_point,
+        Math.min(audioHit.clip.in_point + (t - audioHit.clip.start), audioHit.clip.out_point - 0.01),
+      );
+    };
+
+    if (!needVideoLoad && !needAudioLoad) {
+      // Sources already loaded — seek only when out of sync (no reload).
+      if (previewMode === "video" && front) {
+        const hit = videoUnderRef.current;
+        if (hit) {
+          const want = mediaTimeForClip(hit.clip, playheadRef.current);
+          if (Math.abs(front.currentTime - want) > 0.15) {
+            front.currentTime = want;
           }
         }
-        if (shouldResume && video.paused) {
-          void video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+        if (shouldResume && front.paused) {
+          void front
+            .play()
+            .then(() => setPlaying(true))
+            .catch(() => setPlaying(false));
           if (timelineAudioSrc && audio && audio.paused) {
             void audio.play().catch(() => undefined);
           }
@@ -351,54 +425,60 @@ function App() {
       setPlaying(false);
     }
 
-    const syncAudioLocal = () => {
-      const audioHit = audioUnderRef.current;
-      if (!audio || !audioHit || !timelineAudioSrc) return;
-      const t = playheadRef.current;
-      const local = audioHit.clip.in_point + (t - audioHit.clip.start);
-      audio.currentTime = Math.max(
-        audioHit.clip.in_point,
-        Math.min(local, audioHit.clip.out_point - 0.01),
-      );
-    };
-
-    if (previewMode === "video" && video && previewSrc && videoNeedsChange) {
-      video.src = previewSrc;
-      video.muted = true;
-      video.load();
-      if (timelineAudioSrc && audio && audioCurrentSrc !== timelineAudioSrc) {
-        audio.src = timelineAudioSrc;
+    if (needVideoLoad && previewMode === "video" && previewSrc && front && back) {
+      if (needAudioLoad && audio && wantAudioSrc) {
+        audio.src = wantAudioSrc;
         audio.load();
       }
+      // Buffer the new source in the hidden element.
+      back.src = previewSrc;
+      back.muted = true;
+      back.load();
       const onMeta = () => {
-        const videoHit = videoUnderRef.current;
-        if (videoHit) {
-          const t = playheadRef.current;
-          const local = videoHit.clip.in_point + (t - videoHit.clip.start);
-          video.currentTime = Math.max(
-            videoHit.clip.in_point,
-            Math.min(local, videoHit.clip.out_point - 0.01),
-          );
+        const hit = videoUnderRef.current;
+        if (hit) {
+          back.currentTime = mediaTimeForClip(hit.clip, playheadRef.current);
         }
         syncAudioLocal();
+        // Carry over effect CSS, then swap front/back roles.
+        back.style.filter = front.style.filter;
+        back.style.transform = front.style.transform;
+        back.style.opacity = front.style.opacity;
+        back.style.clipPath = front.style.clipPath;
+        back.classList.remove("is-back");
+        back.classList.add("is-front");
+        front.classList.remove("is-front");
+        front.classList.add("is-back");
+        // Reassign roles BEFORE pausing the old element so its pause event is
+        // recognized as stale (isActiveElement guard) at any load speed.
+        videoRef.current = back;
+        shadowVideoRef.current = front;
+        if (!front.paused) front.pause();
+        setVideoEpoch((e) => e + 1);
         if (shouldResume || playingRef.current) {
-          void video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
-          if (timelineAudioSrc && audio) {
+          void back
+            .play()
+            .then(() => setPlaying(true))
+            .catch(() => setPlaying(false));
+          if (wantAudioSrc && audio) {
             void audio.play().catch(() => undefined);
           }
         }
       };
-      video.addEventListener("loadedmetadata", onMeta, { once: true });
-      return () => video.removeEventListener("loadedmetadata", onMeta);
+      back.addEventListener("loadedmetadata", onMeta, { once: true });
+      return () => back.removeEventListener("loadedmetadata", onMeta);
     }
 
-    if (previewMode === "audio" && audio && wantAudioSrc && audioNeedsChange) {
+    if (previewMode === "audio" && needAudioLoad && audio && wantAudioSrc) {
       audio.src = wantAudioSrc;
       audio.load();
       const onMeta = () => {
         syncAudioLocal();
         if (shouldResume || playingRef.current) {
-          void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+          void audio
+            .play()
+            .then(() => setPlaying(true))
+            .catch(() => setPlaying(false));
         }
       };
       audio.addEventListener("loadedmetadata", onMeta, { once: true });
@@ -409,6 +489,8 @@ function App() {
   const commitPlayhead = useCallback((t: number, immediate = false) => {
     const next = Math.max(0, t);
     playheadRef.current = next;
+    // Live playhead moves with zero React involvement.
+    movePlayheadRef.current?.(next);
     if (immediate || !playingRef.current) {
       window.clearTimeout(playheadUiTimer.current);
       playheadUiTimer.current = 0;
@@ -426,110 +508,135 @@ function App() {
     return () => window.clearTimeout(playheadUiTimer.current);
   }, []);
 
+  /** Master playback clock: one rAF loop reads the media element per frame. */
+  useEffect(() => {
+    if (!playing || previewMode === "empty") return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      if (!playingRef.current) return;
+      const mode = previewModeRef.current;
+      const active = mode === "video" ? videoRef.current : audioRef.current;
+      if (!active) return;
+      // Paused media means either reverse playback (own stepper drives the
+      // playhead) or a pending buffered swap — the media clock is stale, so
+      // skip instead of corrupting the playhead with a frozen currentTime.
+      if (active.paused) return;
+      const hit = mode === "video" ? videoUnderRef.current : audioUnderRef.current;
+      if (!hit) return;
+
+      const speed = clipSpeed(hit.clip);
+      const reversed = mode === "video" && !!hit.clip.reverse;
+      const localMedia = reversed
+        ? hit.clip.out_point - active.currentTime
+        : active.currentTime - hit.clip.in_point;
+      const timelineTime = hit.clip.start + localMedia / speed;
+      commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
+
+      // Keep A-track audio locked to the video clock.
+      const audio = audioRef.current;
+      const audioHit = audioUnderRef.current;
+      if (mode === "video" && audio && audioHit && !audio.paused) {
+        const pitchRate = previewPitchRate(
+          (audioHit.clip.filters ?? []) as FilterInstance[],
+        );
+        if (Math.abs(pitchRate - 1) < 0.02) {
+          const want = audioHit.clip.in_point + (timelineTime - audioHit.clip.start);
+          if (Math.abs(audio.currentTime - want) > 0.12) {
+            audio.currentTime = Math.max(
+              audioHit.clip.in_point,
+              Math.min(want, audioHit.clip.out_point - 0.01),
+            );
+          }
+        }
+      }
+
+      // Cut / gap / end-of-clip handling.
+      const clipEnd = hit.clip.start + clipTimelineDuration(hit.clip);
+      if (
+        timelineTime >= clipEnd - 0.02 ||
+        active.currentTime >= hit.clip.out_point - 0.02
+      ) {
+        const tl = timelineRef.current;
+        const next = tl
+          ? nextClipAfter(tl, clipEnd, mode === "video" ? "video" : "audio")
+          : null;
+        if (next && next.clip.id !== hit.clip.id) {
+          const isSameMedia = next.clip.media_path === hit.clip.media_path;
+          const isContiguousTimeline = next.clip.start <= clipEnd + 0.04;
+          const isContinuousMedia =
+            Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
+
+          if (isSameMedia && isContiguousTimeline && isContinuousMedia) {
+            // Seamless continuous playback across split point.
+            commitPlayhead(next.clip.start, false);
+            return;
+          } else if (isSameMedia && isContiguousTimeline) {
+            // Same media, in_point jumped: seek within the loaded file.
+            active.currentTime = next.clip.in_point;
+            commitPlayhead(next.clip.start, false);
+            return;
+          } else if (isContiguousTimeline) {
+            // Cut to different media — buffered swap (no decoder teardown stall).
+            resumePlayRef.current = playingRef.current;
+            transitioningRef.current = true;
+            active.pause();
+            audioRef.current?.pause();
+            commitPlayhead(next.clip.start, true);
+            window.setTimeout(() => {
+              transitioningRef.current = false;
+            }, 50);
+            return;
+          }
+        }
+
+        // Gap between clips or end of timeline.
+        const wasPlaying = playingRef.current;
+        transitioningRef.current = true;
+        active.pause();
+        audioRef.current?.pause();
+        window.setTimeout(() => {
+          transitioningRef.current = false;
+        }, 50);
+
+        commitPlayhead(clipEnd, true);
+
+        const dur = tl ? timelineDuration(tl, 10) : 10;
+        if (wasPlaying && clipEnd < dur - 0.05) {
+          playingRef.current = true;
+          setPlaying(true);
+        } else if (wasPlaying) {
+          playingRef.current = false;
+          setPlaying(false);
+        }
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, previewMode, commitPlayhead]);
+
+  // Media element state listeners (play/pause/error). Re-attached when the
+  // active video element changes (buffer swap) via videoEpoch.
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
     const active = previewMode === "video" ? video : previewMode === "audio" ? audio : null;
     if (!active) return;
 
-    const onTime = () => {
-      const hit =
-        previewMode === "video" ? videoUnderRef.current : audioUnderRef.current;
-      if (hit) {
-        const speed = clipSpeed(hit.clip);
-        const reversed = previewMode === "video" && !!hit.clip.reverse;
-        const localMedia = reversed
-          ? hit.clip.out_point - active.currentTime
-          : active.currentTime - hit.clip.in_point;
-        const timelineTime = hit.clip.start + localMedia / speed;
-        commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
-        // Keep A-track audio locked to the playhead while video drives clock.
-        // Skip hard resync when pitch preview changes playbackRate (would chop).
-        const audioHit = audioUnderRef.current;
-        if (previewMode === "video" && audio && audioHit && !audio.paused) {
-          const pitchRate = previewPitchRate(
-            (audioHit.clip.filters ?? []) as FilterInstance[],
-          );
-          if (Math.abs(pitchRate - 1) < 0.02) {
-            const want =
-              audioHit.clip.in_point + (timelineTime - audioHit.clip.start);
-            if (Math.abs(audio.currentTime - want) > 0.12) {
-              audio.currentTime = Math.max(
-                audioHit.clip.in_point,
-                Math.min(want, audioHit.clip.out_point - 0.01),
-              );
-            }
-          }
-        }
-        const clipEnd = hit.clip.start + clipTimelineDuration(hit.clip);
-        if (timelineTime >= clipEnd - 0.02 || active.currentTime >= hit.clip.out_point - 0.02) {
-          const tl = timelineRef.current;
-          const next =
-            tl != null
-              ? nextClipAfter(tl, clipEnd, previewMode === "video" ? "video" : "audio")
-              : null;
-          if (next && next.clip.id !== hit.clip.id) {
-            const isSameMedia = next.clip.media_path === hit.clip.media_path;
-            const isContiguousTimeline = next.clip.start <= clipEnd + 0.04;
-            const isContinuousMedia = Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
+    const isActiveElement = (ev: Event) =>
+      ev.target ===
+      (previewModeRef.current === "video" ? videoRef.current : audioRef.current);
 
-            if (isSameMedia && isContiguousTimeline && isContinuousMedia) {
-              // Seamless continuous playback across split point:
-              // Keep playing smoothly without pausing or reloading!
-              commitPlayhead(next.clip.start, false);
-              return;
-            } else if (isSameMedia && isContiguousTimeline) {
-              // Same media, but in_point jumped (cut section): seek smoothly within loaded video
-              active.currentTime = next.clip.in_point;
-              commitPlayhead(next.clip.start, false);
-              return;
-            } else if (isContiguousTimeline) {
-              // Contiguous cut of different media
-              resumePlayRef.current = !active.paused || playingRef.current;
-              transitioningRef.current = true;
-              active.pause();
-              audio?.pause();
-              commitPlayhead(next.clip.start, true);
-              window.setTimeout(() => {
-                transitioningRef.current = false;
-              }, 50);
-              return;
-            }
-          }
-
-          // Gap between clips or end of timeline:
-          // Do NOT jump across the gap. Pause active media and let the gap playback
-          // ticker drive the playhead smoothly across the gap showing a blank/black screen!
-          const wasPlaying = playingRef.current;
-          transitioningRef.current = true;
-          active.pause();
-          audio?.pause();
-          window.setTimeout(() => {
-            transitioningRef.current = false;
-          }, 50);
-
-          commitPlayhead(clipEnd, true);
-
-          const dur = tl ? timelineDuration(tl, 10) : 10;
-          if (wasPlaying && clipEnd < dur - 0.05) {
-            playingRef.current = true;
-            setPlaying(true);
-          } else if (wasPlaying) {
-            playingRef.current = false;
-            setPlaying(false);
-          }
-        }
-      } else {
-        commitPlayhead(active.currentTime, false);
-      }
-    };
-    const onPlay = () => {
+    const onPlay = (ev: Event) => {
+      if (!isActiveElement(ev)) return;
       setPlaying(true);
       if (previewMode === "video" && audio && timelineAudioSrc && audio.paused) {
         void audio.play().catch(() => undefined);
       }
     };
-    const onPause = () => {
+    const onPause = (ev: Event) => {
+      // Ignore pause events from the retired buffer element during a swap.
+      if (!isActiveElement(ev)) return;
       if (transitioningRef.current) return;
       cancelAnimationFrame(reverseRafRef.current);
       reverseRafRef.current = 0;
@@ -540,21 +647,22 @@ function App() {
       audio?.pause();
       commitPlayhead(playheadRef.current, true);
     };
-    const onErr = () => setPreviewError("Could not load preview.");
+    const onErr = (ev: Event) => {
+      if (!isActiveElement(ev)) return;
+      setPreviewError("Could not load preview.");
+    };
 
-    active.addEventListener("timeupdate", onTime);
     active.addEventListener("play", onPlay);
     active.addEventListener("pause", onPause);
     active.addEventListener("error", onErr);
     return () => {
-      active.removeEventListener("timeupdate", onTime);
       active.removeEventListener("play", onPlay);
       active.removeEventListener("pause", onPause);
       active.removeEventListener("error", onErr);
     };
-  }, [previewMode, timelineAudioSrc, commitPlayhead]);
+  }, [previewMode, timelineAudioSrc, commitPlayhead, videoEpoch]);
 
-  // Gap playback ticker: drives playhead smoothly across gaps at 1x speed showing blank/black screen
+  // Gap playback ticker: drives playhead across gaps at 1x (blank frame).
   useEffect(() => {
     if (!playing || previewMode === "video") {
       if (gapRafRef.current) {
@@ -593,7 +701,7 @@ function App() {
         return;
       }
 
-      // Still in a gap: advance playhead
+      // Still in a gap: advance playhead (imperative + throttled state).
       commitPlayhead(nextPh, false);
 
       const aClip = tl ? clipAtPlayhead(tl, nextPh, "audio") : null;
@@ -788,7 +896,7 @@ function App() {
         setStatus("Unlinked");
         return;
       }
-      const partner = findLinkPartner(timeline, selectedClip.clip, playhead);
+      const partner = findLinkPartner(timeline, selectedClip.clip, playheadRef.current);
       if (!partner) {
         setStatus("No audio/video partner found to link");
         return;
@@ -989,7 +1097,7 @@ function App() {
     let resolvedFromVideo = false;
     // Video A/V pairs: edit the linked audio clip, never the video track.
     if (hit && hit.clip.role === "video" && timeline) {
-      const partner = findLinkPartner(timeline, hit.clip, playhead);
+      const partner = findLinkPartner(timeline, hit.clip, playheadRef.current);
       if (partner && partner.role === "audio") {
         hit = findClipById(partner.id);
         resolvedFromVideo = true;
@@ -1442,7 +1550,7 @@ function App() {
       setTimeline(
         normalizeTimeline(
           await invoke<Timeline>("add_marker", {
-            time: playhead,
+            time: playheadRef.current,
             label: `M${(timeline?.markers?.length ?? 0) + 1}`,
           }),
         ),
@@ -1458,12 +1566,12 @@ function App() {
       setTimeline(
         normalizeTimeline(
           await invoke<Timeline>("set_zone", {
-            zoneIn: playhead,
+            zoneIn: playheadRef.current,
             zoneOut: timeline?.zone_out ?? null,
           }),
         ),
       );
-      setStatus(`Zone in ${playhead.toFixed(2)}s`);
+      setStatus(`Zone in ${playheadRef.current.toFixed(2)}s`);
     } catch (e) {
       setStatus(String(e));
     }
@@ -1475,11 +1583,11 @@ function App() {
         normalizeTimeline(
           await invoke<Timeline>("set_zone", {
             zoneIn: timeline?.zone_in ?? null,
-            zoneOut: playhead,
+            zoneOut: playheadRef.current,
           }),
         ),
       );
-      setStatus(`Zone out ${playhead.toFixed(2)}s`);
+      setStatus(`Zone out ${playheadRef.current.toFixed(2)}s`);
     } catch (e) {
       setStatus(String(e));
     }
@@ -1506,15 +1614,18 @@ function App() {
   }
 
   async function splitAtPlayhead() {
-    if (!timeline) return;
+    const ph = playheadRef.current;
+    const tl = timelineRef.current;
+    if (!tl) return;
     const under =
-      clipAtPlayhead(timeline, playhead, "video") ??
-      clipAtPlayhead(timeline, playhead, "audio");
+      clipAtPlayhead(tl, ph, "video") ??
+      clipAtPlayhead(tl, ph, "audio");
+    const sel = selectedClip;
     const selectedUnder =
-      selectedClip &&
-      playhead > selectedClip.clip.start &&
-      playhead < selectedClip.clip.start + clipTimelineDuration(selectedClip.clip)
-        ? selectedClip.clip
+      sel &&
+      ph > sel.clip.start &&
+      ph < sel.clip.start + clipTimelineDuration(sel.clip)
+        ? sel.clip
         : null;
     const clip = selectedUnder ?? under?.clip;
     if (!clip) {
@@ -1526,16 +1637,82 @@ function App() {
         normalizeTimeline(
           await invoke<Timeline>("split_clip_at", {
             clipId: clip.id,
-            at: playhead,
+            at: ph,
             syncLinked: true,
           }),
         ),
       );
-      setStatus(`Split at ${playhead.toFixed(2)}s`);
+      setStatus(`Split at ${ph.toFixed(2)}s`);
     } catch (e) {
       setStatus(String(e));
     }
   }
+
+  const applyPreviewFades = useCallback(
+    (
+      t: number,
+      videoClip: {
+        start: number;
+        in_point: number;
+        out_point: number;
+        fade_in?: number;
+        fade_out?: number;
+        filters?: FilterInstance[];
+      } | null,
+      audioClip: {
+        start: number;
+        in_point: number;
+        out_point: number;
+        fade_in?: number;
+        fade_out?: number;
+        filters?: FilterInstance[];
+      } | null,
+    ) => {
+      const video = videoRef.current;
+      const audio = audioRef.current;
+      if (video) {
+        const fade = videoClip ? clipFadeGain(videoClip, t) : 1;
+        const style = previewVideoStyle(
+          (videoClip?.filters ?? []) as FilterInstance[],
+          fade,
+        );
+        const opacity = String(style.opacity);
+        const clipPath = style.clipPath ?? "";
+        const prev = lastVideoStyle.current;
+        if (prev.filter !== style.filter) {
+          video.style.filter = style.filter;
+          prev.filter = style.filter;
+        }
+        if (prev.transform !== style.transform) {
+          video.style.transform = style.transform;
+          prev.transform = style.transform;
+        }
+        if (prev.opacity !== opacity) {
+          video.style.opacity = opacity;
+          prev.opacity = opacity;
+        }
+        if (prev.clipPath !== clipPath) {
+          video.style.clipPath = clipPath;
+          prev.clipPath = clipPath;
+        }
+      }
+      if (audio) {
+        const fade = audioClip ? clipFadeGain(audioClip, t) : 1;
+        const vol = monitorMutedRef.current
+          ? 0
+          : Math.min(
+              1,
+              previewVolumeGain((audioClip?.filters ?? []) as FilterInstance[], fade) *
+                monitorVolumeRef.current,
+            );
+        if (Math.abs(lastAudioVolume.current - vol) > 0.001) {
+          audio.volume = vol;
+          lastAudioVolume.current = vol;
+        }
+      }
+    },
+    [],
+  );
 
   function togglePlay() {
     const video = videoRef.current;
@@ -1558,14 +1735,15 @@ function App() {
       return;
     }
 
-    const dur = timeline ? timelineDuration(timeline, 10) : 10;
+    const tl = timelineRef.current;
+    const dur = tl ? timelineDuration(tl, 10) : 10;
     if (playheadRef.current >= dur - 0.05) {
       commitPlayhead(0, true);
     }
 
     const curTime = playheadRef.current;
-    const hit = timeline ? clipAtPlayhead(timeline, curTime, "video") : null;
-    const audioHit = timeline ? clipAtPlayhead(timeline, curTime, "audio") : null;
+    const hit = tl ? clipAtPlayhead(tl, curTime, "video") : null;
+    const audioHit = tl ? clipAtPlayhead(tl, curTime, "audio") : null;
 
     if (hit && video && previewSrc) {
       video.muted = true;
@@ -1573,12 +1751,11 @@ function App() {
 
       if (needsStepped) {
         const clip = hit.clip;
-        const speed = clipSpeed(clip);
         const wall0 = performance.now();
         const ph0 = playheadRef.current;
         const step = () => {
           if (!playingRef.current) return;
-          const elapsed = ((performance.now() - wall0) / 1000);
+          const elapsed = (performance.now() - wall0) / 1000;
           const nextPh = ph0 + elapsed;
           const end = clip.start + clipTimelineDuration(clip);
           if (nextPh >= end - 0.02) {
@@ -1591,14 +1768,7 @@ function App() {
             return;
           }
           commitPlayhead(nextPh, false);
-          const local = nextPh - clip.start;
-          const media = clip.reverse
-            ? clip.out_point - local * speed
-            : clip.in_point + local * speed;
-          video.currentTime = Math.max(
-            clip.in_point,
-            Math.min(media, clip.out_point - 0.01),
-          );
+          video.currentTime = mediaTimeForClip(clip, nextPh);
           applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
           reverseRafRef.current = requestAnimationFrame(step);
         };
@@ -1643,100 +1813,33 @@ function App() {
     }
   }
 
-  function seekTimeline(t: number) {
-    const next = Math.max(0, t);
-    commitPlayhead(next, true);
-    const videoHit = timeline ? clipAtPlayhead(timeline, next, "video") : null;
-    const audioHit = timeline ? clipAtPlayhead(timeline, next, "audio") : null;
-    if (videoHit && videoRef.current) {
-      videoRef.current.muted = true;
-      const local = next - videoHit.clip.start;
-      const speed = clipSpeed(videoHit.clip);
-      const media = videoHit.clip.reverse
-        ? videoHit.clip.out_point - local * speed
-        : videoHit.clip.in_point + local * speed;
-      videoRef.current.currentTime = Math.max(
-        videoHit.clip.in_point,
-        Math.min(media, videoHit.clip.out_point - 0.01),
-      );
-      try {
-        videoRef.current.playbackRate = videoHit.clip.reverse ? 1 : speed;
-      } catch {
-        /* ignore */
+  const seekTimeline = useCallback(
+    (t: number) => {
+      const next = Math.max(0, t);
+      commitPlayhead(next, true);
+      const tl = timelineRef.current;
+      const videoHit = tl ? clipAtPlayhead(tl, next, "video") : null;
+      const audioHit = tl ? clipAtPlayhead(tl, next, "audio") : null;
+      if (videoHit && videoRef.current) {
+        videoRef.current.muted = true;
+        videoRef.current.currentTime = mediaTimeForClip(videoHit.clip, next);
+        try {
+          videoRef.current.playbackRate = videoHit.clip.reverse ? 1 : clipSpeed(videoHit.clip);
+        } catch {
+          /* ignore */
+        }
+      } else if (videoRef.current && !videoRef.current.paused) {
+        videoRef.current.pause();
       }
-    } else if (videoRef.current && !videoRef.current.paused) {
-      videoRef.current.pause();
-    }
-    if (audioHit && audioRef.current) {
-      audioRef.current.currentTime = audioHit.clip.in_point + (next - audioHit.clip.start);
-    } else if (audioRef.current && !audioRef.current.paused) {
-      audioRef.current.pause();
-    }
-    applyPreviewFades(next, videoHit?.clip ?? null, audioHit?.clip ?? null);
-  }
-
-  function applyPreviewFades(
-    t: number,
-    videoClip: {
-      start: number;
-      in_point: number;
-      out_point: number;
-      fade_in?: number;
-      fade_out?: number;
-      filters?: FilterInstance[];
-    } | null,
-    audioClip: {
-      start: number;
-      in_point: number;
-      out_point: number;
-      fade_in?: number;
-      fade_out?: number;
-      filters?: FilterInstance[];
-    } | null,
-  ) {
-    const video = videoRef.current;
-    const audio = audioRef.current;
-    if (video) {
-      const fade = videoClip ? clipFadeGain(videoClip, t) : 1;
-      const style = previewVideoStyle(
-        (videoClip?.filters ?? []) as FilterInstance[],
-        fade,
-      );
-      const opacity = String(style.opacity);
-      const clipPath = style.clipPath ?? "";
-      const prev = lastVideoStyle.current;
-      if (prev.filter !== style.filter) {
-        video.style.filter = style.filter;
-        prev.filter = style.filter;
+      if (audioHit && audioRef.current) {
+        audioRef.current.currentTime = audioHit.clip.in_point + (next - audioHit.clip.start);
+      } else if (audioRef.current && !audioRef.current.paused) {
+        audioRef.current.pause();
       }
-      if (prev.transform !== style.transform) {
-        video.style.transform = style.transform;
-        prev.transform = style.transform;
-      }
-      if (prev.opacity !== opacity) {
-        video.style.opacity = opacity;
-        prev.opacity = opacity;
-      }
-      if (prev.clipPath !== clipPath) {
-        video.style.clipPath = clipPath;
-        prev.clipPath = clipPath;
-      }
-    }
-    if (audio) {
-      const fade = audioClip ? clipFadeGain(audioClip, t) : 1;
-      const vol = monitorMuted
-        ? 0
-        : Math.min(
-            1,
-            previewVolumeGain((audioClip?.filters ?? []) as FilterInstance[], fade) *
-              monitorVolume,
-          );
-      if (Math.abs(lastAudioVolume.current - vol) > 0.001) {
-        audio.volume = vol;
-        lastAudioVolume.current = vol;
-      }
-    }
-  }
+      applyPreviewFades(next, videoHit?.clip ?? null, audioHit?.clip ?? null);
+    },
+    [commitPlayhead, applyPreviewFades],
+  );
 
   // Pitch preview: set once when clip / pitch params change (not every playhead tick).
   const monitorPitchKey = useMemo(() => {
@@ -1767,52 +1870,85 @@ function App() {
       videoUnderPlayhead?.clip ?? null,
       audioUnderPlayhead?.clip ?? null,
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, monitorVolume, monitorMuted]);
+  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, applyPreviewFades]);
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts (latest handlers via ref — attach once).
+  const keyHandlersRef = useRef({
+    togglePlay,
+    onUndo,
+    onRedo,
+    splitAtPlayhead,
+    setTool,
+    setZoneIn,
+    setZoneOut,
+    onRemove,
+    seekTimeline,
+  });
+  useEffect(() => {
+    keyHandlersRef.current = {
+      togglePlay,
+      onUndo,
+      onRedo,
+      splitAtPlayhead,
+      setTool,
+      setZoneIn,
+      setZoneOut,
+      onRemove,
+      seekTimeline,
+    };
+  });
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      const h = keyHandlersRef.current;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
 
       if (e.code === "Space") {
         e.preventDefault();
-        togglePlay();
+        h.togglePlay();
       } else if ((e.ctrlKey || e.metaKey) && e.key === "z") {
         e.preventDefault();
-        void onUndo();
+        void h.onUndo();
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && e.key === "z"))) {
         e.preventDefault();
-        void onRedo();
+        void h.onRedo();
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "b" || e.key === "B")) {
         e.preventDefault();
-        void splitAtPlayhead();
+        void h.splitAtPlayhead();
       } else if (e.key === "s" || e.key === "S") {
-        setTool("select");
+        h.setTool("select");
       } else if (e.key === "x" || e.key === "X") {
-        setTool("razor");
+        h.setTool("razor");
       } else if (e.key === "m" || e.key === "M") {
-        setTool("spacer");
+        h.setTool("spacer");
       } else if (e.key === "y" || e.key === "Y") {
-        setTool("slip");
+        h.setTool("slip");
       } else if (e.key === "r" || e.key === "R") {
-        setTool("ripple");
+        h.setTool("ripple");
       } else if (e.key === "i" || e.key === "I") {
-        void setZoneIn();
+        void h.setZoneIn();
       } else if (e.key === "o" || e.key === "O") {
-        void setZoneOut();
+        void h.setZoneOut();
       } else if (e.key === "Delete" || e.key === "Backspace") {
-        void onRemove();
+        void h.onRemove();
       } else if (e.key === "ArrowLeft") {
-        seekTimeline(playheadRef.current - (e.shiftKey ? 1 : 1 / 30));
+        h.seekTimeline(playheadRef.current - (e.shiftKey ? 1 : 1 / 30));
       } else if (e.key === "ArrowRight") {
-        seekTimeline(playheadRef.current + (e.shiftKey ? 1 : 1 / 30));
+        h.seekTimeline(playheadRef.current + (e.shiftKey ? 1 : 1 / 30));
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
+
+  const handleTimelineUpdate = useCallback((t: Timeline) => {
+    setTimeline(normalizeTimeline(t));
+  }, []);
+
+  const handleRegisterPlayhead = useCallback((fn: ((t: number) => void) | null) => {
+    movePlayheadRef.current = fn;
+  }, []);
 
   if (!boot || !timeline) {
     return (
@@ -1880,7 +2016,7 @@ function App() {
               onImport={() => void onImport()}
               onAddToTimeline={(item) => void addMediaToTimeline(item)}
               onDropToTimeline={(item, clientX) => {
-                const start = timelineDropRef.current?.(clientX) ?? playhead;
+                const start = timelineDropRef.current?.(clientX) ?? playheadRef.current;
                 void addMediaToTimeline(item, start);
               }}
               onDropToClipMonitor={(item) => {
@@ -1968,6 +2104,7 @@ function App() {
             aspect={previewAspect}
             onAspect={setPreviewAspect}
             videoRef={videoRef}
+            shadowVideoRef={shadowVideoRef}
             audioRef={audioRef}
             onTogglePlay={togglePlay}
             onSeekRatio={(ratio) => seekTimeline(ratio * projectDuration)}
@@ -2011,11 +2148,12 @@ function App() {
             library={library}
             selectedClipId={selectedClipId}
             playhead={playhead}
+            playheadRef={playheadRef}
             tool={tool}
             status={status}
             tier={boot.policy.tier}
             onTool={setTool}
-            onTimeline={(t) => setTimeline(normalizeTimeline(t))}
+            onTimeline={handleTimelineUpdate}
             onSelectClip={setSelectedClipId}
             onSeek={seekTimeline}
             onStatus={setStatus}
@@ -2034,6 +2172,7 @@ function App() {
               viewControlsRef.current = api;
               if (api) setSnapOn(api.snap);
             }}
+            onRegisterPlayhead={handleRegisterPlayhead}
             onAdvancedAudio={(clipId, tab) => openAdvancedAudioForClip(clipId, tab)}
             onAdvancedVideo={(clipId) => openAdvancedVideoForClip(clipId)}
           />

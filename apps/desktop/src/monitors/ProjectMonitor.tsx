@@ -18,6 +18,8 @@ type Props = {
   aspect: PreviewAspect;
   onAspect: (a: PreviewAspect) => void;
   videoRef: RefObject<HTMLVideoElement | null>;
+  /** Hidden second video used to preload the next clip for gapless cuts. */
+  shadowVideoRef: RefObject<HTMLVideoElement | null>;
   audioRef: RefObject<HTMLAudioElement | null>;
   onTogglePlay: () => void;
   onSeekRatio: (ratio: number) => void;
@@ -25,13 +27,6 @@ type Props = {
   muted: boolean;
   onVolume: (v: number) => void;
   onMuted: (m: boolean) => void;
-  /** Live CSS preview matching export effects. */
-  videoStyle?: {
-    filter: string;
-    transform: string;
-    opacity: number;
-    clipPath?: string;
-  };
   cropTool?: boolean;
   onCropTool?: (on: boolean) => void;
   cropDraft?: CropRect | null;
@@ -54,6 +49,7 @@ export function ProjectMonitor({
   aspect,
   onAspect,
   videoRef,
+  shadowVideoRef,
   audioRef,
   onTogglePlay,
   onSeekRatio,
@@ -61,7 +57,6 @@ export function ProjectMonitor({
   muted,
   onVolume,
   onMuted,
-  videoStyle,
   cropTool = false,
   onCropTool,
   cropDraft,
@@ -310,18 +305,25 @@ export function ProjectMonitor({
         >
           <video
             ref={videoRef}
-            className="monitor-video"
+            className="monitor-video is-front"
             playsInline
             muted
             preload="metadata"
             onClick={onVideoClick}
             style={{
               display: previewMode === "video" && previewSrc ? "block" : "none",
-              filter: videoStyle?.filter,
-              transform: videoStyle?.transform,
-              opacity: videoStyle?.opacity ?? 1,
-              clipPath: videoStyle?.clipPath,
               cursor: chromakeyActive ? "crosshair" : undefined,
+            }}
+          />
+          {/* Buffer: preloads the next clip so cuts don't stall the pipeline. */}
+          <video
+            ref={shadowVideoRef}
+            className="monitor-video is-back"
+            playsInline
+            muted
+            preload="metadata"
+            style={{
+              display: previewMode === "video" && previewSrc ? "block" : "none",
             }}
           />
           {cropTool && previewMode === "video" && (

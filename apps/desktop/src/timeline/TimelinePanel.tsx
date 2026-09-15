@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type RefObject,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { subscribeBinDrag } from "../bin/binDrag";
-import { ClipBlock } from "./ClipBlock";
+import { ClipBlock, type ClipEditAction } from "./ClipBlock";
 import {
   TimelineContextMenu,
   type ContextMenuState,
@@ -19,8 +28,10 @@ import {
   type Clip,
   type EditMode,
   type LibraryItem,
+  type Obstacle,
   type PerformanceTier,
   type Timeline,
+  type TimelineMarker,
   type TimelineTool,
 } from "./types";
 import { useTimelineView } from "./useTimelineView";
@@ -39,6 +50,8 @@ type Props = {
   tool: TimelineTool;
   status: string;
   tier: PerformanceTier;
+  /** Live playhead source of truth — read in callbacks, never re-renders. */
+  playheadRef: RefObject<number>;
   onTool: (t: TimelineTool) => void;
   onTimeline: (t: Timeline) => void;
   onSelectClip: (id: string | null) => void;
@@ -64,6 +77,8 @@ type Props = {
       snap: boolean;
     } | null,
   ) => void;
+  /** Register the imperative playhead mover (called every animation frame). */
+  onRegisterPlayhead?: (fn: ((t: number) => void) | null) => void;
   library?: LibraryItem[];
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
@@ -76,6 +91,7 @@ export function TimelinePanel({
   tool,
   status,
   tier,
+  playheadRef,
   library = [],
   onTool,
   onTimeline,
@@ -92,6 +108,7 @@ export function TimelinePanel({
   onRedo,
   onRegisterDropResolver,
   onRegisterViewControls,
+  onRegisterPlayhead,
   onAdvancedAudio,
   onAdvancedVideo,
 }: Props) {
@@ -101,7 +118,6 @@ export function TimelinePanel({
   const headerDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   const [binDragOver, setBinDragOver] = useState(false);
-  const [rulerHoverTime, setRulerHoverTime] = useState<number | null>(null);
   const [binDropPreview, setBinDropPreview] = useState<{
     item: LibraryItem;
     start: number;
@@ -120,10 +136,56 @@ export function TimelinePanel({
   const duration = timelineDuration(timeline, 10);
   const view = useTimelineView(duration);
 
-  const trackClipObstacles = useMemo(() => {
-    const map = new Map<string, Array<{ id: string; start: number; duration: number }>>();
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  const timelineRef = useRef(timeline);
+  useEffect(() => {
+    timelineRef.current = timeline;
+  }, [timeline]);
+
+  /* ------------------------------------------------------------------ */
+  /* Memoized per-clip drag data + sorted snap anchors                   */
+  /* ------------------------------------------------------------------ */
+
+  const libIndex = useMemo(() => {
+    const m = new Map<string, LibraryItem>();
+    for (const item of library) {
+      m.set(item.path, item);
+      m.set(fileName(item.path), item);
+    }
+    return m;
+  }, [library]);
+
+  /** Sorted, de-duplicated snap anchors: clip edges, markers, zone, 0. */
+  const snapAnchors = useMemo(() => {
+    const pts: number[] = [0];
     for (const track of timeline.tracks) {
-      map.set(
+      if (track.hidden) continue;
+      for (const clip of track.clips) {
+        pts.push(clip.start, clip.start + clipTimelineDuration(clip));
+      }
+    }
+    for (const m of timeline.markers ?? []) pts.push(m.time);
+    if (timeline.zone_in != null) pts.push(timeline.zone_in);
+    if (timeline.zone_out != null) pts.push(timeline.zone_out);
+    pts.sort((a, b) => a - b);
+    return pts.filter((v, i) => i === 0 || v !== pts[i - 1]);
+  }, [timeline]);
+
+  const snapAnchorsRef = useRef<number[]>(snapAnchors);
+  useEffect(() => {
+    snapAnchorsRef.current = snapAnchors;
+  }, [snapAnchors]);
+
+  type ClipInfo = { obstacles: Obstacle[]; anchors: number[]; maxMediaDuration: number };
+  const clipInfo = useMemo(() => {
+    const map = new Map<string, ClipInfo>();
+    const trackObs = new Map<string, Array<{ id: string; start: number; duration: number }>>();
+    for (const track of timeline.tracks) {
+      trackObs.set(
         track.id,
         track.clips.map((c) => ({
           id: c.id,
@@ -132,8 +194,81 @@ export function TimelinePanel({
         })),
       );
     }
+    for (const track of timeline.tracks) {
+      const own = trackObs.get(track.id) ?? [];
+      for (const clip of track.clips) {
+        const obstacles: Obstacle[] = own
+          .filter((o) => o.id !== clip.id)
+          .map((o) => ({ start: o.start, duration: o.duration }));
+        if (clip.linked_clip_id) {
+          for (const [tid, obsList] of trackObs.entries()) {
+            if (tid !== track.id && obsList.some((o) => o.id === clip.linked_clip_id)) {
+              for (const o of obsList) {
+                if (o.id !== clip.linked_clip_id) {
+                  obstacles.push({ start: o.start, duration: o.duration });
+                }
+              }
+              break;
+            }
+          }
+        }
+        const ownStart = clip.start;
+        const ownEnd = clip.start + clipTimelineDuration(clip);
+        const libItem =
+          libIndex.get(clip.media_path) ?? libIndex.get(fileName(clip.media_path));
+        map.set(clip.id, {
+          obstacles,
+          anchors: snapAnchors.filter((a) => a !== ownStart && a !== ownEnd),
+          maxMediaDuration: libItem?.duration ?? Infinity,
+        });
+      }
+    }
     return map;
-  }, [timeline.tracks]);
+  }, [timeline, libIndex, snapAnchors]);
+
+  const selectedClip = useMemo(() => {
+    for (const track of timeline.tracks) {
+      const clip = track.clips.find((c) => c.id === selectedClipId);
+      if (clip) return clip;
+    }
+    return null;
+  }, [timeline, selectedClipId]);
+
+  /* ------------------------------------------------------------------ */
+  /* Imperative playhead — never re-renders while playing/scrubbing      */
+  /* ------------------------------------------------------------------ */
+
+  const playheadElsRef = useRef<Set<HTMLDivElement>>(new Set());
+  const registerPlayheadEl = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    playheadElsRef.current.add(el);
+    return () => {
+      playheadElsRef.current.delete(el);
+    };
+  }, []);
+  const movePlayhead = useCallback((t: number) => {
+    const x = Math.max(0, t) * viewRef.current.pxPerSec;
+    playheadElsRef.current.forEach((el) => {
+      el.style.left = `${x}px`;
+    });
+  }, []);
+
+  useEffect(() => {
+    onRegisterPlayhead?.(movePlayhead);
+    return () => onRegisterPlayhead?.(null);
+  }, [onRegisterPlayhead, movePlayhead]);
+
+  // Initial position + reposition after zoom (committed playhead; during
+  // playback the clock loop corrects on the next frame anyway).
+  useEffect(() => {
+    movePlayhead(playhead);
+    // Deliberately not keyed on `playhead` — the mover owns live updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [movePlayhead, view.pxPerSec]);
+
+  /* ------------------------------------------------------------------ */
+  /* Header resize                                                       */
+  /* ------------------------------------------------------------------ */
 
   const clampHeader = useCallback((w: number) => {
     return Math.max(HEADER_MIN, Math.min(HEADER_MAX, w));
@@ -148,10 +283,19 @@ export function TimelinePanel({
   }, [clampHeader]);
 
   useEffect(() => {
+    let raf = 0;
+    let latest = 0;
     function onMove(e: MouseEvent) {
       if (!headerDragRef.current) return;
-      const delta = e.clientX - headerDragRef.current.startX;
-      setHeaderPx(clampHeader(headerDragRef.current.startW + delta));
+      latest = e.clientX - headerDragRef.current.startX;
+      if (!raf) {
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          if (headerDragRef.current) {
+            setHeaderPx(clampHeader(headerDragRef.current.startW + latest));
+          }
+        });
+      }
     }
     function onUp() {
       headerDragRef.current = null;
@@ -162,36 +306,160 @@ export function TimelinePanel({
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      if (raf) cancelAnimationFrame(raf);
     };
   }, [clampHeader]);
 
-  const selectedClip = useMemo(() => {
-    for (const track of timeline.tracks) {
-      const clip = track.clips.find((c) => c.id === selectedClipId);
-      if (clip) return clip;
-    }
-    return null;
-  }, [timeline, selectedClipId]);
+  /* ------------------------------------------------------------------ */
+  /* Backend runs + optimistic edit dispatcher                           */
+  /* ------------------------------------------------------------------ */
 
-  const anchors = useMemo(() => {
-    const pts = [0, playhead];
-    for (const track of timeline.tracks) {
-      if (track.hidden) continue;
-      for (const clip of track.clips) {
-        pts.push(clip.start, clip.start + clipTimelineDuration(clip));
+  const run = useCallback(
+    async (cmd: string, args: Record<string, unknown>, okMsg?: string) => {
+      try {
+        const next = await invoke<Timeline>(cmd, args);
+        onTimeline(next);
+        if (okMsg) onStatus(okMsg);
+        return next;
+      } catch (e) {
+        const msg = String(e);
+        if (/no gap/i.test(msg)) onStatus("No gap at that position");
+        else onStatus(msg);
+        return null;
       }
-    }
-    return pts;
-  }, [timeline, playhead]);
+    },
+    [onTimeline, onStatus],
+  );
 
-  const zoneLeft =
-    timeline.zone_in != null && timeline.zone_out != null
-      ? Math.min(timeline.zone_in, timeline.zone_out)
-      : timeline.zone_in;
-  const zoneRight =
-    timeline.zone_in != null && timeline.zone_out != null
-      ? Math.max(timeline.zone_in, timeline.zone_out)
-      : timeline.zone_out;
+  /** Optimistic timeline clone with the target clip(s) updated. */
+  function optimisticUpdate(
+    tl: Timeline,
+    clipIds: string[],
+    update: (c: Clip) => Clip,
+  ): Timeline {
+    const ids = new Set(clipIds);
+    return {
+      ...tl,
+      tracks: tl.tracks.map((t) => {
+        if (!t.clips.some((c) => ids.has(c.id))) return t;
+        const updated = t.clips.map((c) => (ids.has(c.id) ? update(c) : c));
+        updated.sort((a, b) => a.start - b.start);
+        return { ...t, clips: updated };
+      }),
+    };
+  }
+
+  const editClip = useCallback(
+    async (action: ClipEditAction) => {
+      const tl = timelineRef.current;
+      if (!tl) return;
+      let clip: Clip | null = null;
+      for (const t of tl.tracks) {
+        const hit = t.clips.find((c) => c.id === action.clipId);
+        if (hit) {
+          clip = hit;
+          break;
+        }
+      }
+      if (!clip) return;
+      const linkedId = clip.linked_clip_id;
+      const targetIds = linkedId ? [clip.id, linkedId] : [clip.id];
+
+      switch (action.type) {
+        case "move": {
+          // Optimistic update removes drop snap-back; backend confirms after.
+          onTimeline(
+            optimisticUpdate(tl, targetIds, (c) => ({ ...c, start: action.newStart })),
+          );
+          try {
+            const next = await invoke<Timeline>("move_clip", {
+              clipId: action.clipId,
+              newStart: action.newStart,
+              syncLinked: true,
+            });
+            onTimeline(next);
+            onStatus(`Moved to ${formatTime(action.newStart)}`);
+          } catch (e) {
+            onStatus(String(e));
+          } finally {
+            setDragPreview(null);
+          }
+          return;
+        }
+        case "trim": {
+          const { inPoint, outPoint, keepEnd } = action;
+          const speed = clip.speed ?? 1;
+          const newDur = (outPoint - inPoint) / speed;
+          const applyOne = (c: Clip): Clip => {
+            const oldDur = clipTimelineDuration(c);
+            const newStart = keepEnd ? c.start + (oldDur - newDur) : c.start;
+            return {
+              ...c,
+              start: Math.max(0, newStart),
+              in_point: inPoint,
+              out_point: outPoint,
+            };
+          };
+          onTimeline(optimisticUpdate(tl, targetIds, applyOne));
+          setDragPreview(null);
+          void run("trim_clip", {
+            clipId: action.clipId,
+            inPoint,
+            outPoint,
+            keepEnd,
+            syncLinked: true,
+          });
+          return;
+        }
+        case "razor":
+          void run(
+            "split_clip_at",
+            { clipId: action.clipId, at: action.at, syncLinked: true },
+            `Cut at ${formatTime(action.at)}`,
+          );
+          return;
+        case "rippleTrim":
+          void run(
+            "ripple_trim",
+            {
+              clipId: action.clipId,
+              edge: action.edge,
+              newEdgeTime: action.newEdgeTime,
+              syncLinked: true,
+            },
+            `Ripple ${action.edge}`,
+          );
+          return;
+        case "slip":
+          void run(
+            "slip_clip",
+            {
+              clipId: action.clipId,
+              delta: action.delta,
+              syncLinked: true,
+            },
+            `Slip ${action.delta >= 0 ? "+" : ""}${action.delta.toFixed(2)}s`,
+          );
+          return;
+        case "fades":
+          void run(
+            "set_clip_fades",
+            {
+              clipId: action.clipId,
+              fadeIn: action.fadeIn,
+              fadeOut: action.fadeOut,
+            },
+            `Fade ${action.fadeIn.toFixed(2)}s / ${action.fadeOut.toFixed(2)}s`,
+          );
+          return;
+      }
+    },
+    [onTimeline, onStatus, run],
+  );
+
+  /* ------------------------------------------------------------------ */
+  /* Fit / zoom                                                          */
+  /* ------------------------------------------------------------------ */
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -213,6 +481,7 @@ export function TimelinePanel({
       if (lastW > 0 && Math.abs(w - lastW) < 12) return;
       lastW = w;
       view.zoomFit(w);
+      el.scrollLeft = 0;
     };
 
     fitIfAllowed();
@@ -222,26 +491,6 @@ export function TimelinePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [duration, view.zoomFit, view.hasUserZoomed]);
 
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    if (Math.abs(el.scrollLeft - view.scrollLeft) > 1) {
-      el.scrollLeft = view.scrollLeft;
-    }
-  }, [view.scrollLeft, view.contentWidth]);
-
-  async function run(cmd: string, args: Record<string, unknown>, okMsg?: string) {
-    try {
-      const next = await invoke<Timeline>(cmd, args);
-      onTimeline(next);
-      if (okMsg) onStatus(okMsg);
-    } catch (e) {
-      const msg = String(e);
-      if (/no gap/i.test(msg)) onStatus("No gap at that position");
-      else onStatus(msg);
-    }
-  }
-
   function doZoomFit() {
     const el = scrollerRef.current;
     view.zoomFit(el?.clientWidth ?? 800);
@@ -249,100 +498,96 @@ export function TimelinePanel({
     onStatus(`Fit · ${duration.toFixed(1)}s in view`);
   }
 
-  function openContext(
-    e: React.MouseEvent,
-    target: ContextMenuState["target"],
-  ) {
-    e.preventDefault();
-    e.stopPropagation();
-    setCtxMenu({ x: e.clientX, y: e.clientY, target });
-  }
+  useEffect(() => {
+    if (!onRegisterViewControls) return;
+    onRegisterViewControls({
+      zoomFit: doZoomFit,
+      zoomIn: view.zoomIn,
+      zoomOut: view.zoomOut,
+      setSnap: view.setSnap,
+      snap: view.snap,
+    });
+    return () => onRegisterViewControls(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onRegisterViewControls, view.snap, view.pxPerSec, duration]);
 
-  async function setZoneAt(which: "in" | "out", time: number) {
-    onSeek(time);
-    if (which === "in") {
-      await run(
-        "set_zone",
-        { zoneIn: time, zoneOut: timeline.zone_out },
-        `Zone in ${formatTime(time)}`,
-      );
-    } else {
-      await run(
-        "set_zone",
-        { zoneIn: timeline.zone_in, zoneOut: time },
-        `Zone out ${formatTime(time)}`,
-      );
-    }
-  }
+  /* ------------------------------------------------------------------ */
+  /* Time from pointer + scrubbing (rAF batched)                         */
+  /* ------------------------------------------------------------------ */
 
-  const activeRulerTicksRef = useRef<RulerTick[]>([]);
+  const activeRulerTicksRef: MutableRefObject<RulerTick[]> = useRef([]);
 
-  function timeFromClientX(clientX: number): number {
-    const scroller = scrollerRef.current;
-    if (!scroller) return 0;
-    const rect = scroller.getBoundingClientRect();
-    const x = clientX - rect.left + scroller.scrollLeft;
-    const rawTime = Math.max(0, view.xToTime(x));
+  const timeFromClientX = useCallback(
+    (clientX: number): number => {
+      const scroller = scrollerRef.current;
+      if (!scroller) return 0;
+      const rect = scroller.getBoundingClientRect();
+      const x = clientX - rect.left + scroller.scrollLeft;
+      const v = viewRef.current;
+      const rawTime = Math.max(0, v.xToTime(x));
 
-    // 1. Magnetic anchor snapping (clip boundaries, markers, zones)
-    if (view.snap) {
-      const anchorThreshold = Math.max(0.04, 8 / view.pxPerSec);
-      let bestAnchor = rawTime;
-      let bestAnchorDist = anchorThreshold;
-      for (const a of anchors) {
-        const d = Math.abs(a - rawTime);
-        if (d < bestAnchorDist) {
-          bestAnchorDist = d;
-          bestAnchor = a;
+      // 1. Magnetic anchor snapping (clip boundaries, markers, zones)
+      if (v.snap) {
+        const anchorThreshold = Math.max(0.04, 8 / v.pxPerSec);
+        const anchors = snapAnchorsRef.current;
+        let bestAnchor = rawTime;
+        let bestAnchorDist = anchorThreshold;
+        for (const a of anchors) {
+          const d = Math.abs(a - rawTime);
+          if (d < bestAnchorDist) {
+            bestAnchorDist = d;
+            bestAnchor = a;
+          }
+        }
+        if (bestAnchorDist < anchorThreshold) {
+          v.showSnapGuide(bestAnchor);
+          return Number(bestAnchor.toFixed(4));
         }
       }
-      if (bestAnchorDist < anchorThreshold) {
-        view.setSnapGuide(bestAnchor);
-        return Number(bestAnchor.toFixed(4));
-      }
-    }
 
-    view.setSnapGuide(null);
+      v.showSnapGuide(null);
 
-    // 2. Magnetic ruler division tick snapping
-    if (view.snap && activeRulerTicksRef.current.length > 0) {
-      const tickThreshold = Math.max(0.02, 6 / view.pxPerSec);
-      let bestTick = rawTime;
-      let bestTickDist = tickThreshold;
-      for (const tick of activeRulerTicksRef.current) {
-        const d = Math.abs(tick.t - rawTime);
-        if (d < bestTickDist) {
-          bestTickDist = d;
-          bestTick = tick.t;
+      // 2. Magnetic ruler division tick snapping
+      if (v.snap && activeRulerTicksRef.current.length > 0) {
+        const tickThreshold = Math.max(0.02, 6 / v.pxPerSec);
+        let bestTick = rawTime;
+        let bestTickDist = tickThreshold;
+        for (const tick of activeRulerTicksRef.current) {
+          const d = Math.abs(tick.t - rawTime);
+          if (d < bestTickDist) {
+            bestTickDist = d;
+            bestTick = tick.t;
+          }
+        }
+        if (bestTickDist < tickThreshold) {
+          return Number(bestTick.toFixed(4));
         }
       }
-      if (bestTickDist < tickThreshold) {
-        return Number(bestTick.toFixed(4));
+
+      // 3. Precision interval quantization (exact frame / hundredth / ms)
+      const FPS = 30;
+      const frameDur = 1 / FPS;
+      let qStep = frameDur;
+      if (v.pxPerSec >= 200) {
+        qStep = 0.01; // 10ms / hundredths
+      } else if (v.pxPerSec >= 40) {
+        qStep = frameDur; // exact 30fps frames
+      } else if (v.pxPerSec >= 15) {
+        qStep = 0.1; // 100ms
+      } else {
+        qStep = 0.5; // half second
       }
-    }
 
-    // 3. Precision interval quantization (exact frame / hundredth / millisecond)
-    const FPS = 30;
-    const frameDur = 1 / FPS;
-    let qStep = frameDur;
-    if (view.pxPerSec >= 200) {
-      qStep = 0.01; // 10ms / hundredths
-    } else if (view.pxPerSec >= 40) {
-      qStep = frameDur; // exact 30fps frames
-    } else if (view.pxPerSec >= 15) {
-      qStep = 0.1; // 100ms
-    } else {
-      qStep = 0.5; // half second
-    }
-
-    const quantized = Math.round(rawTime / qStep) * qStep;
-    return Math.max(0, Number(quantized.toFixed(4)));
-  }
-
+      const quantized = Math.round(rawTime / qStep) * qStep;
+      return Math.max(0, Number(quantized.toFixed(4)));
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
   const timeFromClientXRef = useRef(timeFromClientX);
-  timeFromClientXRef.current = timeFromClientX;
-  const timelineRef = useRef(timeline);
-  timelineRef.current = timeline;
+  useEffect(() => {
+    timeFromClientXRef.current = timeFromClientX;
+  }, [timeFromClientX]);
 
   useEffect(() => {
     return subscribeBinDrag((session) => {
@@ -384,82 +629,90 @@ export function TimelinePanel({
 
   useEffect(() => {
     if (!onRegisterDropResolver) return;
-    onRegisterDropResolver((clientX) => Math.max(0, timeFromClientX(clientX)));
+    onRegisterDropResolver((clientX) =>
+      Math.max(0, timeFromClientXRef.current(clientX)),
+    );
     return () => onRegisterDropResolver(null);
-    // Re-register when view / anchors change so drop time stays accurate.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onRegisterDropResolver, view.pxPerSec, view.scrollLeft, anchors]);
+  }, [onRegisterDropResolver]);
 
-  useEffect(() => {
-    if (!onRegisterViewControls) return;
-    onRegisterViewControls({
-      zoomFit: doZoomFit,
-      zoomIn: view.zoomIn,
-      zoomOut: view.zoomOut,
-      setSnap: view.setSnap,
-      snap: view.snap,
-    });
-    return () => onRegisterViewControls(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onRegisterViewControls, view.snap, view.pxPerSec, duration]);
-
-  function onLanePointer(e: React.MouseEvent<HTMLDivElement>) {
-    if (suppressClickRef.current) {
-      suppressClickRef.current = false;
-      return;
-    }
-    if (tool === "spacer") return;
-    const t = timeFromClientX(e.clientX);
-    onSeek(t);
-    view.setSnapGuide(null);
-  }
-
-  /** Kdenlive-style scrub: press and drag moves the playhead. */
-  function beginScrub(e: React.PointerEvent<HTMLDivElement>) {
-    if (tool === "spacer") return;
-    if ((e.target as HTMLElement).closest(".tl-clip")) return;
-    if (e.button !== 0) return;
-    e.preventDefault();
-    suppressClickRef.current = true;
-
-    const seekAt = (clientX: number) => {
-      const t = timeFromClientX(clientX);
+  const onLanePointer = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (suppressClickRef.current) {
+        suppressClickRef.current = false;
+        return;
+      }
+      if (tool === "spacer") return;
+      const t = timeFromClientXRef.current(e.clientX);
       onSeek(t);
-    };
-    seekAt(e.clientX);
+      viewRef.current.showSnapGuide(null);
+    },
+    [tool, onSeek],
+  );
 
-    const onMoveWin = (ev: PointerEvent) => {
-      seekAt(ev.clientX);
-    };
-    const onUpWin = () => {
-      window.removeEventListener("pointermove", onMoveWin);
-      window.removeEventListener("pointerup", onUpWin);
-      window.removeEventListener("pointercancel", onUpWin);
-      view.setSnapGuide(null);
-    };
-    window.addEventListener("pointermove", onMoveWin);
-    window.addEventListener("pointerup", onUpWin);
-    window.addEventListener("pointercancel", onUpWin);
-  }
+  /** Kdenlive-style scrub: press and drag moves the playhead (rAF batched). */
+  const beginScrub = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (tool === "spacer") return;
+      if ((e.target as HTMLElement).closest(".tl-clip")) return;
+      if (e.button !== 0) return;
+      e.preventDefault();
+      suppressClickRef.current = true;
+
+      let raf = 0;
+      let pendingX: number | null = null;
+      const seekAt = (clientX: number) => {
+        onSeek(timeFromClientXRef.current(clientX));
+      };
+      seekAt(e.clientX);
+
+      const onMoveWin = (ev: PointerEvent) => {
+        pendingX = ev.clientX;
+        if (!raf) {
+          raf = requestAnimationFrame(() => {
+            raf = 0;
+            if (pendingX != null) {
+              seekAt(pendingX);
+              pendingX = null;
+            }
+          });
+        }
+      };
+      const onUpWin = () => {
+        window.removeEventListener("pointermove", onMoveWin);
+        window.removeEventListener("pointerup", onUpWin);
+        window.removeEventListener("pointercancel", onUpWin);
+        if (raf) {
+          cancelAnimationFrame(raf);
+          raf = 0;
+        }
+        pendingX = null;
+        viewRef.current.showSnapGuide(null);
+      };
+      window.addEventListener("pointermove", onMoveWin);
+      window.addEventListener("pointerup", onUpWin);
+      window.addEventListener("pointercancel", onUpWin);
+    },
+    [tool, onSeek],
+  );
 
   function beginSpacerDrag(e: React.PointerEvent<HTMLDivElement>, trackId: string | null) {
     if (tool !== "spacer") return;
     e.preventDefault();
     e.stopPropagation();
     const originX = e.clientX;
-    const at = timeFromClientX(e.clientX);
+    const at = timeFromClientXRef.current(e.clientX);
     let latestDelta = 0;
     suppressClickRef.current = true;
 
     const onMoveWin = (ev: PointerEvent) => {
-      latestDelta = (ev.clientX - originX) / view.pxPerSec;
+      latestDelta = (ev.clientX - originX) / viewRef.current.pxPerSec;
     };
 
     const onUpWin = () => {
       window.removeEventListener("pointermove", onMoveWin);
       window.removeEventListener("pointerup", onUpWin);
       window.removeEventListener("pointercancel", onUpWin);
-      view.setSnapGuide(null);
+      viewRef.current.showSnapGuide(null);
       if (Math.abs(latestDelta) > 0.001) {
         void run(
           "spacer_shift",
@@ -478,20 +731,157 @@ export function TimelinePanel({
     window.addEventListener("pointercancel", onUpWin);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Context menus (stable handlers; clip resolved via data attribute)   */
+  /* ------------------------------------------------------------------ */
+
+  const openContext = useCallback(
+    (e: React.MouseEvent, target: ContextMenuState["target"]) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setCtxMenu({ x: e.clientX, y: e.clientY, target });
+    },
+    [],
+  );
+
+  const handleClipContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      const clipId = (e.target as HTMLElement)
+        .closest(".tl-clip")
+        ?.getAttribute("data-clip-id");
+      const tl = timelineRef.current;
+      if (!clipId || !tl) return;
+      let clip: Clip | null = null;
+      let trackId = "";
+      for (const t of tl.tracks) {
+        const hit = t.clips.find((c) => c.id === clipId);
+        if (hit) {
+          clip = hit;
+          trackId = t.id;
+          break;
+        }
+      }
+      if (!clip) return;
+      const at = timeFromClientXRef.current(e.clientX);
+      const end = clip.start + clipTimelineDuration(clip);
+      openContext(e, {
+        kind: "clip",
+        clipId: clip.id,
+        trackId,
+        linked: Boolean(clip.linked_clip_id),
+        role: clip.role,
+        at: Math.min(Math.max(at, clip.start + 0.05), end - 0.05),
+        clipStart: clip.start,
+        clipEnd: end,
+      });
+    },
+    [openContext],
+  );
+
+  const handleRulerContext = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      openContext(e, { kind: "ruler", at: timeFromClientXRef.current(e.clientX) });
+    },
+    [openContext],
+  );
+
+  const handleLaneContext = useCallback(
+    (trackId: string, trackKind: "video" | "audio") =>
+      (e: React.MouseEvent<HTMLDivElement>) => {
+        if ((e.target as HTMLElement).closest(".tl-clip")) return;
+        openContext(e, {
+          kind: "lane",
+          trackId,
+          trackKind,
+          at: timeFromClientXRef.current(e.clientX),
+        });
+      },
+    [openContext],
+  );
+
+  const handleTrackContext = useCallback(
+    (
+      track: { id: string; kind: "video" | "audio"; muted: boolean; locked: boolean; hidden?: boolean },
+      canDelete: boolean,
+    ) =>
+      (e: React.MouseEvent) => {
+        openContext(e, {
+          kind: "track",
+          trackId: track.id,
+          trackKind: track.kind,
+          muted: track.muted,
+          locked: track.locked,
+          hidden: Boolean(track.hidden),
+          canDelete,
+        });
+      },
+    [openContext],
+  );
+
+  async function setZoneAt(which: "in" | "out", time: number) {
+    onSeek(time);
+    if (which === "in") {
+      await run(
+        "set_zone",
+        { zoneIn: time, zoneOut: timeline.zone_out },
+        `Zone in ${formatTime(time)}`,
+      );
+    } else {
+      await run(
+        "set_zone",
+        { zoneIn: timeline.zone_in, zoneOut: time },
+        `Zone out ${formatTime(time)}`,
+      );
+    }
+  }
+
   function trackHeight(track: (typeof timeline.tracks)[0]) {
     if (track.hidden) return 22;
     return track.kind === "video" ? 64 : 48;
   }
 
-  const totalRulerDuration = Math.max(duration + 120, view.xToTime(view.contentWidth) + 60);
-  const visibleStart = Math.max(0, view.xToTime(view.scrollLeft) - 5);
-  const visibleEnd = view.xToTime(
-    view.scrollLeft + (scrollerRef.current?.clientWidth ?? 1920) + 10,
+  const zoneLeft =
+    timeline.zone_in != null && timeline.zone_out != null
+      ? Math.min(timeline.zone_in, timeline.zone_out)
+      : timeline.zone_in;
+  const zoneRight =
+    timeline.zone_in != null && timeline.zone_out != null
+      ? Math.max(timeline.zone_in, timeline.zone_out)
+      : timeline.zone_out;
+
+  const totalRulerDuration = duration + 120;
+
+  /* Linked-partner live preview: only the partner clip re-renders. */
+  const handleLiveDrag = useCallback(
+    (phase: "start" | "move" | "end", clipId: string, draft: {
+      start: number;
+      in_point: number;
+      out_point: number;
+    }) => {
+      if (phase === "end") {
+        return;
+      }
+      const tl = timelineRef.current;
+      if (!tl) return;
+      let linkedId: string | null = null;
+      for (const t of tl.tracks) {
+        const hit = t.clips.find((c) => c.id === clipId);
+        if (hit) {
+          linkedId = hit.linked_clip_id;
+          break;
+        }
+      }
+      if (!linkedId) return;
+      setDragPreview({ partnerClipId: linkedId, draft });
+    },
+    [],
   );
-  const rulerTickList = useMemo(() => {
-    return rulerTicks(totalRulerDuration, view.pxPerSec, visibleStart, visibleEnd);
-  }, [totalRulerDuration, view.pxPerSec, visibleStart, visibleEnd]);
-  activeRulerTicksRef.current = rulerTickList;
+
+  const handleDragActive = useCallback((active: boolean) => {
+    if (active) suppressClickRef.current = true;
+  }, []);
+
+  const markers = useMemo(() => timeline.markers ?? [], [timeline.markers]);
 
   return (
     <section
@@ -516,7 +906,7 @@ export function TimelinePanel({
             void run("unlink_clip", { clipId: selectedClip.id }, "Unlinked");
             return;
           }
-          const partner = findLinkPartner(timeline, selectedClip, playhead);
+          const partner = findLinkPartner(timeline, selectedClip, playheadRef.current);
           if (!partner) {
             onStatus("No audio/video partner found to link");
             return;
@@ -537,17 +927,18 @@ export function TimelinePanel({
           onSelectClip(null);
         }}
         onSplitAtPlayhead={() => {
+          const ph = playheadRef.current;
           const clip =
             selectedClip &&
-            playhead > selectedClip.start &&
-            playhead < selectedClip.start + clipTimelineDuration(selectedClip)
+            ph > selectedClip.start &&
+            ph < selectedClip.start + clipTimelineDuration(selectedClip)
               ? selectedClip
               : timeline.tracks
                   .flatMap((t) => t.clips.map((c) => ({ track: t, clip: c })))
                   .find(({ track, clip: c }) => {
                     if (track.locked) return false;
                     const end = c.start + clipTimelineDuration(c);
-                    return playhead > c.start && playhead < end;
+                    return ph > c.start && ph < end;
                   })?.clip;
           if (!clip) {
             onStatus("Playhead must be inside a clip");
@@ -555,21 +946,21 @@ export function TimelinePanel({
           }
           void run(
             "split_clip_at",
-            { clipId: clip.id, at: playhead, syncLinked: true },
-            `Split at ${formatTime(playhead)}`,
+            { clipId: clip.id, at: ph, syncLinked: true },
+            `Split at ${formatTime(ph)}`,
           );
         }}
         onRemoveSpaceAllTracks={() => {
           void run(
             "close_gap",
-            { at: playhead, trackId: null },
+            { at: playheadRef.current, trackId: null },
             "Remove Space in All Tracks",
           );
         }}
         onRemoveAllSpacesAfterCursor={() => {
           void run(
             "remove_gaps",
-            { from: playhead, trackId: null },
+            { from: playheadRef.current, trackId: null },
             "Remove All Spaces After Cursor",
           );
         }}
@@ -600,7 +991,7 @@ export function TimelinePanel({
           {timeline.tracks.map((track) => {
             const sameKind = timeline.tracks.filter((t) => t.kind === track.kind).length;
             return (
-            <TrackHeader
+            <TrackHeaderMemo
               key={track.id}
               track={track}
               height={trackHeight(track)}
@@ -637,17 +1028,7 @@ export function TimelinePanel({
                 }
                 void run("remove_track", { trackId: track.id }, `Deleted ${track.name}`);
               }}
-              onContextMenu={(e) => {
-                openContext(e, {
-                  kind: "track",
-                  trackId: track.id,
-                  trackKind: track.kind,
-                  muted: track.muted,
-                  locked: track.locked,
-                  hidden: Boolean(track.hidden),
-                  canDelete: sameKind > 1 && !track.locked,
-                });
-              }}
+              onContextMenu={handleTrackContext(track, sameKind > 1 && !track.locked)}
             />
             );
           })}
@@ -667,7 +1048,6 @@ export function TimelinePanel({
         <div
           className={`tl-scroller ${binDragOver ? "bin-drag-over" : ""}`}
           ref={scrollerRef}
-          onScroll={(e) => view.setScrollLeft(e.currentTarget.scrollLeft)}
           onWheel={(e) => {
             if (e.ctrlKey || e.metaKey) {
               e.preventDefault();
@@ -677,64 +1057,21 @@ export function TimelinePanel({
           }}
         >
           <div className="tl-canvas" style={{ width: view.contentWidth }}>
-            <div
-              className="tl-ruler"
-              onClick={onLanePointer}
-              onPointerDown={beginScrub}
-              onPointerMove={(e) => {
-                setRulerHoverTime(timeFromClientX(e.clientX));
-              }}
-              onPointerLeave={() => {
-                setRulerHoverTime(null);
-              }}
-              onContextMenu={(e) => {
-                openContext(e, { kind: "ruler", at: timeFromClientX(e.clientX) });
-              }}
-            >
-              {rulerTickList.map((tick) => (
-                <span
-                  key={tick.t}
-                  className={`tl-tick ${tick.kind}`}
-                  style={{ left: view.timeToX(tick.t) }}
-                >
-                  <i className="tl-tick-mark" aria-hidden />
-                  {tick.label ? (
-                    <span className="tl-tick-label">{tick.label}</span>
-                  ) : null}
-                </span>
-              ))}
-              {rulerHoverTime != null && (
-                <div
-                  className="tl-ruler-hover"
-                  style={{ left: view.timeToX(rulerHoverTime) }}
-                >
-                  <span className="tl-ruler-hover-badge">
-                    {formatTime(rulerHoverTime)}
-                  </span>
-                </div>
-              )}
-              {zoneLeft != null && zoneRight != null && zoneRight > zoneLeft && (
-                <div
-                  className="tl-zone"
-                  style={{
-                    left: view.timeToX(zoneLeft),
-                    width: Math.max(2, view.timeToX(zoneRight - zoneLeft)),
-                  }}
-                />
-              )}
-              {(timeline.markers ?? []).map((m) => (
-                <div
-                  key={m.id}
-                  className="tl-marker"
-                  style={{ left: view.timeToX(m.time) }}
-                  title={m.label || "Marker"}
-                />
-              ))}
-              <div className="tl-playhead" style={{ left: view.timeToX(playhead) }} />
-              {view.snapGuide != null && (
-                <div className="tl-snap-guide" style={{ left: view.timeToX(view.snapGuide) }} />
-              )}
-            </div>
+            <Ruler
+              pxPerSec={view.pxPerSec}
+              totalDuration={totalRulerDuration}
+              zoneLeft={zoneLeft}
+              zoneRight={zoneRight}
+              markers={markers}
+              scrollerRef={scrollerRef}
+              ticksOutRef={activeRulerTicksRef}
+              timeFromClientXRef={timeFromClientXRef}
+              onScrubStart={beginScrub}
+              onSeekClick={onLanePointer}
+              onContextMenu={handleRulerContext}
+              registerPlayheadEl={registerPlayheadEl}
+              registerSnapGuideEl={view.registerSnapGuideEl}
+            />
 
             {timeline.tracks.map((track) => {
               const h = trackHeight(track);
@@ -764,15 +1101,7 @@ export function TimelinePanel({
                     }
                     beginScrub(e);
                   }}
-                  onContextMenu={(e) => {
-                    if ((e.target as HTMLElement).closest(".tl-clip")) return;
-                    openContext(e, {
-                      kind: "lane",
-                      trackId: track.id,
-                      trackKind: track.kind,
-                      at: timeFromClientX(e.clientX),
-                    });
-                  }}
+                  onContextMenu={handleLaneContext(track.id, track.kind)}
                 >
                   {binDropPreview?.trackId === track.id && (
                     <div
@@ -793,30 +1122,7 @@ export function TimelinePanel({
                     </div>
                   )}
                   {track.clips.map((clip: Clip) => {
-                    const trackObs = trackClipObstacles.get(track.id) ?? [];
-                    const ownObstacles = trackObs
-                      .filter((o) => o.id !== clip.id)
-                      .map((o) => ({ start: o.start, duration: o.duration }));
-                    let obstacles = ownObstacles;
-                    if (clip.linked_clip_id) {
-                      for (const [tid, obsList] of trackClipObstacles.entries()) {
-                        if (tid !== track.id && obsList.some((o) => o.id === clip.linked_clip_id)) {
-                          const partnerObs = obsList
-                            .filter((o) => o.id !== clip.linked_clip_id)
-                            .map((o) => ({ start: o.start, duration: o.duration }));
-                          obstacles = [...ownObstacles, ...partnerObs];
-                          break;
-                        }
-                      }
-                    }
-
-                    const libItem = library.find(
-                      (m) =>
-                        m.path === clip.media_path ||
-                        fileName(m.path) === fileName(clip.media_path),
-                    );
-                    const maxMediaDuration = libItem?.duration ?? Infinity;
-
+                    const info = clipInfo.get(clip.id);
                     return (
                       <ClipBlock
                         key={clip.id}
@@ -825,183 +1131,24 @@ export function TimelinePanel({
                         tool={tool}
                         view={view}
                         locked={track.locked}
-                        obstacles={obstacles}
+                        obstacles={info?.obstacles}
+                        anchors={info?.anchors ?? EMPTY_ANCHORS}
                         editMode={timeline.edit_mode ?? "normal"}
-                        maxMediaDuration={maxMediaDuration}
-                        anchors={anchors.filter(
-                          (a) =>
-                            a !== clip.start &&
-                            a !== clip.start + clipTimelineDuration(clip),
-                        )}
-                        onSelect={() => onSelectClip(clip.id)}
-                      onContextMenu={(e) => {
-                        const at = timeFromClientX(e.clientX);
-                        const end = clip.start + clipTimelineDuration(clip);
-                        openContext(e, {
-                          kind: "clip",
-                          clipId: clip.id,
-                          trackId: track.id,
-                          linked: Boolean(clip.linked_clip_id),
-                          role: clip.role,
-                          at: Math.min(Math.max(at, clip.start + 0.05), end - 0.05),
-                          clipStart: clip.start,
-                          clipEnd: end,
-                        });
-                      }}
-                      previewDraft={
-                        dragPreview?.partnerClipId === clip.id
-                          ? dragPreview.draft
-                          : null
-                      }
-                      onDragActive={(active) => {
-                        if (active) suppressClickRef.current = true;
-                      }}
-                      onRazor={(at) =>
-                        void run(
-                          "split_clip_at",
-                          { clipId: clip.id, at, syncLinked: true },
-                          `Cut at ${formatTime(at)}`,
-                        )
-                      }
-                      onLiveDrag={(phase, draft) => {
-                        if (!clip.linked_clip_id) return;
-                        if (phase === "end") {
-                          return;
+                        maxMediaDuration={info?.maxMediaDuration ?? Infinity}
+                        onSelect={onSelectClip}
+                        onEdit={editClip}
+                        onContextMenu={handleClipContextMenu}
+                        previewDraft={
+                          dragPreview?.partnerClipId === clip.id
+                            ? dragPreview.draft
+                            : null
                         }
-                        setDragPreview({
-                          partnerClipId: clip.linked_clip_id,
-                          draft,
-                        });
-                      }}
-                      onMove={(newStart) => {
-                        // Optimistic immediate update to eliminate snap-back flicker
-                        const optimistic: Timeline = {
-                          ...timeline,
-                          tracks: timeline.tracks.map((t) => {
-                            if (
-                              !t.clips.some(
-                                (c) =>
-                                  c.id === clip.id ||
-                                  (clip.linked_clip_id && c.id === clip.linked_clip_id),
-                              )
-                            ) {
-                              return t;
-                            }
-                            const updatedClips = t.clips.map((c) => {
-                              if (
-                                c.id === clip.id ||
-                                (clip.linked_clip_id && c.id === clip.linked_clip_id)
-                              ) {
-                                return { ...c, start: newStart };
-                              }
-                              return c;
-                            });
-                            updatedClips.sort((a, b) => a.start - b.start);
-                            return { ...t, clips: updatedClips };
-                          }),
-                        };
-                        onTimeline(optimistic);
-
-                        void (async () => {
-                          try {
-                            await run(
-                              "move_clip",
-                              {
-                                clipId: clip.id,
-                                newStart,
-                                syncLinked: true,
-                              },
-                              `Moved to ${formatTime(newStart)}`,
-                            );
-                          } finally {
-                            setDragPreview(null);
-                          }
-                        })();
-                      }}
-                      onTrim={(inPoint, outPoint, keepEnd) => {
-                        const newDur = (outPoint - inPoint) / (clip.speed ?? 1);
-                        const optimistic: Timeline = {
-                          ...timeline,
-                          tracks: timeline.tracks.map((t) => {
-                            if (
-                              !t.clips.some(
-                                (c) =>
-                                  c.id === clip.id ||
-                                  (clip.linked_clip_id && c.id === clip.linked_clip_id),
-                              )
-                            ) {
-                              return t;
-                            }
-                            const updatedClips = t.clips.map((c) => {
-                              if (
-                                c.id === clip.id ||
-                                (clip.linked_clip_id && c.id === clip.linked_clip_id)
-                              ) {
-                                const oldDur = clipTimelineDuration(c);
-                                const newStart = keepEnd
-                                  ? c.start + (oldDur - newDur)
-                                  : c.start;
-                                return {
-                                  ...c,
-                                  start: Math.max(0, newStart),
-                                  in_point: inPoint,
-                                  out_point: outPoint,
-                                };
-                              }
-                              return c;
-                            });
-                            updatedClips.sort((a, b) => a.start - b.start);
-                            return { ...t, clips: updatedClips };
-                          }),
-                        };
-                        onTimeline(optimistic);
-                        setDragPreview(null);
-                        void run("trim_clip", {
-                          clipId: clip.id,
-                          inPoint,
-                          outPoint,
-                          keepEnd,
-                          syncLinked: true,
-                        });
-                      }}
-                      onRippleTrim={(edge, newEdgeTime) =>
-                        void run(
-                          "ripple_trim",
-                          {
-                            clipId: clip.id,
-                            edge,
-                            newEdgeTime,
-                            syncLinked: true,
-                          },
-                          `Ripple ${edge}`,
-                        )
-                      }
-                      onSlip={(delta) =>
-                        void run(
-                          "slip_clip",
-                          {
-                            clipId: clip.id,
-                            delta,
-                            syncLinked: true,
-                          },
-                          `Slip ${delta >= 0 ? "+" : ""}${delta.toFixed(2)}s`,
-                        )
-                      }
-                      onSetFades={(fadeIn, fadeOut) =>
-                        void run(
-                          "set_clip_fades",
-                          {
-                            clipId: clip.id,
-                            fadeIn,
-                            fadeOut,
-                          },
-                          `Fade ${fadeIn.toFixed(2)}s / ${fadeOut.toFixed(2)}s`,
-                        )
-                      }
-                    />
-                  );
-                })}
-                  <div className="tl-playhead" style={{ left: view.timeToX(playhead) }} />
+                        onDragActive={handleDragActive}
+                        onLiveDrag={handleLiveDrag}
+                      />
+                    );
+                  })}
+                  <div className="tl-playhead" ref={registerPlayheadEl} />
                 </div>
               );
             })}
@@ -1009,7 +1156,7 @@ export function TimelinePanel({
         </div>
       </div>
 
-      <TimelineStatusBar
+      <TimelineStatusBarMemo
         playhead={playhead}
         editMode={timeline.edit_mode ?? "normal"}
         tier={tier}
@@ -1045,14 +1192,14 @@ export function TimelinePanel({
                 : selectedClip;
             if (!clip) return;
             const end = clip.start + clipTimelineDuration(clip);
-            if (playhead <= clip.start || playhead >= end) {
+            if (playheadRef.current <= clip.start || playheadRef.current >= end) {
               onStatus("Playhead must be inside the clip");
               return;
             }
             void run(
               "split_clip_at",
-              { clipId, at: playhead, syncLinked: true },
-              `Split at ${formatTime(playhead)}`,
+              { clipId, at: playheadRef.current, syncLinked: true },
+              `Split at ${formatTime(playheadRef.current)}`,
             );
           }}
           onDelete={(clipId) => {
@@ -1082,7 +1229,7 @@ export function TimelinePanel({
               void run("unlink_clip", { clipId }, "Unlinked");
               return;
             }
-            const partner = findLinkPartner(timeline, clip, playhead);
+            const partner = findLinkPartner(timeline, clip, playheadRef.current);
             if (!partner) {
               onStatus("No audio/video partner found to link");
               return;
@@ -1125,7 +1272,7 @@ export function TimelinePanel({
             const at =
               ctxMenu.target.kind === "ruler" || ctxMenu.target.kind === "lane"
                 ? ctxMenu.target.at
-                : playhead;
+                : playheadRef.current;
             onSeek(at);
             void run(
               "add_marker",
@@ -1179,6 +1326,145 @@ export function TimelinePanel({
     </section>
   );
 }
+
+const EMPTY_ANCHORS: number[] = [];
+
+/** Memoized header: skip re-render unless the track data itself changed. */
+const TrackHeaderMemo = memo(
+  TrackHeader,
+  (a, b) => a.track === b.track && a.height === b.height && a.canDelete === b.canDelete,
+);
+
+const TimelineStatusBarMemo = memo(TimelineStatusBar);
+
+type RulerProps = {
+  pxPerSec: number;
+  totalDuration: number;
+  zoneLeft: number | null;
+  zoneRight: number | null;
+  markers: TimelineMarker[];
+  scrollerRef: RefObject<HTMLDivElement | null>;
+  ticksOutRef: MutableRefObject<RulerTick[]>;
+  timeFromClientXRef: MutableRefObject<(clientX: number) => number>;
+  onScrubStart: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onSeekClick: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onContextMenu: (e: React.MouseEvent<HTMLDivElement>) => void;
+  registerPlayheadEl: (el: HTMLDivElement | null) => void;
+  registerSnapGuideEl: (el: HTMLElement | null) => void;
+};
+
+/**
+ * Isolated ruler: owns hover + scroll-derived tick state so scrolling /
+ * hovering / playing never re-renders tracks or clips. The playhead line and
+ * snap guide are positioned imperatively by the parent.
+ */
+const Ruler = memo(function Ruler({
+  pxPerSec,
+  totalDuration,
+  zoneLeft,
+  zoneRight,
+  markers,
+  scrollerRef,
+  ticksOutRef,
+  timeFromClientXRef,
+  onScrubStart,
+  onSeekClick,
+  onContextMenu,
+  registerPlayheadEl,
+  registerSnapGuideEl,
+}: RulerProps) {
+  const [scroll, setScroll] = useState({ left: 0, width: 1920 });
+  const [hoverT, setHoverT] = useState<number | null>(null);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      setScroll((prev) =>
+        prev.left === el.scrollLeft && prev.width === el.clientWidth
+          ? prev
+          : { left: el.scrollLeft, width: el.clientWidth },
+      );
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    update();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [scrollerRef]);
+
+  const visibleStart = Math.max(0, scroll.left / pxPerSec - 5);
+  const visibleEnd = (scroll.left + scroll.width + 10) / pxPerSec;
+  const ticks = useMemo(
+    () => rulerTicks(totalDuration, pxPerSec, visibleStart, visibleEnd),
+    [totalDuration, pxPerSec, visibleStart, visibleEnd],
+  );
+
+  useEffect(() => {
+    ticksOutRef.current = ticks;
+  }, [ticksOutRef, ticks]);
+
+  return (
+    <div
+      className="tl-ruler"
+      onClick={onSeekClick}
+      onPointerDown={onScrubStart}
+      onPointerMove={(e) => setHoverT(timeFromClientXRef.current(e.clientX))}
+      onPointerLeave={() => setHoverT(null)}
+      onContextMenu={onContextMenu}
+    >
+      {ticks.map((tick) => (
+        <span
+          key={tick.t}
+          className={`tl-tick ${tick.kind}`}
+          style={{ left: tick.t * pxPerSec }}
+        >
+          <i className="tl-tick-mark" aria-hidden />
+          {tick.label ? (
+            <span className="tl-tick-label">{tick.label}</span>
+          ) : null}
+        </span>
+      ))}
+      {hoverT != null && (
+        <div className="tl-ruler-hover" style={{ left: hoverT * pxPerSec }}>
+          <span className="tl-ruler-hover-badge">{formatTime(hoverT)}</span>
+        </div>
+      )}
+      {zoneLeft != null && zoneRight != null && zoneRight > zoneLeft && (
+        <div
+          className="tl-zone"
+          style={{
+            left: zoneLeft * pxPerSec,
+            width: Math.max(2, (zoneRight - zoneLeft) * pxPerSec),
+          }}
+        />
+      )}
+      {markers.map((m) => (
+        <div
+          key={m.id}
+          className="tl-marker"
+          style={{ left: m.time * pxPerSec }}
+          title={m.label || "Marker"}
+        />
+      ))}
+      <div className="tl-playhead" ref={registerPlayheadEl} />
+      <div
+        className="tl-snap-guide"
+        ref={registerSnapGuideEl}
+        style={{ display: "none" }}
+      />
+    </div>
+  );
+});
 
 export type RulerTickKind = "major" | "medium" | "minor" | "micro";
 
@@ -1252,11 +1538,14 @@ function rulerTicks(
   };
 
   const ticks: RulerTick[] = [];
+  const seen = new Set<number>();
   const start = Math.max(0, Math.floor(rangeStart / tickStep) * tickStep);
   const end = Math.min(duration + 1e-4, rangeEnd + 1e-4);
 
   for (let t = start; t <= end; t += tickStep) {
     const rounded = Number(t.toFixed(4));
+    if (seen.has(rounded)) continue; // guard duplicate keys at micro zooms
+    seen.add(rounded);
     const major = isMajor(rounded);
     const medium = !major && isMedium(rounded);
     const minor = !major && !medium && isMinor(rounded);

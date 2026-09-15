@@ -1909,6 +1909,22 @@ impl TimelineEditor {
         Ok((right_id, linked))
     }
 
+    /// Re-point every clip referencing `from` to `to` (e.g. hot-swap an
+    /// original file to its finished proxy). Not undoable — playback plumbing
+    /// only; the edit intent does not change.
+    pub fn swap_media_path(&mut self, from: &str, to: &str) -> usize {
+        let mut count = 0;
+        for track in &mut self.timeline.tracks {
+            for clip in &mut track.clips {
+                if clip.media_path == from {
+                    clip.media_path = to.to_string();
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     pub fn undo(&mut self) -> Result<(), TimelineError> {
         let previous = self.undo.pop_back().ok_or(TimelineError::NothingToUndo)?;
         self.redo.push_back(self.timeline.clone());

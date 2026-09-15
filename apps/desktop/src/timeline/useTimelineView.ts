@@ -4,13 +4,21 @@ const MIN_PPS = 0.35;
 const MAX_PPS = 480;
 const DEFAULT_PPS = 64;
 
+/**
+ * Timeline view model (zoom + snap).
+ *
+ * Perf contract:
+ * - The returned object is referentially stable across renders unless zoom or
+ *   snap actually changes, so memoized clips only re-render on real zooms.
+ * - Scroll is NOT mirrored into React state — the scroller scrolls natively.
+ * - The snap guide line is moved imperatively (no re-render while dragging).
+ */
 export function useTimelineView(durationSec: number) {
   const [pxPerSec, setPxPerSec] = useState(DEFAULT_PPS);
-  const [scrollLeft, setScrollLeft] = useState(0);
   const [snap, setSnap] = useState(true);
-  const [snapGuide, setSnapGuide] = useState<number | null>(null);
   const userZoomedRef = useRef(false);
   const lastFitDuration = useRef(0);
+  const snapGuideElRef = useRef<HTMLElement | null>(null);
 
   const contentWidth = useMemo(
     () => Math.max(640, durationSec * pxPerSec + 160),
@@ -36,7 +44,6 @@ export function useTimelineView(durationSec: number) {
       const safeDur = Math.max(1, durationSec);
       const next = usable / safeDur;
       setPxPerSec(Math.min(MAX_PPS, Math.max(MIN_PPS, next)));
-      setScrollLeft(0);
       lastFitDuration.current = durationSec;
       userZoomedRef.current = false;
     },
@@ -63,10 +70,26 @@ export function useTimelineView(durationSec: number) {
 
   const xToTime = useCallback((x: number) => Math.max(0, x / pxPerSec), [pxPerSec]);
 
+  /** Imperative snap-guide line update — no React state, no re-render. */
+  const showSnapGuide = useCallback((t: number | null) => {
+    const el = snapGuideElRef.current;
+    if (!el) return;
+    if (t == null) {
+      el.style.display = "none";
+    } else {
+      el.style.display = "block";
+      el.style.left = `${t * pxPerSec}px`;
+    }
+  }, [pxPerSec]);
+
+  const registerSnapGuideEl = useCallback((el: HTMLElement | null) => {
+    snapGuideElRef.current = el;
+  }, []);
+
   const applySnap = useCallback(
     (t: number, anchors: number[]) => {
-      if (!snap) {
-        setSnapGuide(null);
+      if (!snap || anchors.length === 0) {
+        showSnapGuide(null);
         return t;
       }
       const threshold = Math.max(0.05, 10 / pxPerSec);
@@ -79,37 +102,56 @@ export function useTimelineView(durationSec: number) {
           best = a;
         }
       }
-      setSnapGuide(bestDist < threshold ? best : null);
-      return best;
+      const hit = bestDist < threshold;
+      showSnapGuide(hit ? best : null);
+      return hit ? best : t;
     },
-    [snap, pxPerSec],
+    [snap, pxPerSec, showSnapGuide],
   );
 
+  // Snap guide element is re-created by React on remount; reset its visibility.
   useEffect(() => {
-    // Keep scrollLeft applied when fit resets it.
-  }, [scrollLeft]);
+    showSnapGuide(null);
+  }, [showSnapGuide]);
 
-  return {
-    pxPerSec,
-    setPxPerSec,
-    scrollLeft,
-    setScrollLeft,
-    snap,
-    setSnap,
-    snapGuide,
-    setSnapGuide,
-    contentWidth,
-    zoomIn,
-    zoomOut,
-    zoomFit,
-    maybeAutoFit,
-    hasUserZoomed,
-    timeToX,
-    xToTime,
-    applySnap,
-    minPxPerSec: MIN_PPS,
-    maxPxPerSec: MAX_PPS,
-  };
+  const view = useMemo(
+    () => ({
+      pxPerSec,
+      setPxPerSec,
+      snap,
+      setSnap,
+      contentWidth,
+      zoomIn,
+      zoomOut,
+      zoomFit,
+      maybeAutoFit,
+      hasUserZoomed,
+      timeToX,
+      xToTime,
+      applySnap,
+      showSnapGuide,
+      registerSnapGuideEl,
+      minPxPerSec: MIN_PPS,
+      maxPxPerSec: MAX_PPS,
+    }),
+    [
+      pxPerSec,
+      snap,
+      contentWidth,
+      zoomIn,
+      zoomOut,
+      zoomFit,
+      maybeAutoFit,
+      hasUserZoomed,
+      timeToX,
+      xToTime,
+      applySnap,
+      showSnapGuide,
+      registerSnapGuideEl,
+    ],
+  );
+
+  return view;
 }
 
 export type TimelineView = ReturnType<typeof useTimelineView>;

@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -45,10 +46,14 @@ pub struct ProxyJob {
     pub source_info: Option<MediaInfo>,
 }
 
-#[derive(Debug, Default)]
+pub type ProxyNotifier = Arc<dyn Fn(&ProxyJob) + Send + Sync>;
+
+#[derive(Default)]
 pub struct ProxyManager {
     inner: Mutex<HashMap<Uuid, ProxyJob>>,
     cache_dir: PathBuf,
+    queue_tx: Mutex<Option<mpsc::Sender<(Uuid, PerformancePolicy)>>>,
+    notifier: Mutex<Option<ProxyNotifier>>,
 }
 
 impl ProxyManager {
@@ -56,7 +61,42 @@ impl ProxyManager {
         Self {
             inner: Mutex::new(HashMap::new()),
             cache_dir: cache_dir.into(),
+            queue_tx: Mutex::new(None),
+            notifier: Mutex::new(None),
         }
+    }
+
+    /// Callback fired on the worker thread whenever a job reaches a terminal
+    /// status (Ready / Failed / Skipped). Used to emit Tauri events.
+    pub fn set_notifier(&self, f: ProxyNotifier) {
+        *self.notifier.lock() = Some(f);
+    }
+
+    fn notify(&self, id: Uuid) {
+        if let Some(job) = self.get(id) {
+            if let Some(f) = self.notifier.lock().as_ref() {
+                f(&job);
+            }
+        }
+    }
+
+    fn ensure_worker(self: &Arc<Self>) -> mpsc::Sender<(Uuid, PerformancePolicy)> {
+        let mut guard = self.queue_tx.lock();
+        if let Some(tx) = guard.as_ref() {
+            return tx.clone();
+        }
+        let (tx, rx) = mpsc::channel::<(Uuid, PerformancePolicy)>();
+        let manager = Arc::clone(self);
+        // One worker => proxy encodes never run concurrently with each other,
+        // so a batch import cannot saturate every core while the user edits.
+        std::thread::spawn(move || {
+            for (id, policy) in rx {
+                let _ = manager.run_job(id, &policy);
+                manager.notify(id);
+            }
+        });
+        *guard = Some(tx.clone());
+        tx
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -72,8 +112,9 @@ impl ProxyManager {
     }
 
     /// Queue a proxy. Returns existing job if the same source is already tracked.
+    /// Transcoding runs on the background worker; this call does not block.
     pub fn enqueue(
-        &self,
+        self: &Arc<Self>,
         source: &Path,
         policy: &PerformancePolicy,
     ) -> Result<ProxyJob, ProxyError> {
@@ -116,12 +157,13 @@ impl ProxyManager {
         };
         self.inner.lock().insert(id, job.clone());
 
-        // Run synchronously for MVP; desktop app will spawn a worker thread.
-        self.run_job(id, policy)?;
-        self.get(id).ok_or(ProxyError::NotFound(id))
+        let tx = self.ensure_worker();
+        tx.send((id, policy.clone()))
+            .map_err(|_| ProxyError::NotFound(id))?;
+        Ok(job)
     }
 
-    pub fn run_job(&self, id: Uuid, policy: &PerformancePolicy) -> Result<(), ProxyError> {
+    fn run_job(&self, id: Uuid, policy: &PerformancePolicy) -> Result<(), ProxyError> {
         let (source, proxy_path) = {
             let mut guard = self.inner.lock();
             let job = guard.get_mut(&id).ok_or(ProxyError::NotFound(id))?;
@@ -147,7 +189,7 @@ impl ProxyManager {
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                "superfast",
                 "-threads",
                 &threads,
                 "-b:v",

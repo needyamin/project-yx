@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use yx_detect::{probe_and_policy, HardwareProfile, PerformancePolicy};
@@ -20,6 +21,19 @@ struct AppState {
     profile: Mutex<HardwareProfile>,
     policy: Mutex<PerformancePolicy>,
     proxies: Arc<ProxyManager>,
+    /// ffprobe results keyed by canonical path — importing and dragging a file
+    /// onto the timeline must not spawn repeated ffprobe subprocesses.
+    probe_cache: Mutex<HashMap<PathBuf, MediaInfo>>,
+}
+
+fn cached_probe(state: &AppState, path: &Path) -> Result<MediaInfo, String> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if let Some(info) = state.probe_cache.lock().get(&key) {
+        return Ok(info.clone());
+    }
+    let info = probe_media(path).map_err(|e| e.to_string())?;
+    state.probe_cache.lock().insert(key, info.clone());
+    Ok(info)
 }
 
 #[derive(Serialize)]
@@ -57,14 +71,34 @@ fn reprobe_hardware(state: State<'_, AppState>) -> BootInfo {
 
 #[tauri::command]
 fn import_media(path: String, state: State<'_, AppState>) -> Result<MediaInfo, String> {
-    let info = probe_media(PathBuf::from(&path).as_path()).map_err(|e| e.to_string())?;
+    let info = cached_probe(&state, PathBuf::from(&path).as_path())?;
     let policy = state.policy.lock().clone();
     let proxies = Arc::clone(&state.proxies);
     let source = PathBuf::from(&path);
+    // Queued on the background worker; completion is emitted via "proxy-ready".
     std::thread::spawn(move || {
         let _ = proxies.enqueue(source.as_path(), &policy);
     });
     Ok(info)
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyReadyPayload {
+    source_path: String,
+    proxy_path: String,
+}
+
+/// Repoint every timeline clip playing `source_path` to its finished proxy.
+#[tauri::command]
+fn swap_timeline_media(
+    source_path: String,
+    proxy_path: String,
+    state: State<'_, AppState>,
+) -> Result<Timeline, String> {
+    let mut editor = state.editor.lock();
+    editor.swap_media_path(&source_path, &proxy_path);
+    Ok(editor.timeline().clone())
 }
 
 fn playback_path(state: &AppState, media_path: &str) -> String {
@@ -90,7 +124,7 @@ fn place_media_on_timeline(
     media_path: String,
     start: f64,
 ) -> Result<Timeline, String> {
-    let info = probe_media(PathBuf::from(&media_path).as_path()).map_err(|e| e.to_string())?;
+    let info = cached_probe(state, PathBuf::from(&media_path).as_path())?;
     let out_point = if info.duration > 0.0 {
         info.duration
     } else {
@@ -997,7 +1031,12 @@ pub fn run() {
         profile: Mutex::new(profile),
         policy: Mutex::new(policy),
         proxies: Arc::new(ProxyManager::new(cache)),
+        probe_cache: Mutex::new(HashMap::new()),
     };
+
+    // Notify the UI when background proxy transcodes finish so the timeline
+    // can hot-swap from the original file to the proxy (registered in setup,
+    // where the AppHandle is available).
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1010,12 +1049,25 @@ pub fn run() {
                 "{\"sessionId\":\"75f279\",\"message\":\"yx-desktop setup\",\"hypothesisId\":\"H2\",\"timestamp\":0}"
                     .into(),
             );
+            let state: tauri::State<AppState> = tauri::Manager::state(app);
+            let handle = app.handle().clone();
+            let proxies = Arc::clone(&state.proxies);
+            proxies.set_notifier(Arc::new(move |job: &yx_proxy::ProxyJob| {
+                if matches!(job.status, yx_proxy::ProxyStatus::Ready) {
+                    let _ = handle.emit(
+                        "proxy-ready",
+                        ProxyReadyPayload {
+                            source_path: job.source_path.display().to_string(),
+                            proxy_path: job.proxy_path.display().to_string(),
+                        },
+                    );
+                }
+            }));
             #[cfg(desktop)]
             {
                 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-                use tauri::{Emitter, Manager};
-                use tauri_plugin_opener::OpenerExt;
+                use tauri::{Emitter, Manager};                use tauri_plugin_opener::OpenerExt;
 
                 fn show_main(app: &tauri::AppHandle) {
                     if let Some(window) = app.get_webview_window("main") {
@@ -1103,6 +1155,7 @@ pub fn run() {
             debug_agent_log,
             reprobe_hardware,
             import_media,
+            swap_timeline_media,
             add_media_to_timeline,
             add_clip_to_track,
             move_clip,
