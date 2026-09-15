@@ -211,15 +211,21 @@ fn move_clip(
     clip_id: String,
     new_start: f64,
     sync_linked: bool,
+    target_track_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
+    let target_track_id = match target_track_id {
+        Some(s) => Some(s.parse::<TrackId>().map_err(|e| format!("bad track id: {e}"))?),
+        None => None,
+    };
     let mut editor = state.editor.lock();
     editor
         .apply(EditCommand::MoveClip {
             clip_id,
             new_start,
             sync_linked,
+            target_track_id,
         })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())

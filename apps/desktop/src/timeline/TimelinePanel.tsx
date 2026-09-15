@@ -354,10 +354,12 @@ export function TimelinePanel({
       const tl = timelineRef.current;
       if (!tl) return;
       let clip: Clip | null = null;
+      let srcTrackId: string | null = null;
       for (const t of tl.tracks) {
         const hit = t.clips.find((c) => c.id === action.clipId);
         if (hit) {
           clip = hit;
+          srcTrackId = t.id;
           break;
         }
       }
@@ -367,18 +369,40 @@ export function TimelinePanel({
 
       switch (action.type) {
         case "move": {
-          // Optimistic update removes drop snap-back; backend confirms after.
-          onTimeline(
-            optimisticUpdate(tl, targetIds, (c) => ({ ...c, start: action.newStart })),
-          );
+          const targetTrackId = action.targetTrackId ?? null;
+          const crossTrack = Boolean(targetTrackId && srcTrackId && targetTrackId !== srcTrackId);
+          if (crossTrack) {
+            // Optimistic: relocate the dragged clip; the backend response
+            // (with linked-pair track mapping) replaces the state right after.
+            onTimeline({
+              ...tl,
+              tracks: tl.tracks.map((t) => {
+                if (t.id !== srcTrackId && t.id !== targetTrackId) return t;
+                let clips = t.clips;
+                if (t.id === srcTrackId) clips = clips.filter((c) => c.id !== clip.id);
+                if (t.id === targetTrackId) clips = [...clips, { ...clip, start: action.newStart }];
+                return { ...t, clips: [...clips].sort((a, b) => a.start - b.start) };
+              }),
+            });
+          } else {
+            // Same-track: optimistic update removes drop snap-back.
+            onTimeline(
+              optimisticUpdate(tl, targetIds, (c) => ({ ...c, start: action.newStart })),
+            );
+          }
           try {
             const next = await invoke<Timeline>("move_clip", {
               clipId: action.clipId,
               newStart: action.newStart,
               syncLinked: true,
+              targetTrackId,
             });
             onTimeline(next);
-            onStatus(`Moved to ${formatTime(action.newStart)}`);
+            onStatus(
+              crossTrack
+                ? `Moved to ${formatTime(action.newStart)} on new track`
+                : `Moved to ${formatTime(action.newStart)}`,
+            );
           } catch (e) {
             onStatus(String(e));
           } finally {

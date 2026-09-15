@@ -868,3 +868,17 @@ body.resizing-tl-headers {
   white-space: nowrap;
   font-family: var(--font);
 }
+
+/* Cross-track drag: ghost preview in the destination lane + lane highlight */
+.tl-clip-ghost {
+  opacity: 0.85;
+  background: rgba(255, 71, 87, 0.16);
+  outline: 1.5px dashed rgba(255, 71, 87, 0.9);
+  z-index: 40;
+}
+
+.tl-lane-drop-target {
+  outline: 2px solid rgba(255, 71, 87, 0.75);
+  outline-offset: -2px;
+  background: rgba(255, 71, 87, 0.06);
+}

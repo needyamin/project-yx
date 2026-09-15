@@ -439,6 +439,8 @@ pub enum EditCommand {
         clip_id: ClipId,
         new_start: f64,
         sync_linked: bool,
+        /// When set, relocate the clip to this track (same kind required).
+        target_track_id: Option<TrackId>,
     },
     SplitClip {
         clip_id: ClipId,
@@ -753,11 +755,30 @@ impl TimelineEditor {
                 clip_id,
                 new_start,
                 sync_linked,
+                target_track_id,
             } => {
-                let (_track_id, linked, placed) = self.move_clip_one(clip_id, new_start)?;
+                let (src_track_id, linked) = {
+                    let (track, idx) = self.timeline.find_clip(clip_id)?;
+                    (track.id, track.clips[idx].linked_clip_id)
+                };
+                let (dest_track_id, _linked, placed) =
+                    self.move_clip_one(clip_id, new_start, target_track_id)?;
                 if sync_linked {
                     if let Some(link) = linked {
-                        self.set_clip_start_absolute(link, placed)?;
+                        if dest_track_id != src_track_id {
+                            // Cross-track: keep the A/V pair lockstep by moving
+                            // the partner to the index-mapped track of its kind.
+                            match self.mapped_partner_track(dest_track_id, link) {
+                                Some(mapped) => {
+                                    self.relocate_clip_absolute(link, mapped, placed)?;
+                                }
+                                None => {
+                                    self.set_clip_start_absolute(link, placed)?;
+                                }
+                            }
+                        } else {
+                            self.set_clip_start_absolute(link, placed)?;
+                        }
                     }
                 }
                 Ok(EditResult {
@@ -1459,9 +1480,10 @@ impl TimelineEditor {
         &mut self,
         clip_id: ClipId,
         new_start: f64,
+        target_track_id: Option<TrackId>,
     ) -> Result<(TrackId, Option<ClipId>, f64), TimelineError> {
         let mode = self.timeline.edit_mode;
-        let (track_id, linked, dur, old_start, clip_snapshot) = {
+        let (track_id, linked, dur, old_start, clip_snapshot, clip_kind) = {
             let (track, idx) = self.timeline.find_clip(clip_id)?;
             if track.locked {
                 return Err(TimelineError::TrackLocked);
@@ -1473,11 +1495,36 @@ impl TimelineEditor {
                 clip.duration(),
                 clip.start,
                 clip,
+                track.kind,
             )
         };
 
+        // Resolve the destination track (cross-track moves keep the clip kind).
+        let dest_track_id = match target_track_id {
+            Some(dest) if dest != track_id => {
+                let dest_track = self
+                    .timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == dest)
+                    .ok_or(TimelineError::TrackNotFound(dest))?;
+                if dest_track.kind != clip_kind {
+                    return Err(TimelineError::MediaTrackMismatch);
+                }
+                if dest_track.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                if dest_track.hidden {
+                    return Err(TimelineError::TrackLocked);
+                }
+                dest
+            }
+            _ => track_id,
+        };
+        let same_track = dest_track_id == track_id;
+
         let desired = new_start.max(0.0);
-        if (desired - old_start).abs() < 1e-9 {
+        if same_track && (desired - old_start).abs() < 1e-9 {
             return Ok((track_id, linked, old_start));
         }
 
@@ -1490,7 +1537,12 @@ impl TimelineEditor {
         let placed = match mode {
             EditMode::Normal => {
                 let mut obstacles: Vec<(f64, f64)> = Vec::new();
-                if let Some(track) = self.timeline.tracks.iter().find(|t| t.id == track_id) {
+                if let Some(track) = self
+                    .timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == dest_track_id)
+                {
                     obstacles.extend(track.clips.iter().map(|c| (c.start, c.end())));
                 }
                 if let Some(link) = linked {
@@ -1507,33 +1559,114 @@ impl TimelineEditor {
                 self.resolve_non_overlapping_start_for_obstacles(desired, dur, &obstacles)
             }
             EditMode::Insert => {
-                // Close the hole left behind, then open space at the drop point.
-                if desired > old_start {
-                    // Moving right: close old hole, then push at destination.
-                    self.shift_clips_after(track_id, old_start + 1e-9, -dur)?;
-                    self.shift_clips_after(track_id, desired, dur)?;
-                    desired
+                if same_track {
+                    // Close the hole left behind, then open space at the drop point.
+                    if desired > old_start {
+                        // Moving right: close old hole, then push at destination.
+                        self.shift_clips_after(track_id, old_start + 1e-9, -dur)?;
+                        self.shift_clips_after(dest_track_id, desired, dur)?;
+                        desired
+                    } else {
+                        // Moving left: push at destination first, then close old hole
+                        // (old hole index shifts by +dur for clips that were after old_start).
+                        self.shift_clips_after(dest_track_id, desired, dur)?;
+                        self.shift_clips_after(track_id, old_start + dur + 1e-9, -dur)?;
+                        desired
+                    }
                 } else {
-                    // Moving left: push at destination first, then close old hole
-                    // (old hole index shifts by +dur for clips that were after old_start).
-                    self.shift_clips_after(track_id, desired, dur)?;
-                    self.shift_clips_after(track_id, old_start + dur + 1e-9, -dur)?;
+                    // Cross-track: close the hole on the source, open space on the destination.
+                    self.shift_clips_after(track_id, old_start + 1e-9, -dur)?;
+                    self.shift_clips_after(dest_track_id, desired, dur)?;
                     desired
                 }
             }
             EditMode::Overwrite => {
-                self.overwrite_range(track_id, desired, desired + dur)?;
+                self.overwrite_range(dest_track_id, desired, desired + dur)?;
                 desired
             }
         };
 
-        let track = self.timeline.track_mut(track_id)?;
+        let track = self.timeline.track_mut(dest_track_id)?;
         track.clips.push(Clip {
             start: placed,
             ..clip_snapshot
         });
         Timeline::sort_track(track);
-        Ok((track_id, linked, placed))
+        Ok((dest_track_id, linked, placed))
+    }
+
+    /// Track of the partner's kind occupying the same row position as
+    /// `dest_track_id` (V1↔A1, V2↔A2, …). Returns None when no usable match.
+    fn mapped_partner_track(
+        &self,
+        dest_track_id: TrackId,
+        partner_clip_id: ClipId,
+    ) -> Option<TrackId> {
+        let dest_track = self
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == dest_track_id)?;
+        let partner_track = self.timeline.find_clip(partner_clip_id).ok()?.0;
+        if partner_track.kind == dest_track.kind {
+            return None;
+        }
+        let kind_index = self
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == dest_track.kind)
+            .position(|t| t.id == dest_track_id)?;
+        let mapped = self
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == partner_track.kind)
+            .nth(kind_index)?;
+        if mapped.locked || mapped.hidden {
+            return None;
+        }
+        Some(mapped.id)
+    }
+
+    /// Force a clip onto an absolute timeline start on a (possibly different)
+    /// track, preserving A/V sync. Overlaps are not resolved (pair moves keep
+    /// lockstep like `set_clip_start_absolute`).
+    fn relocate_clip_absolute(
+        &mut self,
+        clip_id: ClipId,
+        dest_track_id: TrackId,
+        start: f64,
+    ) -> Result<(), TimelineError> {
+        let (src_track_id, kind) = {
+            let (track, _idx) = self.timeline.find_clip(clip_id)?;
+            (track.id, track.kind)
+        };
+        if src_track_id == dest_track_id {
+            self.set_clip_start_absolute(clip_id, start)?;
+            return Ok(());
+        }
+        let dest_track = self
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == dest_track_id)
+            .ok_or(TimelineError::TrackNotFound(dest_track_id))?;
+        if dest_track.kind != kind {
+            return Err(TimelineError::MediaTrackMismatch);
+        }
+        if dest_track.locked || dest_track.hidden {
+            return Err(TimelineError::TrackLocked);
+        }
+        let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+        let clip = track.clips.remove(idx);
+        let dest_track = self.timeline.track_mut(dest_track_id)?;
+        dest_track.clips.push(Clip {
+            start: start.max(0.0),
+            ..clip
+        });
+        Timeline::sort_track(dest_track);
+        Ok(())
     }
 
     /// Force a clip onto an absolute timeline start (used for linked A/V sync).
@@ -2038,6 +2171,7 @@ mod tests {
             clip_id: left,
             new_start: 7.0,
             sync_linked: false,
+            target_track_id: None,
         })
         .unwrap();
 
@@ -2076,6 +2210,7 @@ mod tests {
             clip_id: vid,
             new_start: 3.0,
             sync_linked: true,
+            target_track_id: None,
         })
         .unwrap();
         assert!((ed.timeline.tracks[0].clips[0].start - 3.0).abs() < 1e-9);
@@ -2086,6 +2221,111 @@ mod tests {
             .find(|t| t.kind == TrackKind::Audio)
             .unwrap();
         assert!((a.clips[0].start - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn move_clip_to_track_moves_within_kind() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let v2 = ed
+            .apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
+            .unwrap();
+        let _ = v2;
+        let clip_id = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "clip.mp4".into(),
+                source_path: None,
+                start: 2.0,
+                in_point: 0.0,
+                out_point: 5.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        let v2_id = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Video && t.id != v1)
+            .unwrap()
+            .id;
+        ed.apply(EditCommand::MoveClip {
+            clip_id,
+            new_start: 4.0,
+            sync_linked: false,
+            target_track_id: Some(v2_id),
+        })
+        .unwrap();
+        // Gone from the source track…
+        assert!(ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == v1)
+            .unwrap()
+            .clips
+            .is_empty());
+        // …and present on the destination track at the requested start.
+        let dest = ed.timeline.tracks.iter().find(|t| t.id == v2_id).unwrap();
+        assert_eq!(dest.clips.len(), 1);
+        assert!((dest.clips[0].start - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn move_cross_track_syncs_linked_pair() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        ed.apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
+            .unwrap();
+        ed.apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
+            .unwrap();
+        let res = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "clip.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 8.0,
+            })
+            .unwrap();
+        let vid = res.primary_clip_id.unwrap();
+        let v2_id = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .nth(1)
+            .unwrap()
+            .id;
+        let a2_id = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .nth(1)
+            .unwrap()
+            .id;
+        ed.apply(EditCommand::MoveClip {
+            clip_id: vid,
+            new_start: 2.0,
+            sync_linked: true,
+            target_track_id: Some(v2_id),
+        })
+        .unwrap();
+        let v2 = ed.timeline.tracks.iter().find(|t| t.id == v2_id).unwrap();
+        let a2 = ed.timeline.tracks.iter().find(|t| t.id == a2_id).unwrap();
+        assert_eq!(v2.clips.len(), 1);
+        assert_eq!(a2.clips.len(), 1);
+        assert!((v2.clips[0].start - 2.0).abs() < 1e-9);
+        // Partner stays in lockstep on the mapped track.
+        assert!((a2.clips[0].start - 2.0).abs() < 1e-9);
+        assert_eq!(a2.clips[0].linked_clip_id, Some(vid));
     }
 
     #[test]
@@ -2818,6 +3058,7 @@ mod tests {
             clip_id: short,
             new_start: 4.0,
             sync_linked: false,
+            target_track_id: None,
         })
         .unwrap();
         let _ = left;
@@ -2874,6 +3115,7 @@ mod tests {
             clip_id: c3,
             new_start: 5.5,
             sync_linked: false,
+            target_track_id: None,
         })
         .unwrap();
 
@@ -2951,6 +3193,7 @@ mod tests {
             clip_id: left_v,
             new_start: 1.0,
             sync_linked: true,
+            target_track_id: None,
         })
         .unwrap();
         let v_start = ed.timeline.tracks[0].clips[0].start;
@@ -3039,6 +3282,7 @@ mod tests {
                 clip_id: link,
                 new_start: before + 2.0,
                 sync_linked: false,
+                target_track_id: None,
             })
             .unwrap();
             let a = ed

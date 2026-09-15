@@ -9,7 +9,13 @@ import {
 import type { TimelineView } from "./useTimelineView";
 
 export type ClipEditAction =
-  | { type: "move"; clipId: string; newStart: number }
+  | {
+      type: "move";
+      clipId: string;
+      newStart: number;
+      /** When set, drop the clip onto this track (cross-track move). */
+      targetTrackId?: string | null;
+    }
   | { type: "trim"; clipId: string; inPoint: number; outPoint: number; keepEnd: boolean }
   | { type: "razor"; clipId: string; at: number }
   | { type: "rippleTrim"; clipId: string; edge: "left" | "right"; newEdgeTime: number }
@@ -135,6 +141,10 @@ function ClipBlockImpl({
     const resolved: DragMode = mode;
 
     const originX = e.clientX;
+    const originY = e.clientY;
+    const originLane = (e.currentTarget as HTMLElement).closest(
+      ".tl-lane",
+    ) as HTMLElement | null;
     const originStart = clip.start;
     const originIn = clip.in_point;
     const originOut = clip.out_point;
@@ -169,6 +179,63 @@ function ClipBlockImpl({
 
     let rafId: number | null = null;
     let pendingEv: PointerEvent | null = null;
+
+    /* Cross-track drag targeting: while the pointer vertically leaves the
+     * origin lane (> 14px), resolve the lane under the pointer and float a
+     * ghost preview there. All DOM updates are imperative (no re-renders). */
+    let ghost: HTMLDivElement | null = null;
+    let ghostLaneEl: HTMLElement | null = null;
+    let targetTrackId: string | null = null;
+
+    const updateTrackTarget = (ev: PointerEvent, startPx: number) => {
+      let lane: HTMLElement | null = null;
+      if (Math.abs(ev.clientY - originY) > 14) {
+        const hit = document
+          .elementFromPoint(ev.clientX, ev.clientY)
+          ?.closest(".tl-lane") as HTMLElement | null;
+        if (
+          hit &&
+          hit !== originLane &&
+          !hit.classList.contains("collapsed") &&
+          !hit.classList.contains("locked") &&
+          hit.classList.contains(`track-${clip.role}`)
+        ) {
+          lane = hit;
+        }
+      }
+      const laneTrackId = lane?.dataset.trackId ?? null;
+      if (laneTrackId !== targetTrackId) {
+        ghostLaneEl?.classList.remove("tl-lane-drop-target");
+        ghost?.remove();
+        ghost = null;
+        ghostLaneEl = null;
+        targetTrackId = laneTrackId;
+        if (lane && targetTrackId) {
+          lane.classList.add("tl-lane-drop-target");
+          ghost = document.createElement("div");
+          ghost.className = `tl-clip tl-clip-ghost role-${clip.role}`;
+          ghost.style.pointerEvents = "none";
+          const name = document.createElement("span");
+          name.className = "tl-clip-name";
+          name.textContent = fileName(clip.media_path);
+          ghost.appendChild(name);
+          lane.appendChild(ghost);
+          ghostLaneEl = lane;
+        }
+      }
+      if (ghost) {
+        ghost.style.left = `${startPx}px`;
+        ghost.style.width = `${Math.max(12, view.timeToX(originDur))}px`;
+      }
+    };
+
+    const clearTrackTarget = () => {
+      ghostLaneEl?.classList.remove("tl-lane-drop-target");
+      ghost?.remove();
+      ghost = null;
+      ghostLaneEl = null;
+      targetTrackId = null;
+    };
 
     const processMove = (ev: PointerEvent) => {
       const dx = ev.clientX - originX;
@@ -251,6 +318,7 @@ function ClipBlockImpl({
           fade_in: originFadeIn,
           fade_out: originFadeOut,
         };
+        updateTrackTarget(ev, view.timeToX(next));
         setDraft(latest);
         onLiveDrag?.("move", clip.id, {
           start: latest.start,
@@ -347,6 +415,8 @@ function ClipBlockImpl({
         processMove(pendingEv);
         pendingEv = null;
       }
+      const dropTargetTrackId = targetTrackId;
+      clearTrackTarget();
       view.showSnapGuide(null);
       draggingRef.current = false;
       onDragActive?.(false);
@@ -389,8 +459,13 @@ function ClipBlockImpl({
         Math.abs(latest.out_point - originOut) > 0.001;
 
       if (resolved === "move") {
-        if (moved) {
-          onEdit({ type: "move", clipId: clip.id, newStart: latest.start });
+        if (moved || dropTargetTrackId) {
+          onEdit({
+            type: "move",
+            clipId: clip.id,
+            newStart: latest.start,
+            targetTrackId: dropTargetTrackId,
+          });
         }
       } else if (moved) {
         if (tool === "ripple") {

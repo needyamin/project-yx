@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { AboutDialog } from "./AboutDialog";
 import "./TopMenubar.css";
 
 export type MenuId = "file" | "edit" | "view" | "run" | "help" | null;
@@ -37,6 +38,7 @@ type Props = {
 
 const DOCS = "https://github.com/needyamin/project-yx#readme";
 const ISSUES = "https://github.com/needyamin/project-yx/issues";
+const CONTACT = "https://project-yx.blogspot.com/#support";
 
 export function TopMenubar({
   tier,
@@ -272,6 +274,13 @@ export function TopMenubar({
           <button
             type="button"
             role="menuitem"
+            onClick={item(() => void openUrl(CONTACT))}
+          >
+            Contact Us
+          </button>
+          <button
+            type="button"
+            role="menuitem"
             onClick={item(() => void openUrl(ISSUES))}
           >
             Report Issue
@@ -308,19 +317,7 @@ export function TopMenubar({
       </div>
 
       {aboutOpen && (
-        <div
-          className="about-modal"
-          role="dialog"
-          aria-label="About"
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <strong>Project YX</strong>
-          <p>Version {version}</p>
-          <p className="about-muted">Open-source desktop video editor</p>
-          <button type="button" className="ghost-btn" onClick={() => setAboutOpen(false)}>
-            Close
-          </button>
-        </div>
+        <AboutDialog version={version} onClose={() => setAboutOpen(false)} />
       )}
     </header>
   );
