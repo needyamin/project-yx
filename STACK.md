@@ -79,13 +79,17 @@ Tauri features enabled in `yx-desktop`: `protocol-asset`, `tray-icon`.
 
 | Area | Path | Notes |
 |------|------|--------|
-| Shell / layout | `layout/` | Editor chrome, top menubar |
-| Project bin | `bin/` | Media library, effects bin |
-| Monitors | `monitors/` | Clip + project preview |
-| Timeline | `timeline/` | Tracks, clips, tools, shortcuts |
-| Effects | `effects/` | Catalog, inspector, preview CSS filters |
-| Export | `export/` | Export dialog / presets |
-| Updates | `update/` | Check-for-updates UI |
+| Shell / layout | `layout/` | Editor chrome, top menubar, performance tier indicator |
+| Project bin | `bin/` | Media library (Media/Audio/Effects/Applied tabs), drag-and-drop |
+| Monitors | `monitors/` | Clip + project preview, transform handles, crop tool, chroma eyedropper |
+| Timeline | `timeline/` | Tracks, clips, sticky tools (S/X/M/Y/R), edit modes, zoom/snap |
+| Recording | `timeline/` | Screen recorder (screen/mic/system audio/camera bubble) & voiceover |
+| Audio tools | `audio/` | Advanced Audio Tools dialog, multi-channel waveform peak extraction & cutting |
+| Video tools | `video/` | Advanced Video Tools dialog, clip speed (0.25×–4×), reverse playback |
+| Effects | `effects/` | Catalog, inspector, preview CSS filters & FFmpeg mapping |
+| UI components | `ui/` | Reusable editor context menus & overlays |
+| Export | `export/` | Export dialog, resolution presets (YouTube, TikTok, Instagram, 4K) |
+| Updates | `update/` | Check-for-updates UI dialog |
 
 Styling is mostly plain CSS beside components (no Tailwind / UI kit required).
 
@@ -99,12 +103,12 @@ Root: [`Cargo.toml`](Cargo.toml) — workspace resolver `"2"`, edition **2021**.
 
 | Crate | Path | Responsibility |
 |-------|------|----------------|
-| **yx-detect** | `crates/yx-detect` | CPU/GPU/encoder probe and performance tiers (weak machines stay usable) |
+| **yx-detect** | `crates/yx-detect` | CPU/GPU/encoder probe, binary resolution (`ffmpeg`/`ffprobe`), performance tiers |
 | **yx-timeline** | `crates/yx-timeline` | Pure timeline model: tracks, clips, cuts, undo — **no I/O** |
-| **yx-media** | `crates/yx-media` | FFmpeg CLI probe / export / progress (no libav link in Phase 1) |
+| **yx-media** | `crates/yx-media` | FFmpeg CLI probe / export / progress parsing (no libav link in Phase 1) |
 | **yx-compositor** | `crates/yx-compositor` | Filter budget / composition policy (wgpu path planned) |
 | **yx-proxy** | `crates/yx-proxy` | Background proxy transcodes for smooth editing |
-| **yx-desktop** | `apps/desktop/src-tauri` | Tauri commands, wiring crates to the UI |
+| **yx-desktop** | `apps/desktop/src-tauri` | Tauri commands, tray icon, wiring crates to the UI |
 
 ### Shared Rust dependencies (workspace)
 
@@ -125,12 +129,14 @@ Configured for smaller/faster shipping binaries: `lto = true`, `opt-level = 3`, 
 | Concern | How it works |
 |---------|----------------|
 | Probe / import | `ffprobe` via `yx-media` |
-| Export | `ffmpeg` subprocess with progress parsing |
-| Preview effects | Mostly CSS / compositor policy in UI + Rust (WYSIWYG intent vs export filters) |
+| Export | `ffmpeg` subprocess with progress parsing (`command_no_window` suppresses console flashes) |
+| Preview effects | Real-time CSS filters & WebGL canvas overlays with WYSIWYG monitor interaction |
+| Waveforms | Client-side audio peak extraction via Web Audio API (`audio/waveformPeaks.ts`) |
+| Recording | Screen capture & microphone recording via browser `MediaStream` / `MediaRecorder` APIs |
 | Proxies | `yx-proxy` generates lighter edit media; export prefers originals |
-| Hardware | `yx-detect` influences proxy/export choices |
+| Hardware | `yx-detect` influences proxy/export choices and NVENC / QSV / AMF hardware acceleration |
 
-**Bundling & Runtime:** Releases bundle `ffmpeg` and `ffprobe` directly into the package (`bin/` resources) for zero-setup out-of-the-box editing and 4K export. The engine (`yx-detect`) automatically checks the application directory first and cleanly falls back to system `PATH` if custom binaries are desired.
+**Bundling & Runtime:** Releases bundle `ffmpeg` and `ffprobe` directly into the package (`bin/` resources via `scripts/prepare-binaries.js`) for zero-setup out-of-the-box editing and 4K export. The engine (`yx-detect`) automatically checks the application directory first and cleanly falls back to system `PATH` if custom binaries are desired.
 
 ---
 
@@ -138,8 +144,8 @@ Configured for smaller/faster shipping binaries: `lto = true`, `opt-level = 3`, 
 
 | Tool | Role |
 |------|------|
-| **npm** (root + `apps/desktop`) | Scripts: `dev`, `build`, `dist:*`, `clean` |
-| **Node scripts** | `scripts/` — NSIS copy, portable ZIP/SFX, Inno, MSIX, Docker Linux |
+| **npm** (root + `apps/desktop`) | Scripts: `dev`, `build`, `dist:*`, `clean`, `prepare:bin` |
+| **Node scripts** | `scripts/` — binary preparation (`prepare-binaries.js`), NSIS copy, portable ZIP/SFX, Inno, MSIX, Docker Linux |
 | **Inno Setup** | Optional Windows installer (`ISCC.exe`) |
 | **Windows SDK MakeAppx** | MSIX packaging |
 | **Docker** | Linux AppImage build from Windows (`docker/`) |

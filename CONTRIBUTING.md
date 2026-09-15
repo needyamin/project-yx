@@ -16,7 +16,7 @@ Full stack map: [`STACK.md`](STACK.md) · User docs / dist: [`README.md`](README
 
 1. This is **Tauri 2**, not Electron. Do not add Electron, electron-builder, or rewrite the shell.
 2. Keep the **Cargo workspace** and crates under `crates/` — do not flatten into a single crate without discussion.
-3. **FFmpeg / ffprobe stay on PATH** (system install). Do not silently bundle FFmpeg into installers unless maintainers agree and licensing is documented.
+3. **FFmpeg / ffprobe**: End-user release installers bundle FFmpeg and ffprobe automatically via `prepare-binaries.js`. For local development, keep `ffmpeg` and `ffprobe` on your system `PATH` (or run `npm run prepare:bin` to stage them into `apps/desktop/src-tauri/bin/`).
 4. License is **GPL-3.0-or-later** — no incompatible proprietary deps.
 5. Never commit secrets: `yx-updater.key`, `*.pfx`, `.env`, signing passwords.
 
@@ -28,17 +28,24 @@ Full stack map: [`STACK.md`](STACK.md) · User docs / dist: [`README.md`](README
 git clone https://github.com/needyamin/project-yx.git
 cd project-yx
 npm --prefix apps/desktop install
-npm run tauri dev
+npm run dev
+# or: npm run tauri dev
 ```
 
 - UI: Vite at `http://localhost:1420` inside the Tauri window  
-- Need `ffmpeg` + `ffprobe` on PATH for import/export  
+- Need `ffmpeg` + `ffprobe` on PATH for import/export (or run `npm run prepare:bin`)  
 - Windows: WebView2 + VS C++ Build Tools  
 
 Sanity build:
 
 ```bash
 npm run build
+```
+
+Stage bundled binaries locally:
+
+```bash
+npm run prepare:bin
 ```
 
 Icon refresh (from `apps/desktop/public/logo.png`):
@@ -55,17 +62,22 @@ cd apps/desktop && npm run icons
 |----------------------|---------|
 | Project Bin, drag/drop media | `apps/desktop/src/bin/` |
 | Timeline UI, tools, shortcuts | `apps/desktop/src/timeline/` |
+| Screen recorder & voiceover | `apps/desktop/src/timeline/ScreenRecorderButton.tsx`, `VoiceoverButton.tsx` |
 | Clip / project monitors, crop tool | `apps/desktop/src/monitors/` |
+| Advanced Audio Tools dialog, waveforms | `apps/desktop/src/audio/` |
+| Advanced Video Tools dialog, speed/reverse | `apps/desktop/src/video/` |
 | Effects catalog + Applied inspector | `apps/desktop/src/effects/` |
 | Export dialog / presets | `apps/desktop/src/export/` |
 | Menubar / editor chrome | `apps/desktop/src/layout/` |
+| Context menus & reusable UI | `apps/desktop/src/ui/` |
 | Auto-update check UI | `apps/desktop/src/update/` |
 | Tauri commands, tray, wiring | `apps/desktop/src-tauri/src/` |
 | Tracks / clips / undo (pure model) | `crates/yx-timeline/` |
 | FFmpeg probe & export | `crates/yx-media/` |
-| Hardware tiers | `crates/yx-detect/` |
+| Hardware tiers & binary discovery | `crates/yx-detect/` |
 | Proxy jobs | `crates/yx-proxy/` |
 | Filter / preview budget | `crates/yx-compositor/` |
+| Binary staging & bundling | `scripts/prepare-binaries.js` |
 | NSIS / portable / Inno / MSIX / AppImage | `scripts/`, `installer/`, `docker/` |
 
 App id: `com.projectyx.editor` · Product name: **Project YX**
@@ -121,6 +133,8 @@ Match the area you touched:
 | UI only | `npm run tauri dev` — click through Bin / timeline / monitor |
 | Timeline model | `cargo test -p yx-timeline` (and UI smoke) |
 | Media / export | Import a short clip, run an export preset, confirm progress |
+| Audio / Video tools | Right-click clip → open Advanced Audio/Video dialogs, test waveform selection / speed |
+| Recording | Trigger Screen Recorder and Voiceover buttons on the timeline |
 | Effects | Apply effect, toggle on/off, confirm monitor + export if filters changed |
 | Packaging | `npm run dist:nsis` or `npm run dist:release -- --windows-only` — only if you edited `scripts/` / installer |
 
