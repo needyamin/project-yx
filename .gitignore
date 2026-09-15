@@ -41,6 +41,9 @@ coverage/
 *.cer
 !apps/desktop/src-tauri/yx-updater.key.pub
 
+# Microsoft Store identity (real values are local-only; commit the .example)
+store-identity.json
+
 # Updater signing — private keys only (public .pub may be committed)
 apps/desktop/src-tauri/yx-updater.key
 apps/desktop/src-tauri/*.key

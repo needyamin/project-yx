@@ -27,8 +27,40 @@ See [STACK.md](STACK.md) for full stack details.
 - **Export popup** with presets (Best = same size as source · max quality; YouTube, TikTok, Instagram, 4K, Draft, Custom)
 - **Background FFmpeg encode** with live **progress bar** (UI stays responsive)
 - Best export uses software x264, CRF 15, slow preset, source fps/size (no forced downscale)
-- Proxies + capped encode threads for weaker CPUs
+- Hardware-accelerated export when available: NVENC / Intel QSV / AMD AMF
 - **Auto-update** from [GitHub Releases](https://github.com/needyamin/project-yx/releases) (Help → Check for Updates)
+
+### Playback & editing performance
+
+Project YX is engineered to stay smooth on weak machines:
+
+- **Proxy editing** — imports transcode to a lightweight proxy in a **single background queue** (never blocks the UI); when a proxy is ready the timeline **hot-swaps automatically** and preview gets smoother with no restart
+- **Gapless cuts** — the project monitor double-buffers video, preloading the next clip so cuts between files don't stall the decoder
+- **Frame-driven playback clock** — the playhead, audio sync and cut handling run on `requestAnimationFrame` (display refresh rate), not the 4 Hz `timeupdate` event
+- **Zero re-render timeline** — playhead, scrubbing and snap guides are painted imperatively; clips only re-render when their own data changes, so long timelines keep dragging and scrubbing fluid
+- **One-time waveform decode** — audio peaks decode each file once and survive trimming
+- **Performance tiers** — `yx-detect` probes CPU/RAM/GPU at launch and picks a tier (potato → high) that caps encode threads and proxy quality accordingly
+
+## System Requirements
+
+### End users
+
+| | Minimum | Recommended |
+|---|---|---|
+| **OS** | Windows 10 64-bit or Linux (AppImage) | Windows 11 64-bit |
+| **CPU** | Dual-core x86-64 (2 cores / 2 threads) | 6+ cores (Intel i5/Ryzen 5 or better) |
+| **RAM** | 4 GB | 8–16 GB (16 GB for 4K projects) |
+| **GPU** | Integrated graphics | Discrete GPU (NVIDIA / AMD / Intel with NVENC, QSV or AMF) |
+| **Storage** | 500 MB app + space for media | SSD; space for proxy cache + exports |
+| **Display** | 1280 × 720 | 1920 × 1080 or higher |
+| **Runtime** | WebView2 (preinstalled on Windows 10/11) | — |
+
+Notes:
+
+- FFmpeg + ffprobe are **bundled** in release packages — no manual install needed for normal use
+- The performance tier and proxy quality are **auto-detected** at launch; weak machines automatically edit from proxies
+- The proxy cache lives outside the repo at `%LOCALAPPDATA%\ProjectYX\proxy-cache` (Windows) — delete it anytime to reclaim space; proxies regenerate on demand
+- On Linux, AppImage builds require the usual WebKitGTK/Tauri runtime libraries (`webkit2gtk`), which the AppImage bundling targets
 
 ## Timeline shortcuts
 
@@ -41,12 +73,16 @@ See [STACK.md](STACK.md) for full stack details.
 | R | Ripple |
 | I / O | Zone in / out |
 | Space | Play / pause |
+| Ctrl+B | Split clip at playhead |
+| ← / → | Step 1 frame (hold Shift: 1 second) |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Del | Delete clip |
 
+Timeline navigation: **Ctrl+wheel** zooms, drag the ruler to scrub.
+
 Modes: **Normal**, **Insert**, **Overwrite** (via **More…** or context menu). Zone: Lift / Extract.
 
-## Prerequisites
+## Prerequisites (development only — end users just download a release)
 
 ### Always
 

@@ -421,6 +421,7 @@ function ClipBlockImpl({
 
   return (
     <div
+      data-clip-id={clip.id}
       className={`tl-clip role-${clip.role} ${selected ? "selected" : ""} ${clip.linked_clip_id ? "linked" : ""} ${draft || previewing ? "dragging" : ""}`}
       style={{ left, width, cursor }}
       onPointerDown={(e) => beginDrag(e, "move")}
