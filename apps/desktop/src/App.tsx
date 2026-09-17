@@ -11,15 +11,22 @@ import { checkForAppUpdate } from "./update/checkUpdate";
 import { UpdateDialog } from "./update/UpdateDialog";
 import { ClipMonitor } from "./monitors/ClipMonitor";
 import { ProjectMonitor, type PreviewAspect, type PreviewMode } from "./monitors/ProjectMonitor";
+import { pointInElement } from "./monitors/monitorGeometry";
+import type { TextPresetParams } from "./monitors/TextPresets";
 import { EffectInspector } from "./effects/EffectInspector";
 import {
   EFFECT_CATALOG,
   defaultParams,
   effectLabel,
+  findMagicRemove,
+  magicRenderKey,
+  magicResultReady,
   previewPitchRate,
   previewVideoStyle,
   previewVolumeGain,
   type FilterInstance,
+  type MagicKeyframe,
+  type MagicStroke,
 } from "./effects/effects";
 import {
   AdvancedAudioDialog,
@@ -38,10 +45,14 @@ import {
   fileName,
   findLinkPartner,
   formatTime,
+  IMAGE_EXTENSIONS,
   isImagePath,
+  mediaTimeForClip,
   nextClipAfter,
+  videoStackAtPlayhead,
   timelineDuration,
   type BootInfo,
+  type Clip,
   type EditMode,
   type LibraryItem,
   type MediaInfo,
@@ -49,6 +60,13 @@ import {
   type TimelineTool,
 } from "./timeline/types";
 import "./App.css";
+
+/** Compact length for notices ("1m 24s"). */
+function fmtLen(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
 
 function clipSpeed(clip: { speed?: number }): number {
   const raw = clip.speed ?? 1;
@@ -86,6 +104,7 @@ const UPSERT_FILTER_KINDS = new Set([
   "gate",
   "normalize",
   "deesser",
+  "magicremove",
 ]);
 
 /** React-state playhead refresh while playing (the live playhead is moved
@@ -125,17 +144,12 @@ function isMediaPath(path: string): boolean {
   return (MEDIA_EXTENSIONS as readonly string[]).includes(ext);
 }
 
-/** Media-file time for timeline position t within a clip (handles speed + reverse). */
-function mediaTimeForClip(
-  clip: { start: number; in_point: number; out_point: number; reverse?: boolean; speed?: number },
-  t: number,
-): number {
-  const speed = clipSpeed(clip);
-  const local = t - clip.start;
-  const media = clip.reverse
-    ? clip.out_point - local * speed
-    : clip.in_point + local * speed;
-  return Math.max(clip.in_point, Math.min(media, clip.out_point - 0.01));
+const TEXT_EXTENSIONS = ["txt", "text"] as const;
+
+/** Plain-text files droppable onto the Project Monitor (become a title). */
+function isTextPath(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return (TEXT_EXTENSIONS as readonly string[]).includes(ext);
 }
 
 /** Reuse prior {track,clip} when still the same clip object (avoids effect thrash). */
@@ -184,16 +198,9 @@ function App() {
   const audioUnderCache = useRef<UnderPlayhead | null>(null);
   const videoUnderRef = useRef<UnderPlayhead | null>(null);
   const audioUnderRef = useRef<UnderPlayhead | null>(null);
+  const selectedClipIdRef = useRef<string | null>(null);
   const monitorVolumeRef = useRef(1);
   const monitorMutedRef = useRef(false);
-  const lastVideoStyle = useRef({
-    filter: "",
-    transform: "",
-    opacity: "",
-    clipPath: "",
-    objectViewBox: "",
-    objectFit: "",
-  });
   const lastAudioVolume = useRef(-1);
   const timelineDropRef = useRef<((clientX: number) => number) | null>(null);
   const viewControlsRef = useRef<{
@@ -223,8 +230,21 @@ function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  /** OS file drag hovering the Project Monitor frame (routed drop target). */
+  const [monitorFileDrop, setMonitorFileDrop] = useState(false);
+  const [monitorFileDropLabel, setMonitorFileDropLabel] = useState<string | null>(null);
+  const monitorFrameRef = useRef<HTMLDivElement | null>(null);
+  const monitorDropPathsRef = useRef<string[] | null>(null);
   const [exportProgress, setExportProgress] = useState(0);
   const [cropTool, setCropTool] = useState(false);
+  /** Magic Remove (AI Eraser) tool + pipeline progress. */
+  const [magicTool, setMagicTool] = useState(false);
+  const [magicBusy, setMagicBusy] = useState<{ phase: string; percent: number } | null>(null);
+  const [magicStatus, setMagicStatus] = useState<string | null>(null);
+  /** Panel values before the filter exists (first stroke creates it). */
+  const [magicDraft, setMagicDraft] = useState<Record<string, unknown> | null>(null);
+  const magicDraftRef = useRef<Record<string, unknown> | null>(null);
+  const magicStatusTickRef = useRef(0);
   const [snapOn, setSnapOn] = useState(true);
   const [monitorVolume, setMonitorVolume] = useState(1);
   const [monitorMuted, setMonitorMuted] = useState(false);
@@ -236,6 +256,60 @@ function App() {
   // never during render (safe under concurrent rendering).
   useEffect(() => {
     timelineRef.current = timeline;
+  }, [timeline]);
+
+  /** VITA-style stacking default: a still image that ends up ABOVE video
+   * content (fresh drop or a manual track move) with no transform of its own
+   * gets a sensible PiP size instead of covering the whole video.
+   * Images scanned before they overlap any video stay ELIGIBLE — the user
+   * may move them over content later — so only a successfully applied PiP
+   * (or an existing transform) marks a clip as done. */
+  const autoPipDoneRef = useRef<Set<string>>(new Set());  useEffect(() => {
+    if (!timeline) return;
+    const videoTracks = timeline.tracks.filter((t) => t.kind === "video" && !t.hidden);
+    const targets: string[] = [];
+    videoTracks.forEach((track, vi) => {
+      for (const clip of track.clips) {
+        if (autoPipDoneRef.current.has(clip.id)) continue;
+        if (!isImagePath(clip.media_path)) {
+          autoPipDoneRef.current.add(clip.id); // videos never auto-PiP
+          continue;
+        }
+        if ((clip.filters ?? []).some((f) => f.kind === "transform")) {
+          autoPipDoneRef.current.add(clip.id); // already has intent
+          continue;
+        }
+        const start = clip.start;
+        const end = clip.start + clipTimelineDuration(clip);
+        const overVideoContent = videoTracks
+          .slice(0, vi)
+          .some((lower) =>
+            lower.clips.some(
+              (c) => c.start < end && c.start + clipTimelineDuration(c) > start,
+            ),
+          );
+        if (overVideoContent) targets.push(clip.id);
+      }
+    });
+    if (targets.length === 0) return;
+    void (async () => {
+      for (const clipId of targets) {
+        try {
+          const updated = normalizeTimeline(
+            await invoke<Timeline>("add_filter", {
+              clipId,
+              kind: "transform",
+              params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+            }),
+          );
+          autoPipDoneRef.current.add(clipId);
+          setTimeline(updated);
+          setStatus("Overlay image sized to fit — drag it in the monitor to position");
+        } catch (e) {
+          setStatus(String(e));
+        }
+      }
+    })();
   }, [timeline]);
   useEffect(() => {
     playingRef.current = playing;
@@ -255,6 +329,34 @@ function App() {
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
+
+  // Magic Remove pipeline progress (tracking / background reconstruction).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ percent: number; phase: string }>("magic-progress", (event) => {
+      const { percent, phase } = event.payload;
+      if (phase === "done") {
+        setMagicBusy(null);
+        setStatus("✨ Magic Remove finished — the monitor now previews the cleaned video.");
+        return;
+      }
+      setMagicBusy({ phase, percent });
+      // Mirror progress into the status bar (throttled) so it stays visible
+      // even when the Magic Remove panel is closed.
+      const now = Date.now();
+      if (now - magicStatusTickRef.current > 700) {
+        magicStatusTickRef.current = now;
+        setStatus(
+          `✨ Magic Remove ${phase === "tracking" ? "tracking mask" : "rebuilding background"}… ${Math.round(percent * 100)}%`,
+        );
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   // Background proxy finished → hot-swap timeline clips onto the proxy so
   // playback gets smoother without any user action.
@@ -364,6 +466,7 @@ function App() {
     videoUnderRef.current = videoUnderPlayhead;
     audioUnderRef.current = audioUnderPlayhead;
     audioUnder2Ref.current = audioUnderPlayhead2;
+    selectedClipIdRef.current = selectedClipId;
     previewModeRef.current = videoUnderPlayhead
       ? "video"
       : audioUnderPlayhead
@@ -378,12 +481,53 @@ function App() {
       : "empty";
 
   const previewPath = useMemo(() => {
-    if (previewMode === "video") return videoUnderPlayhead?.clip.media_path ?? null;
+    if (previewMode === "video") {
+      const clip = videoUnderPlayhead?.clip;
+      if (clip) {
+        // Magic Remove: once a removal render exists (and is not stale), the
+        // monitor plays the pre-inpainted sidecar — WYSIWYG, non-destructive.
+        // While the tool is open we show the ORIGINAL so the mask can be
+        // edited against the real content.
+        if (!magicTool) {
+          const rp = magicResultReady(
+            (findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null,
+          );
+          if (rp) return rp;
+        }
+        return clip.media_path;
+      }
+      return null;
+    }
     if (previewMode === "audio") return audioUnderPlayhead?.clip.media_path ?? null;
     return null;
-  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead]);
+  }, [previewMode, videoUnderPlayhead, audioUnderPlayhead, magicTool]);
 
   const previewIsImage = useMemo(() => isImagePath(previewPath), [previewPath]);
+
+  /** Overlay layers: every video-track clip under the playhead ABOVE the
+   * base clip. The base (bottom-most, on the main video element) keeps
+   * playing normally underneath — overlays composite on top, exactly like
+   * the export overlay chain. */
+  const monitorLayers = useMemo(() => {
+    if (!timeline) return [] as { clip: Clip; src: string; isImage: boolean }[];
+    const stack = videoStackAtPlayhead(timeline, playhead);
+    const out: { clip: Clip; src: string; isImage: boolean }[] = [];
+    for (const { clip } of stack.slice(1)) {
+      // Magic Remove overlay layers preview through their sidecar too.
+      const rp = magicResultReady(
+        (findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null,
+      );
+      const path = rp ?? clip.media_path;
+      let src: string | null = null;
+      try {
+        src = convertFileSrc(path);
+      } catch {
+        src = null;
+      }
+      if (src) out.push({ clip, src, isImage: isImagePath(path) });
+    }
+    return out;
+  }, [timeline, playhead]);
 
   /** Timeline A-track path for Project Monitor (video is muted; this drives sound). */
   const timelineAudioPath = useMemo(() => {
@@ -554,6 +698,15 @@ function App() {
         back.style.transform = front.style.transform;
         back.style.opacity = front.style.opacity;
         back.style.clipPath = front.style.clipPath;
+        const ovb = front.style.getPropertyValue("object-view-box");
+        if (ovb) {
+          back.style.setProperty("object-view-box", ovb);
+        } else {
+          back.style.removeProperty("object-view-box");
+        }
+        back.style.objectFit = front.style.objectFit;
+        front.style.removeProperty("object-view-box");
+        front.style.objectFit = "";
         back.classList.remove("is-back");
         back.classList.add("is-front");
         front.classList.remove("is-front");
@@ -878,7 +1031,14 @@ function App() {
     try {
       setBusy(true);
       const imported: LibraryItem[] = [];
+      let skipped = 0;
       for (const path of mediaPaths) {
+        // Already in the bin? Reuse it instead of creating a duplicate entry.
+        if (library.some((m) => m.path === path)) {
+          imported.push(library.find((m) => m.path === path)!);
+          skipped += 1;
+          continue;
+        }
         setStatus(`Importing ${fileName(path)}…`);
         const info = await invoke<MediaInfo>("import_media", { path });
         imported.push({
@@ -887,21 +1047,232 @@ function App() {
           name: fileName(path),
         });
       }
-      setLibrary((prev) => [...imported, ...prev]);
+      // Dedupe inside the updater so rapid consecutive imports can't double-add.
+      setLibrary((prev) => {
+        const known = new Set(prev.map((m) => m.path));
+        const fresh = imported.filter((m) => !known.has(m.path));
+        return fresh.length > 0 ? [...fresh, ...prev] : prev;
+      });
       const last = imported[0];
       if (last) {
         setSelectedMediaId(last.id);
         setBinFilter("media");
       }
-      setStatus(
+      const base =
         imported.length === 1
           ? `Imported ${imported[0].name}`
-          : `Imported ${imported.length} files`,
-      );
+          : `Imported ${imported.length} files`;
+      setStatus(skipped > 0 ? `${base} · ${skipped} already in project` : base);
     } catch (e) {
       setStatus(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** Drop routed to the Project Monitor: images become timeline clips at the
+   * playhead (imported to the bin like any media), text files become a Text
+   * filter on the clip under the playhead. Other files fall back to the bin. */
+  async function handleMonitorDrop(paths: string[]) {
+    const images = paths.filter((p) => isImagePath(p));
+    const texts = paths.filter((p) => isTextPath(p));
+    const others = paths.filter((p) => !isImagePath(p) && !isTextPath(p));
+    if (images.length > 0) {
+      await importPaths(images);
+      await dropImagesOnMonitor(images);
+    }
+    for (const p of texts) {
+      await dropTextOnMonitor(p);
+    }
+    if (others.length > 0) {
+      await importPaths(others);
+    }
+  }
+
+  /** Place dropped images sequentially on the timeline starting at the
+   * playhead, chaining each next start after the previous clip's end. When
+   * video is under the playhead the image becomes an overlay layer, so give
+   * it a sensible PiP size instead of covering the whole frame. */
+  async function dropImagesOnMonitor(paths: string[]) {
+    const overVideo = hasVideoAtPlayhead();
+    let cursor = playheadRef.current;
+    for (const path of paths) {
+      try {
+        const next = await invoke<Timeline>("add_media_to_timeline", {
+          mediaPath: path,
+          start: cursor,
+        });
+        const tl = normalizeTimeline(next);
+        setTimeline(tl);
+        const placed = tl.tracks
+          .flatMap((t) => t.clips)
+          .filter((c) => c.media_path === path)
+          .sort((a, b) => a.start - b.start)[0];
+        if (placed) {
+          cursor = placed.start + clipTimelineDuration(placed);
+          setSelectedClipId(placed.id);
+          if (overVideo && !(placed.filters ?? []).some((f) => f.kind === "transform")) {
+            try {
+              const withTf = normalizeTimeline(
+                await invoke<Timeline>("add_filter", {
+                  clipId: placed.id,
+                  kind: "transform",
+                  params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+                }),
+              );
+              setTimeline(withTf);
+            } catch {
+              /* overlay still works full-frame without the default size */
+            }
+          }
+        }
+        setStatus(
+          overVideo
+            ? `Placed ${fileName(path)} over the video — drag it in the monitor to position it`
+            : `Placed ${fileName(path)} on the timeline`,
+        );
+      } catch (e) {
+        setStatus(String(e));
+      }
+    }
+  }
+
+  /** Turn a dropped text file into a Text (drawtext) filter on the clip under
+   * the playhead, preserving any existing text styling. */  async function dropTextOnMonitor(path: string) {
+    const clip = videoUnderRef.current?.clip;
+    if (!clip) {
+      setStatus("Park the playhead on a clip, then drop the text file to add a title");
+      return;
+    }
+    let content: string;
+    try {
+      content = await invoke<string>("read_text_file", { path });
+    } catch (e) {
+      setStatus(String(e));
+      return;
+    }
+    const text = content.replace(/\r\n/g, "\n").trim();
+    if (!text) {
+      setStatus(`${fileName(path)} is empty`);
+      return;
+    }
+    // Keep the drawtext payload within sane filtergraph sizes.
+    const clipped = text.length > 2000 ? text.slice(0, 2000) : text;
+    const filters = clip.filters ?? [];
+    const existing = filters.find((f) => f.kind === "text");
+    const prevParams = (existing?.params ?? {}) as Record<string, unknown>;
+    const params = {
+      size: 6,
+      color: "#ffffff",
+      x: 0,
+      y: 0.55,
+      box: true,
+      ...prevParams,
+      text: clipped,
+    };
+    try {
+      const updated = existing
+        ? await invoke<Timeline>("update_filter", {
+            clipId: clip.id,
+            filterId: existing.id,
+            params,
+          })
+        : await invoke<Timeline>("add_filter", {
+            clipId: clip.id,
+            kind: "text",
+            params,
+          });
+      setTimeline(normalizeTimeline(updated));
+      setSelectedClipId(clip.id);
+      setStatus(existing ? `Title updated from ${fileName(path)}` : `Added title from ${fileName(path)}`);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  /** Images from the project bin for the monitor's image picker — deduped
+   * by path so the same file never shows twice. */
+  const monitorImages = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { id: string; name: string; path: string; src: string }[] = [];
+    for (const m of library) {
+      if (!isImagePath(m.path) || seen.has(m.path)) continue;
+      seen.add(m.path);
+      let src = m.path;
+      try {
+        src = convertFileSrc(m.path);
+      } catch {
+        /* fall back to the raw path */
+      }
+      out.push({ id: m.id, name: m.name, path: m.path, src });
+    }
+    return out;
+  }, [library]);
+
+  /** Picker context: what will the image land on at the playhead? */
+  const imagePickerContext = videoUnderPlayhead
+    ? `Will place over "${fileName(videoUnderPlayhead.clip.media_path)}" — drag it in the monitor after`
+    : hasTimelineClips
+      ? "The playhead is in a gap — the image will attach to the nearest video"
+      : "It will be placed at the playhead";
+
+  /** Fresh check: does ANY visible video clip cover the playhead? Reads the
+   * latest timeline ref — the React-state mirror (videoUnderRef) lags one
+   * render behind, which silently skipped the PiP default on placements. */
+  function hasVideoAtPlayhead(): boolean {
+    const tl = timelineRef.current;
+    const ph = playheadRef.current;
+    if (!tl) return false;
+    return tl.tracks.some(
+      (t) =>
+        t.kind === "video" &&
+        !t.hidden &&
+        t.clips.some((c) => ph >= c.start && ph < c.start + clipTimelineDuration(c)),
+    );
+  }
+
+  /** When the playhead sits in a gap, snap image placements onto the nearest
+   * video clip so overlays always land over visible content (VITA-style). */
+  function nearestVideoTargetTime(): number | null {
+    if (videoUnderRef.current) return null; // already over video
+    const tl = timelineRef.current;
+    if (!tl) return null;
+    const clips = tl.tracks
+      .filter((t) => t.kind === "video" && !t.hidden)
+      .flatMap((t) => t.clips);
+    if (clips.length === 0) return null;
+    const ph = playheadRef.current;
+    const nearest = clips.reduce((best, c) => {
+      const end = c.start + clipTimelineDuration(c);
+      const dist = ph < c.start ? c.start - ph : ph > end ? ph - end : 0;
+      return dist < best.dist ? { c, dist } : best;
+    }, { c: clips[0], dist: Number.MAX_VALUE }).c;
+    const end = nearest.start + clipTimelineDuration(nearest);
+    return Math.max(nearest.start, Math.min(ph, end - 0.1));
+  }
+
+  /** Image picker "Browse from disk": pick files, import to the bin, place
+   * them at the playhead as overlays. Snaps to the nearest video when the
+   * playhead is in a gap so the overlay lands over visible content. */
+  async function browseAndPlaceImages() {
+    try {
+      const selected = await open({
+        multiple: true,
+        filters: [{ name: "Images", extensions: [...IMAGE_EXTENSIONS] }],
+      });
+      if (!selected) return;
+      const paths = (Array.isArray(selected) ? selected : [selected]).filter((p) =>
+        isImagePath(p),
+      );
+      if (paths.length === 0) {
+        setStatus("No image files selected");
+        return;
+      }
+      const targetTime = nearestVideoTargetTime();
+      if (targetTime != null) seekTimeline(targetTime);
+      await handleMonitorDrop(paths);
+    } catch (e) {
+      setStatus(String(e));
     }
   }
 
@@ -927,20 +1298,71 @@ function App() {
     }
   }
 
+  /** Cache the webview client-area offset (physical px) once so drag-drop
+   * positions can be converted to CSS client coordinates. */
+  const registerMonitorDropTarget = useCallback((el: HTMLDivElement | null) => {
+    monitorFrameRef.current = el;
+  }, []);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
 
+    /** Drag-drop positions arrive in physical px relative to the webview
+     * surface; CSS client px are logical, so divide by the device scale. */
+    const dragEventToClient = (pos: { x: number; y: number }) => {
+      const dpr = window.devicePixelRatio || 1;
+      return { x: pos.x / dpr, y: pos.y / dpr };
+    };
+
+    const monitorDropLabel = (paths: string[]): string | null => {
+      const hasImg = paths.some((p) => isImagePath(p));
+      const hasTxt = paths.some((p) => isTextPath(p));
+      if (hasImg && hasTxt) return "Drop images & text — images place at the playhead, text becomes a title";
+      if (hasImg) return "Drop to place images on the timeline at the playhead";
+      if (hasTxt) return "Drop to add a title from the text file";
+      return null;
+    };
+
+    const updateHover = (paths: string[] | null, pos: { x: number; y: number } | null) => {
+      if (!paths || !pos) {
+        setMonitorFileDrop(false);
+        setMonitorFileDropLabel(null);
+        setDragOver(false);
+        return;
+      }
+      const label = monitorDropLabel(paths);
+      const overMonitor = !!label && pointInElement(pos.x, pos.y, monitorFrameRef.current);
+      setMonitorFileDrop(overMonitor);
+      setMonitorFileDropLabel(label);
+      setDragOver(!overMonitor);
+    };
+
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         const { type } = event.payload;
-        if (type === "enter" || type === "over") {
-          setDragOver(true);
+        if (type === "enter") {
+          monitorDropPathsRef.current = [...event.payload.paths];
+          updateHover(monitorDropPathsRef.current, dragEventToClient(event.payload.position));
+        } else if (type === "over") {
+          updateHover(monitorDropPathsRef.current, dragEventToClient(event.payload.position));
         } else if (type === "leave") {
-          setDragOver(false);
+          monitorDropPathsRef.current = null;
+          updateHover(null, null);
         } else if (type === "drop") {
+          const paths = event.payload.paths;
+          const pos = dragEventToClient(event.payload.position);
+          const overMonitor =
+            !!monitorDropLabel(paths) && pointInElement(pos.x, pos.y, monitorFrameRef.current);
+          monitorDropPathsRef.current = null;
+          setMonitorFileDrop(false);
+          setMonitorFileDropLabel(null);
           setDragOver(false);
-          void importPaths(event.payload.paths);
+          if (overMonitor) {
+            void handleMonitorDrop(paths);
+          } else {
+            void importPaths(paths);
+          }
         }
       })
       .then((fn) => {
@@ -956,16 +1378,57 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function addMediaToTimeline(media: LibraryItem, start = 0) {
+  async function addMediaToTimeline(media: LibraryItem, start = playheadRef.current) {
+    const overVideo = hasVideoAtPlayhead();
     try {
       setBusy(true);
       const next = await invoke<Timeline>("add_media_to_timeline", {
         mediaPath: media.path,
         start,
       });
-      setTimeline(normalizeTimeline(next));
-      const first = next.tracks.flatMap((t) => t.clips).sort((a, b) => b.start - a.start)[0];
-      if (first) setSelectedClipId(first.id);
+      let tl = normalizeTimeline(next);
+      // Select the clip that was actually placed (Rust stores the playback
+      // path, so match on the original source_path).
+      const placed =
+        tl.tracks
+          .flatMap((t) => t.clips)
+          .find(
+            (c) =>
+              (c.source_path === media.path || c.media_path === media.path) &&
+              Math.abs(c.start - start) < 0.05,
+          ) ??
+        tl.tracks.flatMap((t) => t.clips).sort((a, b) => b.start - a.start)[0];
+      if (placed) {
+        setSelectedClipId(placed.id);
+        // Images dropped over video become PiP: give them a sensible size.
+        if (
+          overVideo &&
+          isImagePath(media.path) &&
+          !(placed.filters ?? []).some((f) => f.kind === "transform")
+        ) {
+          try {
+            tl = normalizeTimeline(
+              await invoke<Timeline>("add_filter", {
+                clipId: placed.id,
+                kind: "transform",
+                params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+              }),
+            );
+            setTimeline(tl);
+          } catch {
+            /* overlay still works full-frame without the default size */
+          }
+        }
+        // Make the monitor preview the new clip even if the playhead was
+        // elsewhere — "I added it, so show it".
+        if (
+          playheadRef.current < placed.start - 0.01 ||
+          playheadRef.current >= placed.start + clipTimelineDuration(placed)
+        ) {
+          seekTimeline(placed.start);
+        }
+      }
+      setTimeline(tl);
       const kind =
         media.has_video && media.has_audio
           ? "linked V+A"
@@ -1066,6 +1529,12 @@ function App() {
   async function onFilter(kind: string) {
     if (!selectedClipId || !selectedClip) {
       setStatus("Select a timeline clip first");
+      return;
+    }
+    // Magic Remove is a monitor tool, not a slider effect: opening the tool
+    // is the whole flow (the filter is created on the first brush stroke).
+    if (kind === "magicremove") {
+      toggleMagicTool(true);
       return;
     }
     const roles = EFFECT_CATALOG.find((e) => e.id === kind)?.roles;
@@ -1238,6 +1707,238 @@ function App() {
     }
     return null;
   }
+
+  /* --- Magic Remove / AI Eraser ------------------------------------- */
+
+  /** The video clip the Magic Remove tool edits. Resolved FRESH from the
+   * timeline + imperative playhead on every call — never from memoized
+   * state — so commits can't race playhead moves or in-flight timeline
+   * writes and land on a stale clip (which used to duplicate filters). */
+  function resolveMagicTarget(): Clip | null {
+    const tl = timelineRef.current;
+    if (!tl) return null;
+    const hit = clipAtPlayhead(tl, playheadRef.current, "video");
+    if (!hit || isImagePath(hit.clip.media_path)) return null;
+    return hit.clip;
+  }
+
+  /** Clip-scoped filter param update (updateFilterParams is bound to the
+   * selected clip, which may differ from the clip under the playhead). */
+  async function updateFilterParamsOnClip(
+    clipId: string,
+    filterId: string,
+    params: Record<string, unknown>,
+  ) {
+    try {
+      setTimeline(
+        normalizeTimeline(await invoke<Timeline>("update_filter", { clipId, filterId, params })),
+      );
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  /** Find the magicremove filter on a clip object. */
+  function magicFilterOf(clip: Clip | null) {
+    return clip?.filters?.find((x) => x.kind === "magicremove") ?? null;
+  }
+
+  /** Merge a patch into the target clip's magicremove filter. The filter is
+   * created ONLY on the first stroke commit (a single invoke, no race) —
+   * slider tweaks before that live in the local draft. */
+  async function upsertMagicParams(patch: Record<string, unknown>) {
+    const target = resolveMagicTarget();
+    if (!target) {
+      setStatus("No video clip under the playhead");
+      return;
+    }
+    const existing = magicFilterOf(target);
+    if (existing) {
+      await updateFilterParamsOnClip(target.id, existing.id, {
+        ...((existing.params ?? {}) as Record<string, unknown>),
+        ...patch,
+      });
+      return;
+    }
+    const hasStrokes = Array.isArray(patch.strokes) && patch.strokes.length > 0;
+    if (!hasStrokes) {
+      // Nothing to persist yet — keep slider changes in the draft so the
+      // panel controls still respond.
+      setMagicDraft((d) => ({ ...(d ?? {}), ...patch }));
+      magicDraftRef.current = { ...(magicDraftRef.current ?? {}), ...patch };
+      return;
+    }
+    const params = {
+      ...defaultParams("magicremove"),
+      ...magicDraftRef.current,
+      ...patch,
+    };
+    setMagicDraft(null);
+    magicDraftRef.current = null;
+    try {
+      const next = normalizeTimeline(
+        await invoke<Timeline>("add_filter", {
+          clipId: target.id,
+          kind: "magicremove",
+          params,
+        }),
+      );
+      setTimeline(next);
+      const added = magicFilterOf(
+        next.tracks.flatMap((t) => t.clips).find((c) => c.id === target.id) ?? null,
+      );
+      if (added) setFocusFilterId(added.id);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  function toggleMagicTool(on: boolean) {
+    if (on) {
+      const target = resolveMagicTarget();
+      if (!target) {
+        setStatus("Scrub to a video clip to use Magic Remove");
+        return;
+      }
+      setCropTool(false);
+      if (selectedClipId !== target.id) setSelectedClipId(target.id);
+      // Heal duplicates: earlier sessions could stack several magicremove
+      // filters on a clip (each brush stroke used to re-add one). Keep the
+      // first — it holds the mask — and drop the rest.
+      const dups = (target.filters ?? []).filter((f) => f.kind === "magicremove");
+      if (dups.length > 1) {
+        void (async () => {
+          for (const dup of dups.slice(1)) {
+            try {
+              setTimeline(
+                normalizeTimeline(
+                  await invoke<Timeline>("remove_filter", {
+                    clipId: target.id,
+                    filterId: dup.id,
+                  }),
+                ),
+              );
+            } catch {
+              /* already gone */
+            }
+          }
+        })();
+      }
+    }
+    setMagicTool(on);
+    if (on) setMagicStatus(null);
+  }
+
+  function commitMagic(patch: {
+    strokes?: MagicStroke[];
+    keyframes?: MagicKeyframe[];
+    anchorTime?: number;
+  }) {
+    const cleared = Array.isArray(patch.strokes) && patch.strokes.length === 0;
+    void upsertMagicParams(
+      cleared ? { ...patch, resultPath: "", renderKey: "", status: "idle" } : patch,
+    );
+    if (cleared) {
+      setMagicStatus(null);
+    } else if (patch.strokes) {
+      setMagicStatus("Mask updated — press ✨ Remove to render the removal.");
+    }
+  }
+
+  async function runMagicTrack() {
+    const clip = resolveMagicTarget();
+    const f = magicFilterOf(clip);
+    if (!clip) {
+      setStatus("No video clip under the playhead");
+      return;
+    }
+    if (!f) return;
+    const p = (f.params ?? {}) as Record<string, unknown>;
+    if (!Array.isArray(p.strokes) || p.strokes.length === 0) {
+      setStatus("Brush over the element to remove first");
+      return;
+    }
+    setMagicBusy({ phase: "tracking", percent: 0 });
+    setMagicStatus(null);
+    setStatus("✨ Magic Remove: tracking the mask across the clip — watch it follow on the timeline.");
+    try {
+      const res = await invoke<{ keyframes: MagicKeyframe[] }>("magic_remove_track", {
+        source: clip.media_path,
+        params: { ...p },
+      });
+      await updateFilterParamsOnClip(clip.id, f.id, {
+        ...p,
+        keyframes: res.keyframes ?? [],
+        status: "tracked",
+        resultPath: "",
+        renderKey: "",
+      });
+      setMagicStatus(
+        "Tracked across the clip — press ✨ Remove, or use Adjust to correct the mask.",
+      );
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("cancelled")) {
+        setMagicStatus("Tracking cancelled.");
+      } else {
+        setMagicStatus(`Tracking failed: ${msg}`);
+      }
+    } finally {
+      setMagicBusy(null);
+    }
+  }
+
+  async function runMagicRemoveRender() {
+    const clip = resolveMagicTarget();
+    const f = magicFilterOf(clip);
+    if (!clip) {
+      setStatus("No video clip under the playhead");
+      return;
+    }
+    if (!f) return;
+    const p = (f.params ?? {}) as Record<string, unknown>;
+    if (!Array.isArray(p.strokes) || p.strokes.length === 0) {
+      setStatus("Brush over the element to remove first");
+      return;
+    }
+    setMagicBusy({ phase: "inpainting", percent: 0 });
+    setMagicStatus(null);
+    const srcDur = library.find((m) => m.path === clip.media_path)?.duration ?? 0;
+    setStatus(
+      `✨ Magic Remove: rebuilding the background across ${fmtLen(srcDur)} of video — longer clips take a few minutes. Keep editing; progress shows on the monitor.`,
+    );
+    try {
+      const path = await invoke<string>("magic_remove_render", {
+        source: clip.media_path,
+        params: { ...p },
+        keyframes: Array.isArray(p.keyframes) ? p.keyframes : [],
+      });
+      await updateFilterParamsOnClip(clip.id, f.id, {
+        ...p,
+        resultPath: path,
+        renderKey: magicRenderKey(p),
+        status: "ready",
+      });
+      setMagicStatus("Removed ✓ — scrub or play to preview; export bakes it in.");
+      setStatus("✨ Magic Remove done — the monitor now previews the cleaned video (original file untouched).");
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("cancelled")) {
+        setMagicStatus("Removal cancelled — nothing changed.");
+        setStatus("✨ Magic Remove cancelled — nothing changed.");
+      } else {
+        setMagicStatus(`Removal failed: ${msg}`);
+        setStatus(`✨ Magic Remove failed: ${msg}`);
+      }
+    } finally {
+      setMagicBusy(null);
+    }
+  }
+
+  function cancelMagic() {
+    void invoke("magic_remove_cancel").catch(() => undefined);
+  }
+
 
   function openAdvancedAudioForClip(
     clipId: string,
@@ -1593,48 +2294,64 @@ function App() {
     await upsertClipFilter(clipId, kind, params);
   }
 
-  async function commitCrop(crop: {
+  /** Serialized crop commits: reads fresh state from timelineRef on each run
+   * so a Done click racing an in-flight commit can never create a duplicate
+   * crop filter (double-crop = double zoom in export). */
+  const cropCommitChain = useRef<Promise<void>>(Promise.resolve());
+  function commitCrop(crop: {
     left: number;
     top: number;
     right: number;
     bottom: number;
   }) {
-    let targetClipId = selectedClipId;
-    let targetClip = selectedClip;
-    if (!targetClipId && videoUnderPlayhead) {
-      targetClipId = videoUnderPlayhead.clip.id;
-      targetClip = videoUnderPlayhead;
-      setSelectedClipId(targetClipId);
-    }
-    if (!targetClipId || !targetClip) {
-      setStatus("Select a clip to crop");
-      return;
-    }
-    try {
-      let filters = targetClip.clip.filters ?? [];
-      let cropFilter = filters.find((f) => f.kind === "crop");
-      if (!cropFilter) {
-        const next = normalizeTimeline(
-          await invoke<Timeline>("add_filter", { clipId: targetClipId, kind: "crop" }),
-        );
-        setTimeline(next);
-        const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === targetClipId);
-        cropFilter = clip?.filters.find((f) => f.kind === "crop");
-        filters = clip?.filters ?? [];
+    const run = async () => {
+      // Crop is a main-preview tool: always target the clip under the
+      // playhead, never whichever overlay happens to be selected.
+      const targetClip = videoUnderRef.current?.clip ?? null;
+      if (!targetClip) {
+        setStatus("No video under playhead to crop");
+        return;
       }
-      if (!cropFilter) return;
-      const updated = normalizeTimeline(
-        await invoke<Timeline>("update_filter", {
-          clipId: targetClipId,
-          filterId: cropFilter.id,
-          params: crop,
-        }),
-      );
-      setTimeline(updated);
-      setStatus("Crop updated");
-    } catch (e) {
-      setStatus(String(e));
-    }
+      try {
+        const filters = targetClip.filters ?? [];
+        const cropFilter = filters.find((f) => f.kind === "crop");
+        const isZero =
+          crop.left <= 0.001 &&
+          crop.top <= 0.001 &&
+          crop.right <= 0.001 &&
+          crop.bottom <= 0.001;
+
+        let updated: Timeline;
+        if (!cropFilter) {
+          if (isZero) return;
+          updated = normalizeTimeline(
+            await invoke<Timeline>("add_filter", {
+              clipId: targetClip.id,
+              kind: "crop",
+              params: crop,
+            }),
+          );
+        } else {
+          updated = normalizeTimeline(
+            await invoke<Timeline>("update_filter", {
+              clipId: targetClip.id,
+              filterId: cropFilter.id,
+              params: crop,
+            }),
+          );
+        }
+        setTimeline(updated);
+        if (selectedClipId !== targetClip.id) {
+          setSelectedClipId(targetClip.id);
+        }
+        setStatus("Crop updated");
+      } catch (e) {
+        setStatus(String(e));
+      }
+    };
+    cropCommitChain.current = cropCommitChain.current
+      .then(run)
+      .catch((e) => setStatus(String(e)));
   }
 
   const exportSource = useMemo(() => {
@@ -1921,19 +2638,35 @@ function App() {
     const num = (v: unknown, d: number) =>
       typeof v === "number" && Number.isFinite(v) ? v : d;
     return {
+      clipId: clip.id,
+      filterId: f.id,
       text: str(p.text, "Your title"),
       size: num(p.size, 6),
       color: str(p.color, "#ffffff"),
       x: num(p.x, 0),
       y: num(p.y, 0.55),
       box: p.box !== false,
+      boxcolor: str(p.boxcolor, "#00000073"),
+      borderw: num(p.borderw, 0),
+      bordercolor: str(p.bordercolor, "#000000"),
+      shadow: p.shadow !== false,
     };
   }, [videoUnderPlayhead]);
 
-  /** Transform filter on the selected (or under-playhead) clip — drives the
-   * monitor drag/scale interactions; export reads the same filter (WYSIWYG). */
+  /** The clip the Project Monitor displays — selected clip only when it IS
+   * the one under the playhead (keeps gestures WYSIWYG with the preview). */
+  const monitorTargetClip = useMemo(() => {
+    return selectedClip &&
+      selectedClip.clip.role === "video" &&
+      selectedClip.clip.id === videoUnderPlayhead?.clip.id
+      ? selectedClip.clip
+      : (videoUnderPlayhead?.clip ?? null);
+  }, [selectedClip, videoUnderPlayhead]);
+
+  /** Transform filter on the displayed clip — drives the monitor drag/scale
+   * interactions; export reads the same filter (WYSIWYG). */
   const monitorTransform = useMemo(() => {
-    const target = selectedClip?.clip ?? videoUnderPlayhead?.clip ?? null;
+    const target = monitorTargetClip;
     if (!target) return null;
     const f = (target.filters ?? []).find((x) => x.kind === "transform" && x.enabled);
     if (!f) return null;
@@ -1949,19 +2682,203 @@ function App() {
       rotation: num(p.rotation, 0),
       opacity: num(p.opacity, 1),
     };
-  }, [selectedClip, videoUnderPlayhead]);
+  }, [monitorTargetClip]);
 
+  /** Magic Remove state for the monitor tool: params of the magicremove
+   * filter on the clip under the playhead + its media-time anchor. */
+  const magicMediaTime = useMemo(() => {
+    const hit = videoUnderPlayhead;
+    return hit ? mediaTimeForClip(hit.clip, playhead) : playhead;
+  }, [videoUnderPlayhead, playhead]);
+
+  const magicParams = useMemo(() => {
+    const clip = videoUnderPlayhead?.clip;
+    const f = magicFilterOf(clip ?? null);
+    if (f) return (f.params ?? {}) as Record<string, unknown>;
+    // No filter yet — the panel runs on the local draft until the first
+    // stroke commit creates it.
+    return magicDraft;
+  }, [videoUnderPlayhead, magicDraft]);
+
+  /** Stale-render indicator: a resultPath exists but the mask/settings
+   * changed since it was rendered. */
+  const magicStale = useMemo(() => {
+    if (!magicParams) return false;
+    const p = magicParams as Record<string, unknown>;
+    return Boolean(p.resultPath) && magicResultReady(p) === null;
+  }, [magicParams]);
+
+  // Escape exits the Magic Remove tool.
+  useEffect(() => {
+    if (!magicTool) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMagicTool(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [magicTool]);
+
+  /** Persist a monitor transform gesture on a specific clip. Creates the
+   * Transform filter on demand when the clip has none (drag/wheel work
+   * without setup), and re-enables a disabled filter instead of ignoring
+   * the gesture. */
+  const commitTransformForClip = useCallback(
+    async (
+      clipId: string,
+      patch: { x?: number; y?: number; scale?: number; opacity?: number },
+    ) => {
+      const num = (v: unknown, d: number) =>
+        typeof v === "number" && Number.isFinite(v) ? v : d;
+      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+      try {
+        const clip = timelineRef.current?.tracks
+          .flatMap((t) => t.clips)
+          .find((c) => c.id === clipId);
+        if (!clip) return;
+        const tf = (clip.filters ?? []).find((f) => f.kind === "transform");
+        let updated: Timeline;
+        if (tf) {
+          const prev = (tf.params ?? {}) as Record<string, unknown>;
+          const params = {
+            x: clamp(patch.x ?? num(prev.x, 0), -1, 1),
+            y: clamp(patch.y ?? num(prev.y, 0), -1, 1),
+            scale: clamp(patch.scale ?? num(prev.scale, 1), 0.05, 8),
+            rotation: num(prev.rotation, 0),
+            opacity: clamp(patch.opacity ?? num(prev.opacity, 1), 0, 1),
+          };
+          updated = normalizeTimeline(
+            await invoke<Timeline>("update_filter", {
+              clipId,
+              filterId: tf.id,
+              params,
+            }),
+          );
+          if (!tf.enabled) {
+            updated = normalizeTimeline(
+              await invoke<Timeline>("set_filter_enabled", {
+                clipId,
+                filterId: tf.id,
+                enabled: true,
+              }),
+            );
+          }
+        } else {
+          const params = {
+            x: clamp(patch.x ?? 0, -1, 1),
+            y: clamp(patch.y ?? 0, -1, 1),
+            scale: clamp(patch.scale ?? 1, 0.05, 8),
+            rotation: 0,
+            opacity: 1,
+          };
+          updated = normalizeTimeline(
+            await invoke<Timeline>("add_filter", {
+              clipId,
+              kind: "transform",
+              params,
+            }),
+          );
+        }
+        setTimeline(updated);
+        if (selectedClipId !== clipId) {
+          setSelectedClipId(clipId);
+        }
+      } catch (e) {
+        setStatus(String(e));
+      }
+    },
+    [selectedClipId],
+  );
+
+  /** Main-preview transform gestures (target resolved in the monitor). */
   const commitTransform = useCallback(
-    async (patch: { x?: number; y?: number; scale?: number }) => {
-      const t = monitorTransform;
+    async (patch: { x?: number; y?: number; scale?: number; opacity?: number }) => {
+      const target = monitorTargetClip;
+      if (!target) return;
+      await commitTransformForClip(target.id, patch);
+    },
+    [monitorTargetClip, commitTransformForClip],
+  );
+
+  /** Monitor "Text" button flow: a preset style + typed text from the picker
+   * becomes (or replaces) the Text filter on the displayed clip. */
+  const addStyledTextFromMonitor = useCallback(async (style: TextPresetParams & { text: string }) => {
+    const clip = videoUnderRef.current?.clip;
+    if (!clip) {
+      setStatus("Park the playhead on a clip to add a title");
+      return;
+    }
+    const text = style.text.trim();
+    if (!text) {
+      setStatus("Type the title text first");
+      return;
+    }
+    const params = {
+      text,
+      size: Math.max(1, Math.min(30, style.size)),
+      color: style.color,
+      x: Math.max(-1, Math.min(1, style.x ?? 0)),
+      y: Math.max(-1, Math.min(1, style.y)),
+      box: style.box,
+      ...(style.box ? { boxcolor: style.boxcolor ?? "#00000073" } : {}),
+      ...(style.box ? { boxborderw: style.boxborderw ?? 14 } : {}),
+      ...(style.borderw && style.borderw > 0
+        ? { borderw: style.borderw, bordercolor: style.bordercolor ?? "#000000" }
+        : {}),
+      shadow: style.shadow !== false,
+    };
+    try {
+      const existing = (clip.filters ?? []).find((f) => f.kind === "text");
+      let updated = normalizeTimeline(
+        existing
+          ? await invoke<Timeline>("update_filter", {
+              clipId: clip.id,
+              filterId: existing.id,
+              params,
+            })
+          : await invoke<Timeline>("add_filter", {
+              clipId: clip.id,
+              kind: "text",
+              params,
+            }),
+      );
+      if (existing && !existing.enabled) {
+        updated = normalizeTimeline(
+          await invoke<Timeline>("set_filter_enabled", {
+            clipId: clip.id,
+            filterId: existing.id,
+            enabled: true,
+          }),
+        );
+      }
+      setTimeline(updated);
+      setSelectedClipId(clip.id);
+      setStatus(existing ? "Title updated — drag to move, corner handles to resize" : "Title added — drag to move, corner handles to resize");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }, []);
+
+  /** Commit monitor text-overlay gestures (drag position / handle resize /
+   * double-click inline edit). Preserves the picked style fields. */
+  const commitTextOverlay = useCallback(
+    async (patch: { x?: number; y?: number; size?: number; text?: string }) => {
+      const t = monitorText;
       if (!t) return;
+      const nextText =
+        typeof patch.text === "string" && patch.text.trim() ? patch.text : t.text;
       const params = {
-        x: t.x,
-        y: t.y,
-        scale: t.scale,
-        rotation: t.rotation,
-        opacity: t.opacity,
-        ...patch,
+        text: nextText,
+        size: Math.max(1, Math.min(30, patch.size ?? t.size)),
+        color: t.color,
+        x: Math.max(-1, Math.min(1, patch.x ?? t.x)),
+        y: Math.max(-1, Math.min(1, patch.y ?? t.y)),
+        box: t.box,
+        ...(t.box ? { boxcolor: t.boxcolor } : {}),
+        ...(t.borderw > 0 ? { borderw: t.borderw, bordercolor: t.bordercolor } : {}),
+        shadow: t.shadow,
       };
       try {
         setTimeline(
@@ -1977,8 +2894,54 @@ function App() {
         setStatus(String(e));
       }
     },
-    [monitorTransform],
+    [monitorText],
   );
+
+  /** Delete the clip the monitor currently targets (selected overlay or the
+   * clip under the playhead) — the context-menu / Delete-key action. */
+  const removeTargetClip = useCallback(async () => {
+    const target = monitorTargetClip;
+    if (!target) return;
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("remove_clip", {
+            clipId: target.id,
+            removeLinked: true,
+          }),
+        ),
+      );
+      if (selectedClipId === target.id) {
+        setSelectedClipId(null);
+      }
+      setStatus("Clip deleted");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }, [monitorTargetClip, selectedClipId]);
+
+  /** Monitor context menu: remove the Text (title) filter from the
+   * displayed clip — titles are filters, not clips, so they get their own
+   * delete action. */
+  const removeTitleFromMonitor = useCallback(async () => {
+    const clip = videoUnderRef.current?.clip;
+    if (!clip) return;
+    const f = (clip.filters ?? []).find((x) => x.kind === "text");
+    if (!f) return;
+    try {
+      setTimeline(
+        normalizeTimeline(
+          await invoke<Timeline>("remove_filter", {
+            clipId: clip.id,
+            filterId: f.id,
+          }),
+        ),
+      );
+      setStatus("Title removed");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }, []);
 
   /** Place any file path (e.g. a saved voiceover) on the timeline. */
   const addMediaPathToTimeline = useCallback(
@@ -2045,33 +3008,32 @@ function App() {
         );
         const opacity = String(style.opacity);
         const clipPath = style.clipPath ?? "";
-        const objectViewBox = style.objectViewBox ?? "";
-        const objectFit = style.objectFit ?? "";
-        const prev = lastVideoStyle.current;
-        if (prev.filter !== style.filter) {
+        const isCropping = cropTool;
+        const objectViewBox = isCropping ? "" : (style.objectViewBox ?? "");
+        const objectFit = isCropping ? "" : (style.objectFit ?? "");
+
+        if (el.style.filter !== style.filter) {
           el.style.filter = style.filter;
-          prev.filter = style.filter;
         }
-        if (prev.transform !== style.transform) {
+        if (el.style.transform !== style.transform) {
           el.style.transform = style.transform;
-          prev.transform = style.transform;
         }
-        if (prev.opacity !== opacity) {
+        if (el.style.opacity !== opacity) {
           el.style.opacity = opacity;
-          prev.opacity = opacity;
         }
-        if (prev.clipPath !== clipPath) {
+        if (el.style.clipPath !== clipPath) {
           el.style.clipPath = clipPath;
-          prev.clipPath = clipPath;
         }
         // Crop fills the frame exactly like the export (crop + scale-to-fill).
-        if (prev.objectViewBox !== objectViewBox) {
-          el.style.setProperty("object-view-box", objectViewBox);
-          prev.objectViewBox = objectViewBox;
+        if (el.style.getPropertyValue("object-view-box") !== objectViewBox) {
+          if (objectViewBox) {
+            el.style.setProperty("object-view-box", objectViewBox);
+          } else {
+            el.style.removeProperty("object-view-box");
+          }
         }
-        if (prev.objectFit !== objectFit) {
+        if (el.style.objectFit !== objectFit) {
           el.style.objectFit = objectFit;
-          prev.objectFit = objectFit;
         }
         const shadow = style.boxShadow ?? "";
         if ((el.dataset.shadow ?? "") !== shadow) {
@@ -2326,7 +3288,7 @@ function App() {
       videoUnderPlayhead?.clip ?? null,
       audioUnderPlayhead?.clip ?? null,
     );
-  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, applyPreviewFades]);
+  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, cropTool, applyPreviewFades]);
 
   // Keyboard shortcuts (latest handlers via ref — attach once).
   const keyHandlersRef = useRef({
@@ -2486,6 +3448,9 @@ function App() {
                 setSelectedClipId(null);
                 setStatus(`Clip Monitor · ${item.name}`);
               }}
+              onDropToProjectMonitor={(item) => {
+                void addMediaToTimeline(item, playheadRef.current);
+              }}
               onRemoveFromBin={(item) => {
                 const used = timeline?.tracks.some((t) =>
                   t.clips.some((c) => c.media_path === item.path),
@@ -2567,6 +3532,7 @@ function App() {
             audioRef={audioRef}
             audio2Ref={audio2Ref}
             textOverlay={monitorText}
+            onTextCommit={(patch) => void commitTextOverlay(patch)}
             transformParams={
               monitorTransform
                 ? {
@@ -2577,8 +3543,24 @@ function App() {
                   }
                 : null
             }
-            transformActive={!!monitorTransform && !cropTool}
+            transformActive={!cropTool}
             onTransformCommit={(patch) => void commitTransform(patch)}
+            onAddTextStyled={(style) => void addStyledTextFromMonitor(style)}
+            onRemoveTitle={() => void removeTitleFromMonitor()}
+            mediaImages={monitorImages}
+            imagePickerContext={imagePickerContext}
+            onPickImageItem={(item) => {
+              const lib = library.find((m) => m.path === item.path);
+              if (!lib) return;
+              const targetTime = nearestVideoTargetTime();
+              if (targetTime != null) seekTimeline(targetTime);
+              void addMediaToTimeline(lib, targetTime ?? playheadRef.current);
+            }}
+            onBrowseImages={() => void browseAndPlaceImages()}
+            removeTargetLabel={
+              monitorTargetClip ? fileName(monitorTargetClip.media_path) : null
+            }
+            onRemoveTarget={() => void removeTargetClip()}
             onTogglePlay={togglePlay}
             onSeekRatio={(ratio) => seekTimeline(ratio * projectDuration)}
             volume={monitorVolume}
@@ -2586,11 +3568,21 @@ function App() {
             onVolume={setMonitorVolume}
             onMuted={setMonitorMuted}
             cropTool={cropTool}
-            onCropTool={setCropTool}
+            onCropTool={(on) => {
+              // Crop is a main-preview tool: select the clip under the
+              // playhead so the crop acts on what the monitor shows.
+              if (on && videoUnderPlayhead && selectedClipId !== videoUnderPlayhead.clip.id) {
+                setSelectedClipId(videoUnderPlayhead.clip.id);
+              }
+              setCropTool(on);
+            }}
             cropDraft={
               (() => {
-                const target = selectedClip?.clip ?? videoUnderPlayhead?.clip;
-                const c = target?.filters?.find((f) => f.kind === "crop" && f.enabled);
+                // Crop always targets the MAIN clip under the playhead — the
+                // visual the crop box is drawn over — never a selected overlay.
+                const c = videoUnderPlayhead?.clip.filters?.find(
+                  (f) => f.kind === "crop" && f.enabled,
+                );
                 if (!c?.params) return null;
                 const p = c.params as Record<string, number>;
                 return {
@@ -2609,10 +3601,32 @@ function App() {
               const f = selectedClip?.clip.filters?.find((x) => x.kind === "chromakey");
               if (f) void updateFilterParams(f.id, { ...(f.params as object), color: hex });
             }}
+            magicTool={magicTool}
+            onMagicTool={toggleMagicTool}
+            magicParams={magicParams}
+            magicMediaTime={magicMediaTime}
+            magicBusy={magicBusy}
+            magicStatus={
+              magicStatus ?? (magicStale ? "Settings changed — press ✨ Remove to re-render." : null)
+            }
+            onMagicCommit={commitMagic}
+            onMagicParamChange={(patch) => void upsertMagicParams(patch)}
+            onMagicTrack={() => void runMagicTrack()}
+            onMagicRemove={() => void runMagicRemoveRender()}
+            onMagicCancel={cancelMagic}
             onShowClipMonitor={
               clipMonitorOpen ? undefined : () => setClipMonitorOpen(true)
             }
             hasTimelineClips={hasTimelineClips}
+            layers={monitorLayers}
+            selectedClipId={selectedClipId}
+            onSelectLayer={(clipId) => setSelectedClipId(clipId)}
+            onLayerTransformCommit={(clipId, patch) =>
+              void commitTransformForClip(clipId, patch)
+            }
+            onRegisterDropTarget={registerMonitorDropTarget}
+            fileDropActive={monitorFileDrop}
+            fileDropLabel={monitorFileDropLabel}
           />
         }
         timeline={

@@ -880,6 +880,16 @@ export function TimelinePanel({
     return track.kind === "video" ? 64 : 48;
   }
 
+  /** Rows render top→bottom as FRONT→BACK (VITA/NLE convention): the highest
+   * video track is the topmost row and composites in front; audio tracks sit
+   * below. The engine stacks array order bottom→top, so this keeps "visually
+   * higher = renders in front" true everywhere. */
+  const displayTracks = useMemo(() => {
+    const video = timeline.tracks.filter((t) => t.kind === "video").reverse();
+    const audio = timeline.tracks.filter((t) => t.kind === "audio");
+    return [...video, ...audio];
+  }, [timeline.tracks]);
+
   const zoneLeft =
     timeline.zone_in != null && timeline.zone_out != null
       ? Math.min(timeline.zone_in, timeline.zone_out)
@@ -1113,7 +1123,7 @@ export function TimelinePanel({
       >
         <div className="tl-headers">
           <div className="tl-corner" />
-          {timeline.tracks.map((track) => {
+          {displayTracks.map((track) => {
             const sameKind = timeline.tracks.filter((t) => t.kind === track.kind).length;
             return (
             <TrackHeaderMemo
@@ -1207,7 +1217,7 @@ export function TimelinePanel({
               </div>
             )}
 
-            {timeline.tracks.map((track) => {
+            {displayTracks.map((track) => {
               const h = trackHeight(track);
               if (track.hidden) {
                 return (

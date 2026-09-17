@@ -24,6 +24,8 @@ pub enum MediaError {
     Json(#[from] serde_json::Error),
 }
 
+pub mod magic;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
     pub path: String,
@@ -177,6 +179,19 @@ fn escape_drawtext(text: &str) -> String {
         .replace('%', "\\%")
 }
 
+/// Normalize a frontend color (#RRGGBB, #RRGGBBAA, or a named color) to an
+/// FFmpeg color string.
+fn ffmpeg_color(v: &str, default: &str) -> String {
+    let v = v.trim();
+    if v.is_empty() {
+        return default.to_string();
+    }
+    match v.strip_prefix('#') {
+        Some(hex) => format!("#{hex}"),
+        None => v.to_string(),
+    }
+}
+
 pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32) -> String {
     let mut parts: Vec<String> = Vec::new();
     let fw = frame_w.max(2) as f64;
@@ -196,11 +211,13 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 if left + right + top + bottom > 1e-6 {
                     let w = (1.0 - left - right).max(0.02);
                     let h = (1.0 - top - bottom).max(0.02);
-                    // Crop the source to the selected region, then scale it up to
-                    // fill the entire output canvas. The cropped area becomes the
-                    // full-screen output — no black bars or padding.
+                    // Crop the source to the selected region, then scale it to
+                    // FIT the output canvas preserving the region's own aspect
+                    // (orientation-aware: a vertical crop stays vertical, a
+                    // horizontal crop stays horizontal — never stretched),
+                    // centered on a black canvas.
                     parts.push(format!(
-                        "crop=iw*{w:.6}:ih*{h:.6}:iw*{left:.6}:ih*{top:.6},scale={fw}:{fh}:flags=lanczos",
+                        "crop=iw*{w:.6}:ih*{h:.6}:iw*{left:.6}:ih*{top:.6},scale={fw}:{fh}:force_original_aspect_ratio=decrease:flags=lanczos,pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2:color=black",
                         fw = frame_w.max(2) & !1,
                         fh = frame_h.max(2) & !1,
                     ));
@@ -316,7 +333,25 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                         "drawtext=fontfile='{font}':text='{payload}':fontsize='h*{size_pct:.2}/100':fontcolor=#{color}:x='(w/2)-(tw/2)+({x:.4}*w/2)':y='(h/2)-(th/2)+({y:.4}*h/2)'"
                     );
                     if boxed {
-                        dt.push_str(":box=1:boxcolor=black@0.45:boxborderw=14");
+                        let boxcolor = ffmpeg_color(
+                            p.get("boxcolor").and_then(|v| v.as_str()).unwrap_or("#00000073"),
+                            "black@0.45",
+                        );
+                        let boxborderw = num(p, "boxborderw", 14.0).clamp(0.0, 200.0).round() as i32;
+                        dt.push_str(&format!(
+                            ":box=1:boxcolor={boxcolor}:boxborderw={boxborderw}"
+                        ));
+                    }
+                    let borderw = num(p, "borderw", 0.0).clamp(0.0, 60.0).round() as i32;
+                    if borderw >= 1 {
+                        let bordercolor = ffmpeg_color(
+                            p.get("bordercolor").and_then(|v| v.as_str()).unwrap_or("#000000"),
+                            "black",
+                        );
+                        dt.push_str(&format!(":borderw={borderw}:bordercolor={bordercolor}"));
+                    }
+                    if bool_p(p, "shadow", true) {
+                        dt.push_str(":shadowcolor=black@0.55:shadowx=4:shadowy=4");
                     }
                     parts.push(dt);
                 }
@@ -355,25 +390,37 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 if (scale - 1.0).abs() > 1e-4 {
                     parts.push(format!("scale=iw*{scale:.6}:ih*{scale:.6}"));
                 }
+                let mut rgba = false;
                 if rotation.abs() > 1e-3 {
+                    // Alpha-aware so rotated corners stay transparent (PiP).
+                    parts.push("format=rgba".into());
+                    rgba = true;
                     parts.push(format!(
-                        "rotate={rotation:.6}*PI/180:ow=rotw({rotation:.6}*PI/180):oh=roth({rotation:.6}*PI/180):c=none"
+                        "rotate={rotation:.6}*PI/180:ow=rotw({rotation:.6}*PI/180):oh=roth({rotation:.6}*PI/180):c=0x00000000"
                     ));
                 }
-                // Pad/crop back to frame and position via overlay offset later —
-                // for single-layer export, pad to canvas then crop.
+                // Pad/crop back to frame, positioning via the normalized
+                // offset. Transparent padding keeps overlay layers (PiP)
+                // compositable; on the base layer the padding is cropped or
+                // blends over the black canvas — visually identical.
                 if x.abs() > 1e-4 || y.abs() > 1e-4 || (scale - 1.0).abs() > 1e-4 || rotation.abs() > 1e-3
                 {
                     let ox = (fw * x * 0.5) as i32;
                     let oy = (fh * y * 0.5) as i32;
+                    if !rgba {
+                        parts.push("format=rgba".into());
+                    }
                     parts.push(format!(
-                        "pad={fw}:{fh}:(ow-iw)/2+{ox}:(oh-ih)/2+{oy}:black"
+                        "pad={fw}:{fh}:(ow-iw)/2+{ox}:(oh-ih)/2+{oy}:color=0x00000000"
                     ));
                     parts.push(format!("crop={fw}:{fh}"));
                 }
                 if opacity < 0.999 {
+                    if !rgba {
+                        parts.push("format=rgba".into());
+                    }
                     parts.push(format!(
-                        "format=rgba,colorchannelmixer=aa={opacity:.4}"
+                        "colorchannelmixer=aa={opacity:.4}"
                     ));
                 }
             }
@@ -662,12 +709,29 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
     Ok(info)
 }
 
-fn video_scale_chain(match_source: bool, width: u32, height: u32, fit: ExportFit, fps: Option<f64>) -> String {
+fn video_scale_chain(
+    match_source: bool,
+    width: u32,
+    height: u32,
+    fit: ExportFit,
+    fps: Option<f64>,
+    overlay: bool,
+) -> String {
     let mut filters: Vec<String> = Vec::new();
     if let Some(fps) = fps {
         if fps > 0.0 {
             filters.push(format!("fps={fps}"));
         }
+    }
+    if overlay {
+        // Overlay layers must keep transparent margins so the base shows
+        // through: fit inside the frame, pad with transparent, force alpha.
+        let w = width.max(2) & !1;
+        let h = height.max(2) & !1;
+        filters.push(format!(
+            "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba,setsar=1"
+        ));
+        return filters.join(",");
     }
     if match_source {
         filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".into());
@@ -803,7 +867,7 @@ pub fn build_export_args(
 ) -> Result<Vec<String>, MediaError> {
     ensure_ffmpeg()?;
 
-    let vf = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps);
+    let vf = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, false);
 
     let mut args = vec![
         "-y".into(),
@@ -893,7 +957,8 @@ pub fn build_timeline_export_args(
 
     let v_count = req.video.len();
     let a_count = req.audio.len();
-    let scale = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps);
+    let scale_base = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, false);
+    let scale_overlay = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, true);
     let w = req.width.max(2) & !1;
     let h = req.height.max(2) & !1;
 
@@ -924,6 +989,9 @@ pub fn build_timeline_export_args(
                 format!("vbg{i}")
             };
             let effects = build_video_effect_chain(seg, w, h);
+            // First video segment = bottom layer; the rest composite on top
+            // with alpha so PiP overlays work.
+            let scale = if i == 0 { &scale_base } else { &scale_overlay };
             let mut vchain = format!("[{i}:v]{scale}");
             if !effects.is_empty() {
                 vchain.push(',');

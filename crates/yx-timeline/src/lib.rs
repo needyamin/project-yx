@@ -201,6 +201,9 @@ pub enum FilterKind {
     Transition,
     /// De-esser: tames harsh "s" sounds in voice.
     Deesser,
+    /// Magic Remove / AI Eraser: brush mask + auto tracking + background
+    /// reconstruction rendered to a non-destructive sidecar clip.
+    MagicRemove,
 }
 
 impl FilterKind {
@@ -214,6 +217,7 @@ impl FilterKind {
                 | Self::VideoDenoise
                 | Self::Stabilize
                 | Self::Lut3d
+                | Self::MagicRemove
         )
     }
 
@@ -286,6 +290,20 @@ impl FilterKind {
             Self::Normalize => serde_json::json!({ "target": -16.0 }),
             Self::Transition => serde_json::json!({ "kind": "dissolve", "duration": 0.5 }),
             Self::Deesser => serde_json::json!({ "amount": 0.5 }),
+            Self::MagicRemove => serde_json::json!({
+                "strokes": [],
+                "keyframes": [],
+                "anchorTime": 0.0,
+                // Brush radius / feather / expand as fractions of frame height.
+                "brushSize": 0.025,
+                "feather": 0.008,
+                "expand": 0.004,
+                "trackingAccuracy": "medium",
+                "removalStrength": 100.0,
+                "status": "idle",
+                "renderKey": "",
+                "resultPath": ""
+            }),
         }
     }
 }

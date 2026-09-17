@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   defaultParams,
@@ -93,6 +100,10 @@ export function AdvancedVideoDialog({
   const [blur, setBlur] = useState(0);
   const [flipH, setFlipH] = useState(false);
   const [flipV, setFlipV] = useState(false);
+  // Natural aspect of the loaded media so the preview box takes the video's
+  // own shape (landscape, portrait, square — anything) and scales UP to fill
+  // the dialog. object-fit: contain guarantees nothing is ever cropped.
+  const [videoAspect, setVideoAspect] = useState(16 / 9);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fadeTimer = useRef(0);
@@ -157,8 +168,14 @@ export function AdvancedVideoDialog({
   localTimeRef.current = localTime;
 
   const previewFilters = useMemo((): FilterInstance[] => {
+    // Crop and Transform are deliberately left out: this dialog always shows
+    // the full original frame — no crop, no zoom, no pan. The zoomed WYSIWYG
+    // views for those effects live in the Project Monitor.
     const base = filters.filter(
-      (f) => !["flip", "exposure", "contrast", "saturation", "blur"].includes(f.kind),
+      (f) =>
+        !["flip", "exposure", "contrast", "saturation", "blur", "crop", "transform"].includes(
+          f.kind,
+        ),
     );
     const live: FilterInstance[] = [
       ...base,
@@ -196,6 +213,10 @@ export function AdvancedVideoDialog({
       video.style.transform = style.transform;
       video.style.opacity = String(style.opacity);
       video.style.clipPath = style.clipPath ?? "";
+      // Full-frame preview: contain-fit the whole picture, never zoom into a
+      // crop region (that WYSIWYG zoom lives in the Project Monitor).
+      video.style.removeProperty("object-view-box");
+      video.style.objectFit = "";
     },
     [dur, fadeIn, fadeOut, previewFilters],
   );
@@ -240,14 +261,37 @@ export function AdvancedVideoDialog({
     applyPreviewCss(localTimeRef.current);
   }, [applyPreviewCss]);
 
+  // Load the media only when the source actually changes — reloading on every
+  // slider-driven style change would restart playback and jump back to 0.
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
     video.src = src;
     video.load();
-    const onMeta = () => seekLocal(0, true);
+  }, [src]);
+
+  // Track the media's natural shape: on metadata load, on mid-stream
+  // resolution change, and immediately if metadata already arrived (race
+  // guard). Starts the preview at the trim in-point once ready.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !src) return;
+    const syncAspect = () => {
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (w > 0 && h > 0 && Number.isFinite(w / h)) setVideoAspect(w / h);
+    };
+    if (video.readyState >= 1) syncAspect();
+    const onMeta = () => {
+      syncAspect();
+      seekLocal(0, true);
+    };
     video.addEventListener("loadedmetadata", onMeta);
-    return () => video.removeEventListener("loadedmetadata", onMeta);
+    video.addEventListener("resize", syncAspect);
+    return () => {
+      video.removeEventListener("loadedmetadata", onMeta);
+      video.removeEventListener("resize", syncAspect);
+    };
   }, [src, seekLocal]);
 
   const stopRaf = useCallback(() => {
@@ -524,7 +568,10 @@ export function AdvancedVideoDialog({
           </button>
         </header>
 
-        <div className="avd-preview-wrap">
+        <div
+          className="avd-preview-wrap"
+          style={{ "--avd-ar": String(videoAspect) } as CSSProperties}
+        >
           {src ? (
             <video ref={videoRef} className="avd-video" playsInline muted preload="auto" />
           ) : (
@@ -773,8 +820,10 @@ export function AdvancedVideoDialog({
 
           <p className="avd-hint">
             Play previews fades, color, flip, reverse, and speed here. <strong>Done</strong> saves to
-            the video clip (Applied tab). Speed retimes timeline length; reverse affects picture on
-            export; linked audio stays forward unless edited separately.
+            the video clip (Applied tab). The preview always shows the original frame at its own
+            size — no crop, no zoom (Crop/Transform previews stay in the Project Monitor). Speed
+            retimes timeline length; reverse affects picture on export; linked audio stays forward
+            unless edited separately.
           </p>
           {target.sourceMode && (
             <p className="avd-hint">Source preview only — add the clip to the timeline to save edits.</p>

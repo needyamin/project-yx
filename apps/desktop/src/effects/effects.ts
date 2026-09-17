@@ -29,7 +29,25 @@ export type EffectKind =
   | "stabilize"
   | "lut3d"
   | "normalize"
-  | "transition";
+  | "transition"
+  | "shake"
+  | "wiggle"
+  | "bounce"
+  | "zoompulse"
+  | "zoomin"
+  | "spin"
+  | "rgbsplit"
+  | "glitch"
+  | "flash"
+  | "pulse"
+  | "glow"
+  | "neon"
+  | "vhs"
+  | "motionblur"
+  | "cinematic"
+  | "dream"
+  | "magic"
+  | "magicremove";
 
 export type FilterInstance = {
   id: string;
@@ -43,6 +61,10 @@ export const EFFECT_CATALOG: {
   label: string;
   heavy?: boolean;
   roles: ("video" | "audio")[];
+  /** Category for grouped pickers (Motion, Shake, Glitch, Light, ...). */
+  category?: string;
+  /** Short editable-param summary for the inspector hint. */
+  params?: string[];
 }[] = [
   { id: "transform", label: "Transform", roles: ["video"] },
   { id: "crop", label: "Crop", roles: ["video"] },
@@ -73,6 +95,35 @@ export const EFFECT_CATALOG: {
   { id: "lut3d", label: "LUT (.cube)", heavy: true, roles: ["video"] },
   { id: "transition", label: "Cross Dissolve", roles: ["video"] },
   { id: "normalize", label: "Normalize (loudness)", roles: ["audio"] },
+
+  /* --- Motion / Shake / Glitch / Light / Magic / Cinematic / Retro /
+     Trending (Vita-style live effects). All accept intensity, speed,
+     duration and direction where meaningful. --- */
+  { id: "shake", label: "Camera Shake", roles: ["video"], category: "Shake", params: ["intensity", "speed", "direction"] },
+  { id: "wiggle", label: "Wiggle", roles: ["video"], category: "Shake", params: ["intensity", "speed"] },
+  { id: "bounce", label: "Bounce", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
+  { id: "zoompulse", label: "Zoom Pulse", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
+  { id: "zoomin", label: "Dynamic Zoom", roles: ["video"], category: "Motion", params: ["intensity", "duration", "direction"] },
+  { id: "spin", label: "Spin", roles: ["video"], category: "Motion", params: ["speed", "duration", "direction"] },
+  { id: "motionblur", label: "Motion Blur", roles: ["video"], category: "Motion", params: ["intensity"] },
+  { id: "rgbsplit", label: "RGB Split", roles: ["video"], category: "Glitch", params: ["intensity", "direction"] },
+  { id: "glitch", label: "Glitch", roles: ["video"], category: "Glitch", params: ["intensity", "speed"] },
+  { id: "flash", label: "Flash", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
+  { id: "pulse", label: "Beat Pulse", roles: ["video"], category: "Trending", params: ["intensity", "speed"] },
+  { id: "glow", label: "Glow", roles: ["video"], category: "Light", params: ["intensity"] },
+  { id: "neon", label: "Neon Cycle", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
+  { id: "vhs", label: "VHS Retro", roles: ["video"], category: "Retro", params: ["intensity"] },
+  { id: "cinematic", label: "Cinematic", roles: ["video"], category: "Cinematic", params: ["intensity"] },
+  { id: "dream", label: "Dream Bloom", roles: ["video"], category: "Magic", params: ["intensity"] },
+  { id: "magic", label: "Magic Hue", roles: ["video"], category: "Magic", params: ["intensity", "speed"] },
+  {
+    id: "magicremove",
+    label: "Magic Remove (AI Eraser)",
+    heavy: true,
+    roles: ["video"],
+    category: "Magic",
+    params: ["brushSize", "feather", "expand", "trackingAccuracy", "removalStrength"],
+  },
 ];
 
 export function defaultParams(kind: string): Record<string, unknown> {
@@ -135,6 +186,57 @@ export function defaultParams(kind: string): Record<string, unknown> {
       return { target: -16 };
     case "transition":
       return { kind: "dissolve", duration: 0.5 };
+    /* --- Vita-style motion / look effects --- */
+    case "shake":
+      return { intensity: 0.06, speed: 8, direction: "both", duration: 0 };
+    case "wiggle":
+      return { intensity: 0.03, speed: 20, duration: 0 };
+    case "bounce":
+      return { intensity: 0.08, speed: 2, duration: 0 };
+    case "zoompulse":
+      return { intensity: 0.15, speed: 2, duration: 0 };
+    case "zoomin":
+      return { intensity: 0.3, duration: 5, direction: "in" };
+    case "spin":
+      return { speed: 0.25, duration: 3, direction: "cw" };
+    case "rgbsplit":
+      return { intensity: 6, direction: "horizontal", duration: 0 };
+    case "glitch":
+      return { intensity: 8, speed: 2, duration: 0 };
+    case "flash":
+      return { intensity: 0.25, speed: 2, duration: 0 };
+    case "pulse":
+      return { intensity: 0.12, speed: 2, duration: 0 };
+    case "glow":
+      return { intensity: 0.6, duration: 0 };
+    case "neon":
+      return { intensity: 0.5, speed: 0.25, duration: 0 };
+    case "vhs":
+      return { intensity: 5, duration: 0 };
+    case "motionblur":
+      return { intensity: 2, duration: 0 };
+    case "cinematic":
+      return { intensity: 0.5, duration: 0 };
+    case "dream":
+      return { intensity: 0.5, duration: 0 };
+    case "magic":
+      return { intensity: 0.3, speed: 0.25, duration: 0 };
+    /* Magic Remove: brush radius/feather/expand are fractions of frame
+       height; strokes/keyframes live in params (see MagicRemove tool). */
+    case "magicremove":
+      return {
+        strokes: [],
+        keyframes: [],
+        anchorTime: 0,
+        brushSize: 0.025,
+        feather: 0.008,
+        expand: 0.004,
+        trackingAccuracy: "medium",
+        removalStrength: 100,
+        status: "idle",
+        renderKey: "",
+        resultPath: "",
+      };
     default:
       return {};
   }
@@ -142,6 +244,11 @@ export function defaultParams(kind: string): Record<string, unknown> {
 
 export function effectLabel(kind: string): string {
   return EFFECT_CATALOG.find((e) => e.id === kind)?.label ?? kind;
+}
+
+/** Category of an effect (Motion, Shake, Glitch, Light, ...). */
+export function effectCategory(kind: string): string {
+  return EFFECT_CATALOG.find((e) => e.id === kind)?.category ?? "Essentials";
 }
 
 /** Short label for dense 2-column cards. */
@@ -209,6 +316,8 @@ export function effectMeta(kind: string): { glyph: string; hue: string } {
       return { glyph: "⇄", hue: "#4ecdc4" };
     case "chromakey":
       return { glyph: "◆", hue: "#3dd68c" };
+    case "magicremove":
+      return { glyph: "✷", hue: "#b76af0" };
     case "volume":
       return { glyph: "♪", hue: "#f0a35e" };
     case "equalizer":
@@ -333,10 +442,12 @@ export function previewVideoStyle(
         const right = n(p, "right", 0) * 100;
         const bottom = n(p, "bottom", 0) * 100;
         if (left + top + right + bottom > 0.01) {
-          // object-view-box = the cropped region becomes the full frame,
-          // matching the export's crop+scale-to-fill (no letterbox).
-          objectViewBox = `inset(${top}% ${right}% ${bottom}% ${left}%)`;
-          objectFit = "fill";
+          // object-view-box shows just the cropped region, contain-fit so the
+          // region keeps its true shape (orientation-aware: vertical stays
+          // vertical, horizontal stays horizontal — never stretched),
+          // matching the export's crop + aspect-preserving scale + pad.
+          objectViewBox = `inset(${top.toFixed(3)}% ${right.toFixed(3)}% ${bottom.toFixed(3)}% ${left.toFixed(3)}%)`;
+          objectFit = "contain";
         }
         break;
       }
@@ -390,8 +501,73 @@ export function previewPitchRate(filters: FilterInstance[]): number {
   return 1;
 }
 
-/** Apply chromakey on a canvas frame (simple distance key). */
-export function applyChromakeyToImageData(
+/* ---------------------------------------------------------------------- */
+/* Magic Remove / AI Eraser helpers                                        */
+/* ---------------------------------------------------------------------- */
+
+export type MagicStroke = {
+  /** Polyline points in normalized source coords ([x, y], fractions of
+   * width/height) — matches the Rust engine's `[f64; 2]` shape. */
+  points: [number, number][];
+  /** Brush radius as a fraction of frame height. */
+  radius: number;
+  erase?: boolean;
+};
+
+export type MagicKeyframe = { t: number; dx: number; dy: number; manual?: boolean };
+
+/** Find the enabled Magic Remove filter on a clip. */
+export function findMagicRemove(
+  filters: FilterInstance[] | undefined,
+): FilterInstance | undefined {
+  return filters?.find((f) => f.kind === "magicremove" && f.enabled);
+}
+
+/** Snapshot of everything that changes the rendered result — used to detect
+ * when a stored resultPath sidecar is stale and must be re-rendered. */
+export function magicRenderKey(params: Record<string, unknown> | null | undefined): string {
+  if (!params) return "";
+  return JSON.stringify({
+    s: params.strokes ?? [],
+    k: params.keyframes ?? [],
+    f: params.feather,
+    e: params.expand,
+    a: params.trackingAccuracy,
+    r: params.removalStrength,
+  });
+}
+
+/** True when the clip has a completed, non-stale Magic Remove render. */
+export function magicResultReady(params: Record<string, unknown> | null | undefined): string | null {
+  if (!params) return null;
+  const path = typeof params.resultPath === "string" ? params.resultPath : "";
+  if (!path) return null;
+  return magicRenderKey(params) === params.renderKey ? path : null;
+}
+
+/** Linearly interpolated mask offset (normalized fractions) at media time t. */
+export function magicOffsetAt(
+  keyframes: MagicKeyframe[] | undefined,
+  t: number,
+): { dx: number; dy: number } {
+  const kf = [...(keyframes ?? [])].sort((a, b) => a.t - b.t);
+  if (kf.length === 0) return { dx: 0, dy: 0 };
+  if (t <= kf[0].t) return { dx: kf[0].dx, dy: kf[0].dy };
+  if (t >= kf[kf.length - 1].t) return { dx: kf[kf.length - 1].dx, dy: kf[kf.length - 1].dy };
+  for (let i = 0; i < kf.length - 1; i++) {
+    if (t >= kf[i].t && t <= kf[i + 1].t) {
+      const span = Math.max(1e-6, kf[i + 1].t - kf[i].t);
+      const f = (t - kf[i].t) / span;
+      return {
+        dx: kf[i].dx + (kf[i + 1].dx - kf[i].dx) * f,
+        dy: kf[i].dy + (kf[i + 1].dy - kf[i].dy) * f,
+      };
+    }
+  }
+  return { dx: 0, dy: 0 };
+}
+
+/** Apply chromakey on a canvas frame (simple distance key). */export function applyChromakeyToImageData(
   data: ImageData,
   colorHex: string,
   similarity: number,

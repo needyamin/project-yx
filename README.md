@@ -13,6 +13,7 @@ Project YX is a free, open-source desktop video editor (Windows / Linux) built t
 - **Screen recorder** — capture any screen/window with mic, straight to the timeline
 - **Voiceover** — one-click mic recording onto an audio track
 - **Effects** — Transform, Crop, Chroma key, Text/Titles, Vignette, Hue, Temperature, Sharpen, Blur, Cross dissolve, LUT (.cube)
+- **Magic Remove (AI Eraser)** — brush over a logo, watermark, text or object; auto-tracking follows it across frames and the background is intelligently rebuilt. Non-destructive, with adjustable brush size, feather, tracking accuracy and removal strength
 - **Audio tools** — Noise removal, Voice clean presets, Compressor, EQ, Gate, De-esser, Normalize, Reverb, Pitch
 - **Smart proxies** — heavy footage edits smoothly on weak CPUs; exports use the original quality
 - **Export** — MP4 (H.264/H.265), 4K, 9:16 vertical, optional GPU encode (NVENC / QSV / AMF)

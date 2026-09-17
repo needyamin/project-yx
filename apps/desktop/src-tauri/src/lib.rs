@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use yx_detect::{probe_and_policy, HardwareProfile, PerformancePolicy};
@@ -10,6 +11,7 @@ use yx_media::{
     ExportCodec, ExportFit, ExportFilter, ExportRequest, ExportSegment, MediaInfo,
     TimelineExportRequest, VideoEncoder,
 };
+use yx_media::magic::{MagicJob, MagicKeyframe};
 use yx_proxy::{ProxyJob, ProxyManager};
 use yx_timeline::{
     ClipId, EditCommand, EditMode, FilterKind, MediaRole, Timeline, TimelineEditor, TrackId,
@@ -25,6 +27,9 @@ struct AppState {
     /// ffprobe results keyed by canonical path — importing and dragging a file
     /// onto the timeline must not spawn repeated ffprobe subprocesses.
     probe_cache: Mutex<HashMap<PathBuf, MediaInfo>>,
+    /// Magic Remove: one heavy track/render at a time + cooperative cancel.
+    magic_busy: Arc<AtomicBool>,
+    magic_cancel: Arc<AtomicBool>,
 }
 
 fn cached_probe(state: &AppState, path: &Path) -> Result<MediaInfo, String> {
@@ -70,8 +75,10 @@ fn reprobe_hardware(state: State<'_, AppState>) -> BootInfo {
     }
 }
 
+/// Async so the (cached) ffprobe inside never blocks the UI thread — a
+/// synchronous probe freezes every window interaction for its duration.
 #[tauri::command]
-fn import_media(path: String, state: State<'_, AppState>) -> Result<MediaInfo, String> {
+async fn import_media(path: String, state: State<'_, AppState>) -> Result<MediaInfo, String> {
     let info = cached_probe(&state, PathBuf::from(&path).as_path())?;
     let policy = state.policy.lock().clone();
     let proxies = Arc::clone(&state.proxies);
@@ -81,6 +88,21 @@ fn import_media(path: String, state: State<'_, AppState>) -> Result<MediaInfo, S
         let _ = proxies.enqueue(source.as_path(), &policy);
     });
     Ok(info)
+}
+
+/// Read a UTF-8 text file (dropped onto the Project Monitor) for a title.
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err(format!("Not a file: {}", path));
+    }
+    const MAX_BYTES: u64 = 256 * 1024;
+    let meta = std::fs::metadata(&p).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_BYTES {
+        return Err("Text file is too large (max 256 KB)".to_string());
+    }
+    std::fs::read_to_string(&p).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Serialize)]
@@ -111,13 +133,46 @@ fn playback_path(state: &AppState, media_path: &str) -> String {
 }
 
 /// Route media onto the correct track(s): AV pair, video-only, or audio-only.
+/// Async: probe + placement run off the UI thread so drops never stutter.
 #[tauri::command]
-fn add_media_to_timeline(
+async fn add_media_to_timeline(
     media_path: String,
     start: f64,
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     place_media_on_timeline(&state, media_path, start)
+}
+
+/// First visible, unlocked track of `kind` whose time range at
+/// [start, start + dur) is completely free — or `TrackId::nil()` when every
+/// candidate is busy (the caller then adds a fresh track, VITA-style).
+fn first_free_track(
+    timeline: &Timeline,
+    kind: TrackKind,
+    start: f64,
+    dur: f64,
+) -> TrackId {
+    let candidates: Vec<TrackId> = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == kind && !t.hidden && !t.locked)
+        .map(|t| t.id)
+        .collect();
+    candidates
+        .into_iter()
+        .find(|tid| {
+            timeline
+                .tracks
+                .iter()
+                .find(|t| t.id == *tid)
+                .map(|t| {
+                    t.clips.iter().all(|c| {
+                        c.end() <= start + 1e-6 || c.start >= start + dur - 1e-6
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or_default()
 }
 
 fn place_media_on_timeline(
@@ -140,74 +195,114 @@ fn place_media_on_timeline(
     let path = playback_path(state, &media_path);
     let mut editor = state.editor.lock();
 
-    if info.has_video && info.has_audio {
-        let video_track = editor
-            .timeline()
-            .first_track(TrackKind::Video)
-            .ok_or_else(|| "no video track".to_string())?;
-        let audio_track = editor
-            .timeline()
-            .first_track(TrackKind::Audio)
-            .ok_or_else(|| "no audio track".to_string())?;
-        editor
-            .apply(EditCommand::AddAvPair {
-                video_track_id: video_track,
-                audio_track_id: audio_track,
-                media_path: path,
-                source_path: Some(source),
-                start,
-                in_point: 0.0,
-                out_point,
-            })
-            .map_err(|e| e.to_string())?;
-    } else if info.has_video {
-        let video_track = editor
-            .timeline()
-            .first_track(TrackKind::Video)
-            .ok_or_else(|| "no video track".to_string())?;
-        editor
-            .apply(EditCommand::AddClip {
-                track_id: video_track,
-                media_path: path,
-                source_path: Some(source),
-                start,
-                in_point: 0.0,
-                out_point,
-                role: MediaRole::Video,
-                linked_clip_id: None,
-            })
-            .map_err(|e| e.to_string())?;
-    } else if info.has_audio {
-        // Voiceovers/overdubs: prefer the first audio track whose range at the
-        // drop point is FREE, so they land exactly at the playhead instead of
-        // stacking on top of existing music. Falls back to the first track.
-        // First FREE audio track at the drop point; when every track is busy
-        // (e.g. voiceover over a full music bed), add a fresh track instead
-        // of stacking invisibly on top of existing clips.
-        let mut audio_track = {
+    // VITA-style stacking: visual media lands ABOVE the topmost video track
+    // occupied at the drop range, so it always renders in front of existing
+    // content; a fresh track is added when nothing free remains above it.
+    // (Array order is the compositing order: first video track = bottom.)
+    if info.has_video {
+        let video_track = {
             let timeline = editor.timeline();
-            let candidates: Vec<TrackId> = timeline
+            let video_tracks: Vec<(usize, TrackId)> = timeline
                 .tracks
                 .iter()
-                .filter(|t| t.kind == TrackKind::Audio && !t.hidden && !t.locked)
-                .map(|t| t.id)
+                .enumerate()
+                .filter(|(_, t)| t.kind == TrackKind::Video && !t.hidden && !t.locked)
+                .map(|(i, t)| (i, t.id))
                 .collect();
-            candidates
+            let occupied_at = |tid: &TrackId| -> bool {
+                timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == *tid)
+                    .map(|t| {
+                        t.clips
+                            .iter()
+                            .any(|c| !(c.end() <= start + 1e-6 || c.start >= start + out_point - 1e-6))
+                    })
+                    .unwrap_or(false)
+            };
+            let top_occupied = video_tracks
                 .iter()
-                .copied()
-                .find(|tid| {
-                    timeline
-                        .tracks
-                        .iter()
-                        .find(|t| t.id == *tid)
-                        .map(|t| {
-                            t.clips.iter().all(|c| {
-                                c.end() <= start + 1e-6 || c.start >= start + out_point - 1e-6
-                            })
-                        })
-                        .unwrap_or(false)
-                })
+                .filter(|(_, tid)| occupied_at(tid))
+                .map(|(i, _)| *i)
+                .max();
+            video_tracks
+                .iter()
+                .filter(|(i, _)| top_occupied.map_or(true, |top| *i > top))
+                .find(|(_, tid)| !occupied_at(tid))
+                .map(|(_, tid)| *tid)
                 .unwrap_or_default()
+        };
+        let video_track = if video_track.is_nil() {
+            editor
+                .apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
+                .map_err(|e| e.to_string())?;
+            editor
+                .timeline()
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Video)
+                .last()
+                .map(|t| t.id)
+                .ok_or_else(|| "no video track".to_string())?
+        } else {
+            video_track
+        };
+
+        if info.has_audio {
+            // Linked audio: prefer a free audio track so the sound lands at
+            // the drop point instead of stacking on existing music.
+            let audio_track = {
+                let timeline = editor.timeline();
+                first_free_track(timeline, TrackKind::Audio, start, out_point)
+            };
+            let audio_track = if audio_track.is_nil() {
+                editor
+                    .apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
+                    .map_err(|e| e.to_string())?;
+                editor
+                    .timeline()
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Audio)
+                    .last()
+                    .map(|t| t.id)
+                    .ok_or_else(|| "no audio track".to_string())?
+            } else {
+                audio_track
+            };
+            editor
+                .apply(EditCommand::AddAvPair {
+                    video_track_id: video_track,
+                    audio_track_id: audio_track,
+                    media_path: path,
+                    source_path: Some(source),
+                    start,
+                    in_point: 0.0,
+                    out_point,
+                })
+                .map_err(|e| e.to_string())?;
+        } else {
+            editor
+                .apply(EditCommand::AddClip {
+                    track_id: video_track,
+                    media_path: path,
+                    source_path: Some(source),
+                    start,
+                    in_point: 0.0,
+                    out_point,
+                    role: MediaRole::Video,
+                    linked_clip_id: None,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+    } else if info.has_audio {
+        // Voiceovers/overdubs: first FREE audio track at the drop point; when
+        // every track is busy (e.g. voiceover over a full music bed), add a
+        // fresh track instead of stacking invisibly on existing clips.
+        let mut audio_track = {
+            let timeline = editor.timeline();
+            first_free_track(timeline, TrackKind::Audio, start, out_point)
         };
         if audio_track.is_nil() {
             editor
@@ -558,6 +653,117 @@ fn remove_filter(
     Ok(editor.timeline().clone())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MagicProgressPayload {
+    percent: f64,
+    phase: String,
+}
+
+fn emit_magic_progress(app: &AppHandle, percent: f64, phase: &str) {
+    let _ = app.emit(
+        "magic-progress",
+        MagicProgressPayload {
+            percent: (percent.clamp(0.0, 1.0) * 100.0).round() / 100.0,
+            phase: phase.to_string(),
+        },
+    );
+}
+
+/// Auto-track the brushed mask region across the clip. Returns translation
+/// keyframes (normalized offsets) that the UI stores back into filter params
+/// so the user can inspect and manually correct them.
+#[tauri::command]
+async fn magic_remove_track(
+    app: AppHandle,
+    source: String,
+    params: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    if state.magic_busy.swap(true, Ordering::SeqCst) {
+        return Err("Another Magic Remove job is already running".into());
+    }
+    state.magic_cancel.store(false, Ordering::SeqCst);
+    let cancel = state.magic_cancel.clone();
+    let emit_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let job = MagicJob::from_params(Path::new(&source), &params, Vec::new())?;
+        let kf = yx_media::magic::track_mask(&job, Some(&cancel), &|p, phase| {
+            emit_magic_progress(&emit_app, p, phase);
+        })?;
+        Ok(serde_json::json!({ "keyframes": kf }))
+    })
+    .await
+    .map_err(|e| format!("magic track task failed: {e}"))?;
+    state.magic_busy.store(false, Ordering::SeqCst);
+    if result.is_ok() {
+        let _ = app.emit(
+            "magic-progress",
+            MagicProgressPayload {
+                percent: 1.0,
+                phase: "done".into(),
+            },
+        );
+    }
+    result
+}
+
+/// Render the inpainted sidecar clip (cached by source + mask + settings).
+/// Returns the sidecar path for the frontend to store in `resultPath`.
+#[tauri::command]
+async fn magic_remove_render(
+    app: AppHandle,
+    source: String,
+    params: serde_json::Value,
+    keyframes: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if state.magic_busy.swap(true, Ordering::SeqCst) {
+        return Err("Another Magic Remove job is already running".into());
+    }
+    state.magic_cancel.store(false, Ordering::SeqCst);
+    let cancel = state.magic_cancel.clone();
+    let emit_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let kfs: Vec<MagicKeyframe> = if keyframes.is_array() {
+            serde_json::from_value(keyframes).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let job = MagicJob::from_params(Path::new(&source), &params, kfs)?;
+        let dir = dirs_cache().with_file_name("magic-cache");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let out = yx_media::magic::cache_path(&dir, &job);
+        if !out.exists() {
+            let tmp = out.with_extension("tmp.mp4");
+            yx_media::magic::render_inpaint(&job, &tmp, Some(&cancel), &|p, phase| {
+                emit_magic_progress(&emit_app, p, phase);
+            })?;
+            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+        }
+        Ok(out.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("magic render task failed: {e}"))?;
+    state.magic_busy.store(false, Ordering::SeqCst);
+    if result.is_ok() {
+        let _ = app.emit(
+            "magic-progress",
+            MagicProgressPayload {
+                percent: 1.0,
+                phase: "done".into(),
+            },
+        );
+    }
+    result
+}
+
+/// Cooperative cancel for the running Magic Remove track/render job.
+#[tauri::command]
+fn magic_remove_cancel(state: State<'_, AppState>) {
+    state.magic_cancel.store(true, Ordering::SeqCst);
+}
+
 fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
     Ok(match kind {
         "transform" => FilterKind::Transform,
@@ -592,6 +798,7 @@ fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
         "normalize" => FilterKind::Normalize,
         "transition" => FilterKind::Transition,
         "deesser" => FilterKind::Deesser,
+        "magicremove" => FilterKind::MagicRemove,
         other => return Err(format!("unknown filter: {other}")),
     })
 }
@@ -798,42 +1005,105 @@ fn collect_export_segments(
     kind: TrackKind,
     proxies: &ProxyManager,
 ) -> Vec<ExportSegment> {
-    // Video: first unmuted/visible track only (preserve prior overlay model).
-    // Audio: all unmuted/visible tracks so FX on A2+ still export.
+    // Video: every visible track, in track order (first track = bottom layer,
+    // later tracks composite on top = VITA-style overlays). Audio: all
+    // unmuted/visible tracks so FX on A2+ still export.
     let tracks: Vec<_> = timeline
         .tracks
         .iter()
         .filter(|t| t.kind == kind && !t.muted && !t.hidden && !t.clips.is_empty())
         .collect();
 
-    let selected: Vec<_> = if kind == TrackKind::Video {
-        tracks.into_iter().take(1).collect()
-    } else {
-        tracks
-    };
-
-    if selected.is_empty() {
+    if tracks.is_empty() {
         return Vec::new();
     }
 
-    let mut clips: Vec<_> = selected
+    // Order matters for the overlay chain: group by track (track order is
+    // the stacking order), start-time order within each track.
+    let clips: Vec<_> = tracks
         .iter()
-        .flat_map(|track| track.clips.iter())
-        .filter(|c| c.out_point > c.in_point)
+        .flat_map(|track| {
+            let mut clips: Vec<_> = track
+                .clips
+                .iter()
+                .filter(|c| c.out_point > c.in_point)
+                .collect();
+            clips.sort_by(|a, b| {
+                a.start
+                    .partial_cmp(&b.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            clips
+        })
         .collect();
-    clips.sort_by(|a, b| {
-        a.start
-            .partial_cmp(&b.start)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
     clips
         .into_iter()
         .map(|c| {
-            let source = c
+            let mut source = c
                 .source_path
                 .as_ref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(&c.media_path));
+            let mut filters: Vec<ExportFilter> = c
+                .filters
+                .iter()
+                .map(|f| ExportFilter {
+                    kind: match f.kind {
+                        FilterKind::Transform => "transform",
+                        FilterKind::Crop => "crop",
+                        FilterKind::Exposure => "exposure",
+                        FilterKind::Contrast => "contrast",
+                        FilterKind::Saturation => "saturation",
+                        FilterKind::Blur => "blur",
+                        FilterKind::Flip => "flip",
+                        FilterKind::Chromakey => "chromakey",
+                        FilterKind::Volume => "volume",
+                        FilterKind::Equalizer => "equalizer",
+                        FilterKind::Compressor => "compressor",
+                        FilterKind::Highpass => "highpass",
+                        FilterKind::Lowpass => "lowpass",
+                        FilterKind::Gate => "gate",
+                        FilterKind::Denoise => "denoise",
+                        FilterKind::Limiter => "limiter",
+                        FilterKind::Reverb => "reverb",
+                        FilterKind::Invert => "invert",
+                        FilterKind::Pitch => "pitch",
+                        FilterKind::Lut => "lut",
+                        FilterKind::Fade => "fade",
+                        FilterKind::Text => "text",
+                        FilterKind::Temperature => "temperature",
+                        FilterKind::Hue => "hue",
+                        FilterKind::Vignette => "vignette",
+                        FilterKind::Sharpen => "sharpen",
+                        FilterKind::VideoDenoise => "vdenoise",
+                        FilterKind::Stabilize => "stabilize",
+                        FilterKind::Lut3d => "lut",
+                        FilterKind::Normalize => "normalize",
+                        FilterKind::Transition => "transition",
+                        FilterKind::Deesser => "deesser",
+                        FilterKind::MagicRemove => "magicremove",
+                    }
+                    .into(),
+                    enabled: f.enabled,
+                    params: f.params.clone(),
+                })
+                .collect();
+            // Magic Remove: the removal is baked into the pre-rendered sidecar
+            // clip (same timing as the original), so export reads its frames
+            // instead of the original and the filter itself is dropped from
+            // the chain. Falls back to the original when no render exists.
+            if let Some(mr) = c
+                .filters
+                .iter()
+                .find(|f| f.kind == FilterKind::MagicRemove && f.enabled)
+            {
+                if let Some(p) = mr.params.get("resultPath").and_then(|v| v.as_str()) {
+                    if !p.is_empty() && Path::new(p).is_file() {
+                        source = PathBuf::from(p);
+                        filters.retain(|f| f.kind != "magicremove");
+                    }
+                }
+            }
             ExportSegment {
                 path: proxies.original_path(source.as_path()),
                 in_point: c.in_point,
@@ -844,49 +1114,7 @@ fn collect_export_segments(
                 reverse: c.reverse,
                 speed: c.clamped_speed(),
                 is_image: is_image_path(&source),
-                filters: c
-                    .filters
-                    .iter()
-                    .map(|f| ExportFilter {
-                        kind: match f.kind {
-                            FilterKind::Transform => "transform",
-                            FilterKind::Crop => "crop",
-                            FilterKind::Exposure => "exposure",
-                            FilterKind::Contrast => "contrast",
-                            FilterKind::Saturation => "saturation",
-                            FilterKind::Blur => "blur",
-                            FilterKind::Flip => "flip",
-                            FilterKind::Chromakey => "chromakey",
-                            FilterKind::Volume => "volume",
-                            FilterKind::Equalizer => "equalizer",
-                            FilterKind::Compressor => "compressor",
-                            FilterKind::Highpass => "highpass",
-                            FilterKind::Lowpass => "lowpass",
-                            FilterKind::Gate => "gate",
-                            FilterKind::Denoise => "denoise",
-                            FilterKind::Limiter => "limiter",
-                            FilterKind::Reverb => "reverb",
-                            FilterKind::Invert => "invert",
-                            FilterKind::Pitch => "pitch",
-                            FilterKind::Lut => "lut",
-                            FilterKind::Fade => "fade",
-                            FilterKind::Text => "text",
-                            FilterKind::Temperature => "temperature",
-                            FilterKind::Hue => "hue",
-                            FilterKind::Vignette => "vignette",
-                            FilterKind::Sharpen => "sharpen",
-                            FilterKind::VideoDenoise => "vdenoise",
-                            FilterKind::Stabilize => "stabilize",
-                            FilterKind::Lut3d => "lut",
-                            FilterKind::Normalize => "normalize",
-                            FilterKind::Transition => "transition",
-                            FilterKind::Deesser => "deesser",
-                        }
-                        .into(),
-                        enabled: f.enabled,
-                        params: f.params.clone(),
-                    })
-                    .collect(),
+                filters,
             }
         })
         .collect()
@@ -1245,6 +1473,8 @@ pub fn run() {
         policy: Mutex::new(policy),
         proxies: Arc::new(ProxyManager::new(cache)),
         probe_cache: Mutex::new(HashMap::new()),
+        magic_busy: Arc::new(AtomicBool::new(false)),
+        magic_cancel: Arc::new(AtomicBool::new(false)),
     };
 
     // Notify the UI when background proxy transcodes finish so the timeline
@@ -1368,6 +1598,7 @@ pub fn run() {
             debug_agent_log,
             reprobe_hardware,
             import_media,
+            read_text_file,
             swap_timeline_media,
             add_media_to_timeline,
             add_clip_to_track,
@@ -1409,6 +1640,9 @@ pub fn run() {
             save_screen_recording,
             render_audio_preview,
             export_media,
+            magic_remove_track,
+            magic_remove_render,
+            magic_remove_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Project YX");

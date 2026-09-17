@@ -129,14 +129,6 @@ export function TopMenubar({
     }
   }
 
-  async function hideToTray() {
-    try {
-      await getCurrentWindow().hide();
-    } catch {
-      /* ignore */
-    }
-  }
-
   async function quitApp() {
     try {
       await getCurrentWindow().close();
@@ -162,13 +154,6 @@ export function TopMenubar({
             Export…
           </button>
           <hr className="menu-sep" />
-          <button type="button" role="menuitem" onClick={item(onCheckUpdates)}>
-            Check for Updates…
-          </button>
-          <hr className="menu-sep" />
-          <button type="button" role="menuitem" onClick={item(() => void hideToTray())}>
-            Hide to Tray
-          </button>
           <button type="button" role="menuitem" onClick={item(() => void quitApp())}>
             Quit
           </button>

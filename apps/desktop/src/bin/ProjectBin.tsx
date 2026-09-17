@@ -33,6 +33,8 @@ type Props = {
   onDropToTimeline: (item: LibraryItem, clientX: number) => void;
   /** Drop onto Clip Monitor for source preview. */
   onDropToClipMonitor: (item: LibraryItem) => void;
+  /** Drop onto the Project Monitor — places the item at the playhead. */
+  onDropToProjectMonitor?: (item: LibraryItem) => void;
   onRemoveFromBin: (item: LibraryItem) => void;
   onAdvancedAudio?: (
     item: LibraryItem,
@@ -64,6 +66,7 @@ export function ProjectBin({
   onAddToTimeline,
   onDropToTimeline,
   onDropToClipMonitor,
+  onDropToProjectMonitor,
   onRemoveFromBin,
   onAdvancedAudio,
   busy,
@@ -149,6 +152,8 @@ export function ProjectBin({
         onDropToTimeline(ended.item, ev.clientX);
       } else if (target === "clip-monitor") {
         onDropToClipMonitor(ended.item);
+      } else if (target === "project-monitor" && onDropToProjectMonitor) {
+        onDropToProjectMonitor(ended.item);
       }
     };
 

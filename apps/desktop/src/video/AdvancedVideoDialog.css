@@ -49,18 +49,25 @@
 }
 
 .avd-preview-wrap {
-  margin: 0.65rem 1rem 0.35rem;
+  margin: 0.65rem auto 0.35rem;
   border: 1px solid var(--line, #3a3a3e);
   border-radius: 2px;
   background: #0c0e12;
-  min-height: 220px;
-  display: grid;
-  place-items: center;
+  /* The box takes the video's own aspect ratio (--avd-ar, measured from the
+     loaded media) so the preview scales to fill the dialog at the media's
+     real shape — vertical, horizontal, square, anything. object-fit:
+     contain inside guarantees the full frame is always visible, never
+     cropped, never stretched. */
+  width: min(100%, calc(min(46vh, 420px) * var(--avd-ar, 1.7778)));
+  aspect-ratio: var(--avd-ar, 1.7778);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   overflow: hidden;
-  aspect-ratio: 16 / 9;
 }
 
 .avd-video {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;

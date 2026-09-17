@@ -466,6 +466,32 @@ function ParamEditors({
           <p className="ei-hint">Export only — basic shake reduction on render.</p>
         </div>
       );
+    case "magicremove":
+      return (
+        <div className="ei-params">
+          <p className="ei-hint">
+            Brush the mask with the <strong>Remove</strong> tool in the Project
+            Monitor — Auto Track follows motion, Remove rebuilds the background.
+            Non-destructive: toggle off or delete anytime.
+          </p>
+          <Slider label="Feather (%)" min={0} max={0.04} step={0.002} value={num("feather", 0.008)} onChange={(v) => set("feather", v)} />
+          <Slider label="Expand (%)" min={0} max={0.02} step={0.001} value={num("expand", 0.004)} onChange={(v) => set("expand", v)} />
+          <Slider label="Strength (%)" min={10} max={100} step={5} value={num("removalStrength", 100)} onChange={(v) => set("removalStrength", v)} />
+          <label className="ei-slider">
+            <span>
+              Tracking <em>{String(params.trackingAccuracy ?? "medium")}</em>
+            </span>
+            <select
+              value={String(params.trackingAccuracy ?? "medium")}
+              onChange={(e) => set("trackingAccuracy", e.target.value)}
+            >
+              <option value="low">Fast</option>
+              <option value="medium">Balanced</option>
+              <option value="high">Precise</option>
+            </select>
+          </label>
+        </div>
+      );
     case "lut3d":
       return (
         <div className="ei-params">

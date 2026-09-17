@@ -1,13 +1,433 @@
+/* Toolbar buttons: icon + label alignment. */
+.monitor-tools button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.monitor-tools button svg {
+  flex: none;
+  opacity: 0.9;
+}
+
 .monitor-frame.crop-mode {
   cursor: crosshair;
+}
+
+/* Direct manipulation (Kdenlive / VN style): pointer drags never scroll or
+   trigger browser gestures, and the whole frame shows a grabbing cursor
+   while a transform drag is in flight. */
+.monitor-frame {
+  touch-action: none;
+}
+
+.monitor-frame.transform-dragging,
+.monitor-frame.transform-dragging * {
+  cursor: grabbing !important;
+}
+
+/* Overlay layers composite ABOVE the main preview (VITA PiP): transparent
+   background so the base video shows through; pointer-events off — gestures
+   route through the frame to the selected clip. z 3 = above main (z2),
+   below crop UI. */
+.monitor-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: transparent;
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Inline text editor (double-click the text overlay). */
+.monitor-text-overlay.editing {
+  pointer-events: auto;
+  border: 1px dashed var(--accent, #3daee9);
+  border-radius: 4px;
+  font-family: inherit;
+  font-weight: 700;
+  text-align: center;
+  resize: none;
+  outline: none;
+  z-index: 8;
+  overflow: hidden;
+}
+
+/* Shared picker shell (text styles / image pickers). */
+.picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.55);
+  display: grid;
+  place-items: center;
+}
+
+.picker-panel {
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+  background: rgba(18, 18, 24, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(10px);
+  padding: 12px 14px;
+  color: #fff;
+}
+
+.picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+}
+
+.picker-close {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+.picker-close:hover {
+  color: #fff;
+}
+
+.picker-section-label {
+  font-size: 0.7rem;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 12px 2px 8px;
+}
+
+.text-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 8px;
+}
+
+/* Image picker: browse card + bin thumbnails. */
+.image-picker-browse {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px dashed rgba(56, 189, 248, 0.5);
+  border-radius: 8px;
+  color: #e2e8f0;
+  padding: 12px 14px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.image-picker-browse:hover {
+  background: rgba(56, 189, 248, 0.16);
+  border-color: var(--accent, #3daee9);
+}
+
+.image-picker-browse-icon {
+  font-size: 1.4rem;
+}
+
+.image-picker-browse small {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.7rem;
+  margin-top: 2px;
+}
+
+.image-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.image-picker-card {
+  display: grid;
+  grid-template-rows: 64px auto;
+  gap: 5px;
+  padding: 6px;
+  background: #0c0e12;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.image-picker-card:hover {
+  border-color: var(--accent, #3daee9);
+  transform: translateY(-1px);
+}
+
+.image-picker-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+.image-picker-name {
+  font-size: 0.66rem;
+  color: #94a3b8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+.image-picker-empty {
+  color: #94a3b8;
+  font-size: 0.8rem;
+  padding: 14px 4px 6px;
+  text-align: center;
+}
+
+.image-picker-context {
+  margin-top: 10px;
+  font-size: 0.72rem;
+  color: #94a3b8;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 5px;
+  padding: 6px 9px;
+}
+
+.text-preset-card {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 14px 8px 10px;
+  background: #0c0e12;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+
+.text-preset-card:hover {
+  border-color: var(--accent, #3daee9);
+  transform: translateY(-1px);
+}
+
+.text-preset-sample {
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+  font-weight: 800;
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+.text-preset-name {
+  font-size: 0.68rem;
+  color: #94a3b8;
+  letter-spacing: 0.02em;
+}
+
+.text-picker-type {
+  display: grid;
+  gap: 10px;
+}
+
+.text-preset-preview {
+  min-height: 74px;
+  display: grid;
+  place-items: center;
+  background:
+    repeating-conic-gradient(#141419 0% 25%, #1b1b22 0% 50%) 50% / 18px 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.text-preset-preview span {
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+  font-weight: 800;
+  font-size: 20px;
+  text-align: center;
+  max-width: 100%;
+}
+
+.text-picker-input {
+  width: 100%;
+  background: #0c0e12;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  color: #fff;
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  outline: none;
+}
+
+.text-picker-input:focus {
+  border-color: var(--accent, #3daee9);
+}
+
+.text-picker-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.text-picker-actions button {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  color: #e2e8f0;
+  padding: 7px 14px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.text-picker-actions button.primary {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+.text-picker-actions button.primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.text-picker-actions button:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+/* Drop-target feedback: OS file drag routed to the monitor, or an in-app
+   library item dragged over the frame. */
+.monitor-frame.drop-target {
+  outline: 2px dashed var(--accent, #3daee9);
+  outline-offset: -3px;
+}
+
+/* Text overlay direct manipulation (drag to position, wheel to resize). */
+.monitor-text-overlay.interactive {
+  pointer-events: auto;
+  cursor: grab;
+  user-select: none;
+}
+
+.monitor-text-overlay.interactive:hover {
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.55);
+}
+
+.monitor-text-overlay.dragging {
+  cursor: grabbing;
+  box-shadow: 0 0 0 2px var(--accent, #3daee9);
+}
+
+/* Transform scale handles — a frame that mirrors the media transform so the
+   corner handles stay glued to the displayed content. */
+.tf-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* Dashed selection outline around the manipulable content. */
+.tf-outline {
+  position: absolute;
+  border: 1.5px dashed rgba(56, 189, 248, 0.85);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
+.tf-handle {
+  pointer-events: auto;
+  width: 13px;
+  height: 13px;
+}
+
+/* Text resize handles hug the measured text box. */
+.text-handles {
+  position: absolute;
+  z-index: 7;
+  pointer-events: none;
+}
+
+.text-handle {
+  pointer-events: auto;
+  width: 12px;
+  height: 12px;
+}
+
+.tf-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(18, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #38bdf8;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+}
+
+/* Selection panel: opacity + target name for the manipulated clip. */
+.sel-panel {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(18, 18, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+  max-width: calc(100% - 16px);
+}
+
+.sel-panel-name {
+  color: #e2e8f0;
+  font-weight: 600;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sel-panel-label {
+  color: #94a3b8;
+}
+
+.sel-panel-value {
+  color: #38bdf8;
+  font-weight: 600;
+  min-width: 34px;
+  text-align: right;
+}
+
+.sel-panel input[type="range"] {
+  width: 110px;
+  accent-color: var(--accent, #3daee9);
 }
 
 /* Interactive Crop Box */
 .crop-box {
   position: absolute;
   box-sizing: border-box;
-  border: 1.5px solid #3daee9;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.52);
+  border: 1.5px solid #38bdf8;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55), 0 0 10px rgba(56, 189, 248, 0.35);
   z-index: 10;
   touch-action: none;
   user-select: none;
@@ -17,11 +437,11 @@
   position: absolute;
   inset: 0;
   cursor: move;
-  background: rgba(61, 174, 233, 0.03);
+  background: rgba(56, 189, 248, 0.04);
 }
 
 .crop-box-body:hover {
-  background: rgba(61, 174, 233, 0.08);
+  background: rgba(56, 189, 248, 0.08);
 }
 
 /* Rule-of-thirds grid lines */
@@ -31,7 +451,7 @@
 .crop-grid-v2 {
   position: absolute;
   pointer-events: none;
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.28);
 }
 
 .crop-grid-h1 {
@@ -67,91 +487,80 @@
   position: absolute;
   box-sizing: border-box;
   background: #ffffff;
-  border: 1.5px solid #1a73e8;
-  border-radius: 2px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+  border: 2px solid #0284c7;
+  border-radius: 3px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
   z-index: 12;
   touch-action: none;
-  transition: transform 0.1s ease, background-color 0.1s ease;
+  transition: transform 0.1s ease, background-color 0.1s ease, border-color 0.1s ease;
 }
 
 .crop-handle:hover,
 .crop-handle:active {
-  background: #3daee9;
-  transform: scale(1.25);
+  background: #38bdf8;
+  border-color: #ffffff;
+  transform: scale(1.22);
 }
 
 /* Corner handles */
 .crop-handle-tl {
-  top: -6px;
-  left: -6px;
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   cursor: nwse-resize;
 }
 
 .crop-handle-tr {
-  top: -6px;
-  right: -6px;
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   cursor: nesw-resize;
 }
 
 .crop-handle-bl {
-  bottom: -6px;
-  left: -6px;
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   cursor: nesw-resize;
 }
 
 .crop-handle-br {
-  bottom: -6px;
-  right: -6px;
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   cursor: nwse-resize;
 }
 
 /* Edge handles */
 .crop-handle-t {
-  top: -5px;
   left: 50%;
-  margin-left: -14px;
-  width: 28px;
+  margin-left: -15px;
+  width: 30px;
   height: 8px;
-  border-radius: 3px;
+  border-radius: 4px;
   cursor: ns-resize;
 }
 
 .crop-handle-b {
-  bottom: -5px;
   left: 50%;
-  margin-left: -14px;
-  width: 28px;
+  margin-left: -15px;
+  width: 30px;
   height: 8px;
-  border-radius: 3px;
+  border-radius: 4px;
   cursor: ns-resize;
 }
 
 .crop-handle-l {
-  left: -5px;
   top: 50%;
-  margin-top: -14px;
-  height: 28px;
+  margin-top: -15px;
+  height: 30px;
   width: 8px;
-  border-radius: 3px;
+  border-radius: 4px;
   cursor: ew-resize;
 }
 
 .crop-handle-r {
-  right: -5px;
   top: 50%;
-  margin-top: -14px;
-  height: 28px;
+  margin-top: -15px;
+  height: 30px;
   width: 8px;
-  border-radius: 3px;
+  border-radius: 4px;
   cursor: ew-resize;
 }
 
@@ -195,6 +604,12 @@
   margin-left: 3px;
 }
 
+.crop-dim-px {
+  color: #94a3b8;
+  font-weight: 400;
+  margin-left: 2px;
+}
+
 .crop-badge-btn {
   background: rgba(255, 255, 255, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -220,4 +635,238 @@
 
 .crop-badge-btn.done:hover {
   background: #1d4ed8;
+}
+
+/* ------------------------------------------------------------------ */
+/* Magic Remove (AI Eraser) overlay + panel                            */
+/* ------------------------------------------------------------------ */
+
+.monitor-frame.magic-mode {
+  cursor: none;
+}
+
+.magic-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 5;
+  touch-action: none;
+}
+
+.magic-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid rgba(226, 178, 255, 0.95);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  z-index: 6;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.magic-cursor.on {
+  opacity: 1;
+}
+
+.magic-cursor.mode-erase {
+  border-color: rgba(255, 130, 130, 0.95);
+}
+
+.magic-cursor.mode-adjust {
+  border-style: dashed;
+  border-color: rgba(120, 220, 255, 0.95);
+}
+
+.magic-panel {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  z-index: 7;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(94%, 640px);
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(18, 16, 26, 0.92);
+  border: 1px solid rgba(183, 106, 240, 0.35);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+  color: #e8e4f2;
+  font-size: 11px;
+}
+
+.magic-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.magic-modes {
+  display: inline-flex;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.magic-modes button {
+  padding: 3px 9px;
+  background: transparent;
+  border: none;
+  color: #cfc8dd;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.magic-modes button + button {
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.magic-modes button.active {
+  background: rgba(183, 106, 240, 0.35);
+  color: #fff;
+}
+
+.magic-modes button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.magic-slider {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.magic-slider > span:first-child {
+  color: #b3aac6;
+  min-width: 42px;
+  text-align: right;
+}
+
+.magic-slider input[type="range"] {
+  width: 76px;
+  accent-color: #b76af0;
+}
+
+.magic-slider select {
+  background: #2a2438;
+  color: #e8e4f2;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 1px 4px;
+}
+
+.magic-val {
+  color: #8fc7ff;
+  min-width: 38px;
+  font-variant-numeric: tabular-nums;
+}
+
+.magic-actions {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.magic-btn {
+  padding: 4px 11px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.07);
+  color: #e8e4f2;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.magic-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.magic-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.magic-btn.primary {
+  background: linear-gradient(135deg, #8d4ddb, #b76af0);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #fff;
+  font-weight: 600;
+}
+
+.magic-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+  background: linear-gradient(135deg, #8d4ddb, #b76af0);
+}
+
+.magic-btn.danger {
+  border-color: rgba(255, 110, 110, 0.4);
+  color: #ffb3b3;
+}
+
+.magic-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 320px;
+}
+
+.magic-phase {
+  color: #d9c9f2;
+  white-space: nowrap;
+}
+
+.magic-progress {
+  flex: 1;
+  height: 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.magic-progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #8d4ddb, #b76af0);
+  transition: width 0.15s ease;
+}
+
+.magic-pct {
+  min-width: 34px;
+  text-align: right;
+  color: #8fc7ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.magic-status {
+  text-align: center;
+  color: #a99fc0;
+  font-size: 10.5px;
+}
+
+/* Job-running badge shown on the monitor when the tool panel is closed. */
+.magic-processing-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 7;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(18, 16, 26, 0.9);
+  border: 1px solid rgba(183, 106, 240, 0.45);
+  color: #e2c9ff;
+  font-size: 11px;
+  pointer-events: none;
 }

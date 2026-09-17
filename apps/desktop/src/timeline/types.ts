@@ -51,6 +51,20 @@ export function isImagePath(path: string | null | undefined): boolean {
   return IMAGE_EXTENSIONS.includes(ext);
 }
 
+/** Media-file time for timeline position t within a clip (handles speed + reverse). */
+export function mediaTimeForClip(
+  clip: { start: number; in_point: number; out_point: number; reverse?: boolean; speed?: number },
+  t: number,
+): number {
+  const raw = clip.speed ?? 1;
+  const speed = Number.isFinite(raw) ? Math.min(4, Math.max(0.25, raw)) : 1;
+  const local = t - clip.start;
+  const media = clip.reverse
+    ? clip.out_point - local * speed
+    : clip.in_point + local * speed;
+  return Math.max(clip.in_point, Math.min(media, clip.out_point - 0.01));
+}
+
 /** Timeline duration for a clip, accounting for speed. */
 export function clipTimelineDuration(
   clip: Pick<Clip, "in_point" | "out_point" | "speed">,
@@ -183,20 +197,44 @@ export function timelineDuration(timeline: Timeline, fallback = 10): number {
   return Math.max(1, ...ends);
 }
 
+/** The clip under the playhead that drives the main preview: the
+ * BOTTOM-MOST visual layer (first video track = base of the composite;
+ * within a track, the earliest-starting clip). Overlays on higher tracks
+ * composite above it — see videoStackAtPlayhead. */
 export function clipAtPlayhead(timeline: Timeline, playhead: number, kind: "video" | "audio") {
-  let found: { track: Track; clip: Clip } | null = null;
   for (const track of timeline.tracks) {
     if (track.kind !== kind || track.muted || track.hidden) continue;
+    let best: Clip | null = null;
     for (const clip of track.clips) {
       const end = clip.start + clipTimelineDuration(clip);
-      // Keep the LAST match: later track / later clip = top-most layer, so
-      // transition overlaps preview the incoming clip.
       if (playhead >= clip.start && playhead < end) {
-        found = { track, clip };
+        if (!best || clip.start < best.start) best = clip;
       }
     }
+    if (best) return { track, clip: best };
   }
-  return found;
+  return null;
+}
+
+/** All video clips under the playhead ordered BOTTOM → TOP (compositing
+ * order, matching the export overlay chain): tracks in array order, clips
+ * within a track by start time. */
+export function videoStackAtPlayhead(
+  timeline: Timeline,
+  playhead: number,
+): { track: Track; clip: Clip }[] {
+  const out: { track: Track; clip: Clip }[] = [];
+  for (const track of timeline.tracks) {
+    if (track.kind !== "video" || track.muted || track.hidden) continue;
+    const hits = track.clips
+      .filter((c) => {
+        const end = c.start + clipTimelineDuration(c);
+        return playhead >= c.start && playhead < end;
+      })
+      .sort((a, b) => a.start - b.start);
+    for (const clip of hits) out.push({ track, clip });
+  }
+  return out;
 }
 
 /** Next clip on a track of `kind` whose start is at/after `time` (sequence playback). */

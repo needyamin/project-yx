@@ -61,10 +61,11 @@ export function endBinPointerDrag(): BinPointerDragSession | null {
 export function hitBinDropTarget(
   clientX: number,
   clientY: number,
-): "timeline" | "clip-monitor" | null {
+): "timeline" | "clip-monitor" | "project-monitor" | null {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
   if (el.closest(".timeline-panel") || el.closest(".tl-scroller")) return "timeline";
+  if (el.closest(".project-monitor .monitor-frame")) return "project-monitor";
   if (el.closest(".clip-monitor")) return "clip-monitor";
   return null;
 }
