@@ -1,9 +1,10 @@
 import { memo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import type { Clip, EditMode, Obstacle, TimelineTool } from "./types";
+import type { Clip, EditMode, IndexedObstacle, Obstacle, TimelineTool } from "./types";
 import {
   clipTimelineDuration,
   fileName,
   formatTime,
+  nearestInSorted,
   resolveNonOverlappingStart,
 } from "./types";
 import type { TimelineView } from "./useTimelineView";
@@ -28,8 +29,16 @@ type Props = {
   tool: TimelineTool;
   view: TimelineView;
   locked: boolean;
+  /** Shared SORTED snap anchors (all clips/markers/zone). This clip's own
+   * edges are excluded once per drag, not per timeline change. */
   anchors: number[];
-  obstacles?: Obstacle[];
+  /** Shared per-track obstacle lists (ids included) — filtered to remove
+   * self/partner once per gesture. Referentially stable per timeline change
+   * so memoized clips skip re-render. */
+  obstacles?: {
+    ownTrack: IndexedObstacle[];
+    partner?: IndexedObstacle[] | null;
+  } | null;
   editMode?: EditMode;
   maxMediaDuration?: number;
   /** Live draft from parent while a linked partner is being dragged or resized. */
@@ -66,7 +75,7 @@ function ClipBlockImpl({
   view,
   locked,
   anchors,
-  obstacles = [],
+  obstacles = null,
   editMode = "normal",
   maxMediaDuration = Infinity,
   previewDraft = null,
@@ -155,6 +164,20 @@ function ClipBlockImpl({
       ? Math.min(4, Math.max(0.25, originSpeedRaw))
       : 1;
     const originDur = Math.max(0.05, (originOut - originIn) / originSpeed);
+    // Gesture-scoped drag data, resolved ONCE per drag (never per
+    // pointermove): obstacles without self/partner, anchors without this
+    // clip's own edges.
+    const linkedId = clip.linked_clip_id;
+    const dragObstacles: Obstacle[] = [
+      ...(obstacles?.ownTrack ?? []),
+      ...(obstacles?.partner ?? []),
+    ]
+      .filter((o) => o.id !== clip.id && (!linkedId || o.id !== linkedId))
+      .map((o) => ({ start: o.start, duration: o.duration }));
+    const ownEnd = originStart + originDur;
+    const dragAnchors = anchors.filter(
+      (a) => Math.abs(a - originStart) > 1e-6 && Math.abs(a - ownEnd) > 1e-6,
+    );
     let latest = {
       start: originStart,
       in_point: originIn,
@@ -289,27 +312,19 @@ function ClipBlockImpl({
 
       if (resolved === "move") {
         const rawNext = Math.max(0, originStart + dt);
-        let snapped = view.applySnap(rawNext, anchors);
+        let snapped = view.applySnap(rawNext, dragAnchors);
         // If left edge did not snap, snap right edge against anchors (flush snapping)
         if (Math.abs(snapped - rawNext) < 0.001 && view.snap) {
           const threshold = Math.max(0.05, 10 / view.pxPerSec);
-          let bestRightDist = threshold;
-          let bestRightStart = rawNext;
-          for (const a of anchors) {
-            const d = Math.abs(a - (rawNext + originDur));
-            if (d < bestRightDist) {
-              bestRightDist = d;
-              bestRightStart = Math.max(0, a - originDur);
-            }
-          }
-          if (bestRightDist < threshold) {
-            snapped = bestRightStart;
+          const hit = nearestInSorted(dragAnchors, rawNext + originDur, threshold);
+          if (hit != null) {
+            snapped = Math.max(0, hit - originDur);
             view.showSnapGuide(snapped + originDur);
           }
         }
         const next =
-          (editMode ?? "normal") === "normal" && obstacles && obstacles.length > 0
-            ? resolveNonOverlappingStart(snapped, originDur, obstacles)
+          (editMode ?? "normal") === "normal" && dragObstacles.length > 0
+            ? resolveNonOverlappingStart(snapped, originDur, dragObstacles)
             : snapped;
         latest = {
           start: next,
@@ -330,8 +345,8 @@ function ClipBlockImpl({
 
       if (resolved === "trim-left") {
         let minStart = 0;
-        if (obstacles && obstacles.length > 0) {
-          for (const o of obstacles) {
+        if (dragObstacles.length > 0) {
+          for (const o of dragObstacles) {
             const oEnd = o.start + o.duration;
             if (oEnd <= originStart + 0.001) {
               minStart = Math.max(minStart, oEnd);
@@ -364,8 +379,8 @@ function ClipBlockImpl({
       }
 
       let maxEnd = Infinity;
-      if (obstacles && obstacles.length > 0) {
-        for (const o of obstacles) {
+      if (dragObstacles.length > 0) {
+        for (const o of dragObstacles) {
           if (o.start >= originStart + originDur - 0.001) {
             maxEnd = Math.min(maxEnd, o.start);
           }

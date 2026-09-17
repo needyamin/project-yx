@@ -285,6 +285,44 @@ export function findLinkPartner(
 
 export type Obstacle = { start: number; duration: number };
 
+/** Obstacle tagged with its owning clip id. Panels build SHARED per-track
+ * lists once per timeline change; each drag filters out self/partner once
+ * per gesture instead of the panel materializing per-clip copies (O(n²)). */
+export type IndexedObstacle = Obstacle & { id: string };
+
+/**
+ * Nearest value in a SORTED array to `t`, within `threshold` — or null.
+ * Binary search: snapping must stay O(log n) even with hundreds of clips.
+ */
+export function nearestInSorted(
+  sorted: number[],
+  t: number,
+  threshold: number,
+): number | null {
+  const n = sorted.length;
+  if (n === 0) return null;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] < t) lo = mid + 1;
+    else hi = mid;
+  }
+  let best: number | null = null;
+  let bestDist = threshold;
+  // lo is the lower bound (first value >= t); only it and its predecessor
+  // can be the nearest element.
+  for (let idx = lo - 1; idx <= lo; idx++) {
+    if (idx < 0 || idx >= n) continue;
+    const d = Math.abs(sorted[idx] - t);
+    if (d < bestDist) {
+      bestDist = d;
+      best = sorted[idx];
+    }
+  }
+  return best;
+}
+
 /**
  * Find a start time near `desired` where `[start, start+dur)` does not overlap any obstacles
  * and fits completely in a valid free space interval (gap).

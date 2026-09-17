@@ -27,11 +27,12 @@ import {
   findLinkPartner,
   clipTimelineDuration,
   isImagePath,
+  nearestInSorted,
   timelineDuration,
   type Clip,
   type EditMode,
+  type IndexedObstacle,
   type LibraryItem,
-  type Obstacle,
   type PerformanceTier,
   type Timeline,
   type TimelineMarker,
@@ -49,11 +50,11 @@ const HEADER_HANDLE_PX = 5;
 type Props = {
   timeline: Timeline;
   selectedClipId: string | null;
-  playhead: number;
   tool: TimelineTool;
   status: string;
   tier: PerformanceTier;
-  /** Live playhead source of truth — read in callbacks, never re-renders. */
+  /** Live playhead source of truth — read in callbacks, never re-renders.
+   * Time displays subscribe to the playback clock instead of a prop. */
   playheadRef: RefObject<number>;
   onTool: (t: TimelineTool) => void;
   onTimeline: (t: Timeline) => void;
@@ -92,7 +93,6 @@ type Props = {
 export function TimelinePanel({
   timeline,
   selectedClipId,
-  playhead,
   tool,
   status,
   tier,
@@ -170,7 +170,9 @@ export function TimelinePanel({
     return m;
   }, [library]);
 
-  /** Sorted, de-duplicated snap anchors: clip edges, markers, zone, 0. */
+  /** Sorted, de-duplicated snap anchors: clip edges, markers, zone, 0.
+   * Shared by every clip — each ClipBlock excludes its own edges once per
+   * drag instead of the panel materializing per-clip copies. */
   const snapAnchors = useMemo(() => {
     const pts: number[] = [0];
     for (const track of timeline.tracks) {
@@ -191,10 +193,20 @@ export function TimelinePanel({
     snapAnchorsRef.current = snapAnchors;
   }, [snapAnchors]);
 
-  type ClipInfo = { obstacles: Obstacle[]; anchors: number[]; maxMediaDuration: number };
+  /** Per-clip drag data referencing SHARED per-track obstacle lists —
+   * O(tracks + clips) to build. ClipBlock filters self/partner once per
+   * drag; the old per-clip materialization was O(clips²) per edit. */
+  type ClipInfo = {
+    obstacles: {
+      ownTrack: IndexedObstacle[];
+      partner: IndexedObstacle[] | null;
+    };
+    maxMediaDuration: number;
+  };
   const clipInfo = useMemo(() => {
     const map = new Map<string, ClipInfo>();
-    const trackObs = new Map<string, Array<{ id: string; start: number; duration: number }>>();
+    const trackObs = new Map<string, IndexedObstacle[]>();
+    const trackByClip = new Map<string, string>();
     for (const track of timeline.tracks) {
       trackObs.set(
         track.id,
@@ -204,35 +216,25 @@ export function TimelinePanel({
           duration: clipTimelineDuration(c),
         })),
       );
+      for (const c of track.clips) trackByClip.set(c.id, track.id);
     }
     for (const track of timeline.tracks) {
       const own = trackObs.get(track.id) ?? [];
       for (const clip of track.clips) {
-        const obstacles: Obstacle[] = own
-          .filter((o) => o.id !== clip.id)
-          .map((o) => ({ start: o.start, duration: o.duration }));
+        let partnerObstacles: IndexedObstacle[] | null = null;
         if (clip.linked_clip_id) {
-          for (const [tid, obsList] of trackObs.entries()) {
-            if (tid !== track.id && obsList.some((o) => o.id === clip.linked_clip_id)) {
-              for (const o of obsList) {
-                if (o.id !== clip.linked_clip_id) {
-                  obstacles.push({ start: o.start, duration: o.duration });
-                }
-              }
-              break;
-            }
+          const pTrackId = trackByClip.get(clip.linked_clip_id);
+          if (pTrackId && pTrackId !== track.id) {
+            partnerObstacles = trackObs.get(pTrackId) ?? null;
           }
         }
-        const ownStart = clip.start;
-        const ownEnd = clip.start + clipTimelineDuration(clip);
         const libItem =
           libIndex.get(clip.media_path) ?? libIndex.get(fileName(clip.media_path));
         // Stills and GIFs loop at export, so their timeline length is not
         // capped by the probed (near-zero) image duration.
         const stillVisual = isImagePath(clip.media_path);
         map.set(clip.id, {
-          obstacles,
-          anchors: snapAnchors.filter((a) => a !== ownStart && a !== ownEnd),
+          obstacles: { ownTrack: own, partner: partnerObstacles },
           maxMediaDuration: stillVisual
             ? Infinity
             : (libItem?.duration ?? Infinity),
@@ -240,7 +242,7 @@ export function TimelinePanel({
       }
     }
     return map;
-  }, [timeline, libIndex, snapAnchors]);
+  }, [timeline, libIndex]);
 
   const selectedClip = useMemo(() => {
     for (const track of timeline.tracks) {
@@ -277,10 +279,44 @@ export function TimelinePanel({
   // Initial position + reposition after zoom (committed playhead; during
   // playback the clock loop corrects on the next frame anyway).
   useEffect(() => {
-    movePlayhead(playhead);
-    // Deliberately not keyed on `playhead` — the mover owns live updates.
+    movePlayhead(playheadRef.current);
+    // Deliberately not keyed on the live playhead — the mover owns updates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [movePlayhead, view.pxPerSec]);
+
+  /* ------------------------------------------------------------------ */
+  /* Viewport culling                                                    */
+  /* ------------------------------------------------------------------ */
+
+  /** Scroller viewport in canvas px — clips fully outside it are not
+   * rendered, keeping DOM size and reconciliation cost independent of
+   * project length. rAF-coalesced; scroll stays native. */
+  const [viewport, setViewport] = useState({ left: 0, width: 1600 });
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      setViewport((prev) =>
+        prev.left === el.scrollLeft && prev.width === el.clientWidth
+          ? prev
+          : { left: el.scrollLeft, width: el.clientWidth },
+      );
+    };
+    const requestUpdate = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    el.addEventListener("scroll", requestUpdate, { passive: true });
+    const ro = new ResizeObserver(requestUpdate);
+    ro.observe(el);
+    update();
+    return () => {
+      el.removeEventListener("scroll", requestUpdate);
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
 
   /* ------------------------------------------------------------------ */
   /* Header resize                                                       */
@@ -566,37 +602,42 @@ export function TimelinePanel({
       const v = viewRef.current;
       const rawTime = Math.max(0, v.xToTime(x));
 
-      // 1. Magnetic anchor snapping (clip boundaries, markers, zones)
+      // 1. Magnetic anchor snapping (clip boundaries, markers, zones) —
+      // binary search over the sorted anchor index.
       if (v.snap) {
         const anchorThreshold = Math.max(0.04, 8 / v.pxPerSec);
-        const anchors = snapAnchorsRef.current;
-        let bestAnchor = rawTime;
-        let bestAnchorDist = anchorThreshold;
-        for (const a of anchors) {
-          const d = Math.abs(a - rawTime);
-          if (d < bestAnchorDist) {
-            bestAnchorDist = d;
-            bestAnchor = a;
-          }
-        }
-        if (bestAnchorDist < anchorThreshold) {
-          v.showSnapGuide(bestAnchor);
-          return Number(bestAnchor.toFixed(4));
+        const hit = nearestInSorted(
+          snapAnchorsRef.current,
+          rawTime,
+          anchorThreshold,
+        );
+        if (hit != null) {
+          v.showSnapGuide(hit);
+          return Number(hit.toFixed(4));
         }
       }
 
       v.showSnapGuide(null);
 
-      // 2. Magnetic ruler division tick snapping
+      // 2. Magnetic ruler division tick snapping (ticks are ascending).
       if (v.snap && activeRulerTicksRef.current.length > 0) {
         const tickThreshold = Math.max(0.02, 6 / v.pxPerSec);
+        const ticks = activeRulerTicksRef.current;
+        let lo = 0;
+        let hi = ticks.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (ticks[mid].t < rawTime) lo = mid + 1;
+          else hi = mid;
+        }
         let bestTick = rawTime;
         let bestTickDist = tickThreshold;
-        for (const tick of activeRulerTicksRef.current) {
-          const d = Math.abs(tick.t - rawTime);
+        for (let idx = lo - 1; idx <= lo; idx++) {
+          if (idx < 0 || idx >= ticks.length) continue;
+          const d = Math.abs(ticks[idx].t - rawTime);
           if (d < bestTickDist) {
             bestTickDist = d;
-            bestTick = tick.t;
+            bestTick = ticks[idx].t;
           }
         }
         if (bestTickDist < tickThreshold) {
@@ -903,6 +944,12 @@ export function TimelinePanel({
       : timeline.zone_out;
 
   const totalRulerDuration = duration + 120;
+
+  /** Clips intersecting [visibleFromT, visibleToT] render; others are culled.
+   * The selected clip is always rendered (it may be mid-drag near an edge). */
+  const CULL_MARGIN_PX = 480;
+  const visibleFromT = (viewport.left - CULL_MARGIN_PX) / view.pxPerSec;
+  const visibleToT = (viewport.left + viewport.width + CULL_MARGIN_PX) / view.pxPerSec;
 
   /* Live voiceover recording region on the first audio lane. */
   useEffect(() => {
@@ -1270,6 +1317,13 @@ export function TimelinePanel({
                   )}
                   {track.clips.map((clip: Clip) => {
                     const info = clipInfo.get(clip.id);
+                    const cEnd = clip.start + clipTimelineDuration(clip);
+                    if (
+                      selectedClipId !== clip.id &&
+                      (cEnd < visibleFromT || clip.start > visibleToT)
+                    ) {
+                      return null;
+                    }
                     return (
                       <ClipBlock
                         key={clip.id}
@@ -1279,7 +1333,7 @@ export function TimelinePanel({
                         view={view}
                         locked={track.locked}
                         obstacles={info?.obstacles}
-                        anchors={info?.anchors ?? EMPTY_ANCHORS}
+                        anchors={snapAnchors}
                         editMode={timeline.edit_mode ?? "normal"}
                         maxMediaDuration={info?.maxMediaDuration ?? Infinity}
                         onSelect={onSelectClip}
@@ -1304,7 +1358,6 @@ export function TimelinePanel({
       </div>
 
       <TimelineStatusBarMemo
-        playhead={playhead}
         editMode={timeline.edit_mode ?? "normal"}
         tier={tier}
         snap={view.snap}
@@ -1474,17 +1527,13 @@ export function TimelinePanel({
   );
 }
 
-const EMPTY_ANCHORS: number[] = [];
-
 /** Memoized header: skip re-render unless the track data itself changed. */
 const TrackHeaderMemo = memo(
   TrackHeader,
   (a, b) => a.track === b.track && a.height === b.height && a.canDelete === b.canDelete,
 );
 
-const TimelineStatusBarMemo = memo(TimelineStatusBar);
-
-type RulerProps = {
+const TimelineStatusBarMemo = memo(TimelineStatusBar);type RulerProps = {
   pxPerSec: number;
   totalDuration: number;
   zoneLeft: number | null;
@@ -1522,6 +1571,30 @@ const Ruler = memo(function Ruler({
 }: RulerProps) {
   const [scroll, setScroll] = useState({ left: 0, width: 1920 });
   const [hoverT, setHoverT] = useState<number | null>(null);
+  /** Hover position coalesced to one update per frame — high-rate mice must
+   * not re-render the ruler for every pointermove. */
+  const hoverRafRef = useRef(0);
+  const hoverPendingRef = useRef<number | null>(null);
+  const onRulerPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      hoverPendingRef.current = timeFromClientXRef.current(e.clientX);
+      if (!hoverRafRef.current) {
+        hoverRafRef.current = requestAnimationFrame(() => {
+          hoverRafRef.current = 0;
+          const t = hoverPendingRef.current;
+          hoverPendingRef.current = null;
+          if (t == null) return;
+          setHoverT((prev) => (prev === t ? prev : t));
+        });
+      }
+    },
+    [timeFromClientXRef],
+  );
+  useEffect(() => {
+    return () => {
+      if (hoverRafRef.current) cancelAnimationFrame(hoverRafRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -1565,7 +1638,7 @@ const Ruler = memo(function Ruler({
       className="tl-ruler"
       onClick={onSeekClick}
       onPointerDown={onScrubStart}
-      onPointerMove={(e) => setHoverT(timeFromClientXRef.current(e.clientX))}
+      onPointerMove={onRulerPointerMove}
       onPointerLeave={() => setHoverT(null)}
       onContextMenu={onContextMenu}
     >

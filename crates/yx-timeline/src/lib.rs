@@ -2227,6 +2227,85 @@ impl TimelineEditor {
     }
 }
 
+impl Timeline {
+    /// Consistency validation (timeline invariants that must never be
+    /// silently violated). Returns human-readable problems; empty = valid.
+    /// Exercised after edit storms in tests and exposed to the frontend for
+    /// diagnostics.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        let mut clip_ids: std::collections::HashSet<ClipId> = std::collections::HashSet::new();
+        let mut track_ids: std::collections::HashSet<TrackId> = std::collections::HashSet::new();
+        for track in &self.tracks {
+            if !track_ids.insert(track.id) {
+                issues.push(format!("duplicate track id {}", track.id));
+            }
+            for clip in &track.clips {
+                if !clip_ids.insert(clip.id) {
+                    issues.push(format!("duplicate clip id {}", clip.id));
+                }
+                let name = &clip.media_path;
+                if !(clip.start.is_finite()
+                    && clip.in_point.is_finite()
+                    && clip.out_point.is_finite()
+                    && clip.speed.is_finite())
+                {
+                    issues.push(format!("clip {name}: non-finite timing"));
+                    continue;
+                }
+                if clip.out_point <= clip.in_point {
+                    issues.push(format!(
+                        "clip {name}: invalid range in={} out={}",
+                        clip.in_point, clip.out_point
+                    ));
+                }
+                if clip.start < 0.0 {
+                    issues.push(format!("clip {name}: negative start {}", clip.start));
+                }
+                if clip.duration() <= 0.0 {
+                    issues.push(format!("clip {name}: non-positive timeline duration"));
+                }
+            }
+        }
+        // Link integrity: partner must exist, link must be mutual, roles must differ.
+        for track in &self.tracks {
+            for clip in &track.clips {
+                let Some(link) = clip.linked_clip_id else {
+                    continue;
+                };
+                let partner = self
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter())
+                    .find(|c| c.id == link);
+                match partner {
+                    None => {
+                        issues.push(format!(
+                            "clip {}: linked partner {link} does not exist",
+                            clip.media_path
+                        ));
+                    }
+                    Some(p) => {
+                        if p.linked_clip_id != Some(clip.id) {
+                            issues.push(format!(
+                                "clip {}: link to {link} is not mutual",
+                                clip.media_path
+                            ));
+                        }
+                        if p.role == clip.role {
+                            issues.push(format!(
+                                "clip {}: linked to same-role clip",
+                                clip.media_path
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        issues
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3642,3 +3721,180 @@ mod tests {
     }
 }
 
+
+/// --- Performance / scale / consistency ---------------------------------
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+/// Build a project with `n` linked AV pairs spread over V1/A1, simulating a
+/// long editing session, and return (editor, video clip ids).
+fn build_stress(n: usize) -> (TimelineEditor, Vec<ClipId>) {
+    let mut ed = TimelineEditor::new();
+    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+    let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = (i as f64) * 4.0;
+        let res = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: format!("clip{i}.mp4"),
+                source_path: None,
+                start,
+                in_point: 0.0,
+                out_point: 4.0,
+            })
+            .unwrap();
+        ids.push(res.primary_clip_id.unwrap());
+    }
+    (ed, ids)
+}
+
+#[test]
+fn stress_500_clips_split_move_trim_stay_valid() {
+    let (mut ed, ids) = build_stress(500);
+    // Split 100 clips (the razor storm case).
+    for (i, id) in ids.iter().take(100).enumerate() {
+        ed.apply(EditCommand::SplitClip {
+            clip_id: *id,
+            at: i as f64 * 4.0 + 2.0,
+            sync_linked: true,
+        })
+        .unwrap();
+    }
+    assert!(ed.timeline.validate().is_empty(), "valid after splits");
+    // Move 50 right-halves (no-ops via collision resolution must not corrupt).
+    for (i, id) in ids.iter().take(50).enumerate() {
+        let _ = ed.apply(EditCommand::MoveClip {
+            clip_id: *id,
+            new_start: i as f64 * 4.0 + 1.0,
+            sync_linked: true,
+            target_track_id: None,
+        });
+    }
+    assert!(ed.timeline.validate().is_empty(), "valid after moves");
+    // Trim 50.
+    for (i, id) in ids.iter().skip(100).take(50).enumerate() {
+        ed.apply(EditCommand::TrimClip {
+            clip_id: *id,
+            in_point: 0.5,
+            out_point: 3.5,
+            keep_end: false,
+            sync_linked: true,
+        })
+        .unwrap();
+    }
+    assert!(ed.timeline.validate().is_empty(), "valid after trims");
+    // Ripple delete 20.
+    for id in ids.iter().skip(200).take(20) {
+        let _ = ed.apply(EditCommand::RippleDelete {
+            clip_id: *id,
+            remove_linked: true,
+        });
+    }
+    let issues = ed.timeline.validate();
+    assert!(issues.is_empty(), "timeline corrupt after storm: {issues:?}");
+}
+
+#[test]
+fn stress_undo_redo_roundtrip_preserves_content() {
+    // 40 pairs + 40 splits = 80 undo entries, inside max_history (100).
+    let (mut ed, ids) = build_stress(40);
+    for (i, id) in ids.iter().enumerate() {
+        ed.apply(EditCommand::SplitClip {
+            clip_id: *id,
+            at: i as f64 * 4.0 + 1.0,
+            sync_linked: true,
+        })
+        .unwrap();
+    }
+    let after_edits = ed.timeline.clone();
+    // Undo the splits, then redo them.
+    for _ in 0..ids.len() {
+        ed.undo().unwrap();
+    }
+    for _ in 0..ids.len() {
+        ed.redo().unwrap();
+    }
+    assert!(
+        ed.timeline.validate().is_empty(),
+        "valid after undo/redo storm"
+    );
+    assert_eq!(
+        ed.timeline.tracks[0].clips.len(),
+        after_edits.tracks[0].clips.len()
+    );
+    assert!((ed.timeline.duration() - after_edits.duration()).abs() < 1e-9);
+}
+
+#[test]
+fn validation_detects_corruption() {
+    let mut ed = TimelineEditor::new();
+    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+    let id = ed
+        .apply(EditCommand::AddClip {
+            track_id: v1,
+            media_path: "a.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Video,
+            linked_clip_id: None,
+        })
+        .unwrap()
+        .primary_clip_id
+        .unwrap();
+    assert!(ed.timeline.validate().is_empty());
+    // Simulate corruption: dangling link + inverted range.
+    ed.timeline.tracks[0].clips[0].linked_clip_id = Some(Uuid::new_v4());
+    ed.timeline.tracks[0].clips[0].out_point = 0.0;
+    let issues = ed.timeline.validate();
+    assert!(issues.len() >= 2, "expected ≥2 issues, got {issues:?}");
+    let _ = id;
+}
+
+#[test]
+fn repeated_split_100_is_cheap_and_linked() {
+    // 100 progressive splits: each cut targets the right half (razor-dragging
+    // down one long clip) and must keep the linked audio pair in lockstep.
+    let mut ed = TimelineEditor::new();
+    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+    let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+    let mut vid = ed
+        .apply(EditCommand::AddAvPair {
+            video_track_id: v1,
+            audio_track_id: a1,
+            media_path: "long.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 100.0,
+        })
+        .unwrap()
+        .primary_clip_id
+        .unwrap();
+    for i in 1..100 {
+        vid = ed
+            .apply(EditCommand::SplitClip {
+                clip_id: vid,
+                at: i as f64,
+                sync_linked: true,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+    }
+    let issues = ed.timeline.validate();
+    assert!(issues.is_empty(), "valid after 99 splits: {issues:?}");
+    let v_clips = &ed.timeline.tracks[0].clips;
+    let a_clips = &ed.timeline.tracks[2].clips;
+    assert_eq!(v_clips.len(), 100);
+    assert_eq!(a_clips.len(), 100);
+    for (v, a) in v_clips.iter().zip(a_clips.iter()) {
+        assert!((v.start - a.start).abs() < 1e-9, "A/V pair desynced");
+    }
+}
+}

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { nearestInSorted } from "./types";
 
 const MIN_PPS = 0.35;
 const MAX_PPS = 480;
@@ -99,18 +100,11 @@ export function useTimelineView(durationSec: number) {
         return t;
       }
       const threshold = Math.max(0.05, 10 / pxPerSec);
-      let best = t;
-      let bestDist = threshold;
-      for (const a of anchors) {
-        const d = Math.abs(a - t);
-        if (d < bestDist) {
-          bestDist = d;
-          best = a;
-        }
-      }
-      const hit = bestDist < threshold;
-      showSnapGuide(hit ? best : null);
-      return hit ? best : t;
+      // Binary search over the sorted anchor index — O(log n) per frame
+      // instead of scanning every clip edge on every pointermove.
+      const hit = nearestInSorted(anchors, t, threshold);
+      showSnapGuide(hit);
+      return hit ?? t;
     },
     [snap, pxPerSec, showSnapGuide],
   );

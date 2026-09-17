@@ -63,6 +63,13 @@ fn get_timeline(state: State<'_, AppState>) -> Timeline {
     state.editor.lock().timeline().clone()
 }
 
+/// Timeline consistency diagnostics (never silently allow corrupt state):
+/// empty result = the project model is valid.
+#[tauri::command]
+fn get_timeline_issues(state: State<'_, AppState>) -> Vec<String> {
+    state.editor.lock().timeline().validate()
+}
+
 #[tauri::command]
 fn reprobe_hardware(state: State<'_, AppState>) -> BootInfo {
     let (profile, policy) = probe_and_policy();
@@ -1657,6 +1664,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_boot_info,
             get_timeline,
+            get_timeline_issues,
             debug_agent_log,
             reprobe_hardware,
             import_media,

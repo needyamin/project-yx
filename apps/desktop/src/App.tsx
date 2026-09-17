@@ -39,6 +39,8 @@ import {
 import "./monitors/ProjectMonitor.css";
 import { MagicProgressDialog } from "./monitors/MagicProgressDialog";
 import { TimelinePanel } from "./timeline/TimelinePanel";
+import { reconcileTimeline } from "./timeline/reconcile";
+import { playbackClock } from "./playback/playbackClock";
 import {
   clipAtPlayhead,
   clipFadeGain,
@@ -108,9 +110,9 @@ const UPSERT_FILTER_KINDS = new Set([
   "magicremove",
 ]);
 
-/** React-state playhead refresh while playing (the live playhead is moved
- * imperatively every frame; this only feeds timecode/sliders). */
-const PLAYHEAD_UI_MS = 50;
+/** React-state playhead refresh while playing is handled by the playback
+ * clock store (src/playback/playbackClock.ts): time-displaying leaves
+ * subscribe to it directly, so playback never re-renders the project tree. */
 
 type UnderPlayhead = NonNullable<ReturnType<typeof clipAtPlayhead>>;
 
@@ -153,38 +155,12 @@ function isTextPath(path: string): boolean {
   return (TEXT_EXTENSIONS as readonly string[]).includes(ext);
 }
 
-/** Reuse prior {track,clip} when still the same clip object (avoids effect thrash). */
-function stableUnderPlayhead(
-  timeline: Timeline | null,
-  playhead: number,
-  kind: "video" | "audio",
-  cache: { current: UnderPlayhead | null },
-): UnderPlayhead | null {
-  if (!timeline) {
-    cache.current = null;
-    return null;
-  }
-  const hit = clipAtPlayhead(timeline, playhead, kind);
-  if (!hit) {
-    cache.current = null;
-    return null;
-  }
-  const prev = cache.current;
-  if (prev && prev.clip.id === hit.clip.id && prev.clip === hit.clip) {
-    return prev;
-  }
-  cache.current = hit;
-  return hit;
-}
-
 function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const shadowVideoRef = useRef<HTMLVideoElement | null>(null);
   const monitorImageRef = useRef<HTMLImageElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audio2Ref = useRef<HTMLAudioElement | null>(null);
-  const audioUnder2Cache = useRef<UnderPlayhead | null>(null);
-  const audioUnder2Ref = useRef<UnderPlayhead | null>(null);
   const lastAudio2Volume = useRef(-1);
   const resumePlayRef = useRef(false);
   const transitioningRef = useRef(false);
@@ -192,13 +168,13 @@ function App() {
   const playingRef = useRef(false);
   const reverseRafRef = useRef(0);
   const gapRafRef = useRef(0);
-  const playheadUiTimer = useRef(0);
   const movePlayheadRef = useRef<((t: number) => void) | null>(null);
   const previewModeRef = useRef<PreviewMode>("empty");
-  const videoUnderCache = useRef<UnderPlayhead | null>(null);
-  const audioUnderCache = useRef<UnderPlayhead | null>(null);
   const videoUnderRef = useRef<UnderPlayhead | null>(null);
   const audioUnderRef = useRef<UnderPlayhead | null>(null);
+  const audioUnder2Ref = useRef<UnderPlayhead | null>(null);
+  const videoStackRef = useRef<UnderPlayhead[]>([]);
+  const cropToolRef = useRef(false);
   const selectedClipIdRef = useRef<string | null>(null);
   const monitorVolumeRef = useRef(1);
   const monitorMutedRef = useRef(false);
@@ -223,7 +199,12 @@ function App() {
   const [status, setStatus] = useState("Booting…");
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState(false);
-  const [playhead, setPlayhead] = useState(0);
+  /** Clips under the playhead — updated ONLY when the set of covering clips
+   * changes (boundary crossings), never per playback tick. The live position
+   * lives in playheadRef + the playback clock; time displays subscribe there. */
+  const [videoStack, setVideoStack] = useState<UnderPlayhead[]>([]);
+  const [audioUnderPlayhead, setAudioUnderPlayhead] = useState<UnderPlayhead | null>(null);
+  const [audioUnderPlayhead2, setAudioUnderPlayhead2] = useState<UnderPlayhead | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewAspect, setPreviewAspect] = useState<PreviewAspect>("landscape");
   const [exportOpen, setExportOpen] = useState(false);
@@ -263,6 +244,16 @@ function App() {
   useEffect(() => {
     timelineRef.current = timeline;
   }, [timeline]);
+
+  /** Merge a fresh backend timeline into state: identity-preserving
+   * reconciliation (memoized clips only re-render when their content
+   * actually changed) + synchronous ref update so subsequent handlers and
+   * the playback loop always see the latest timeline. */
+  function normalizeTimeline(t: Timeline): Timeline {
+    const next = reconcileTimeline(timelineRef.current, t);
+    timelineRef.current = next;
+    return next;
+  }
 
 
   const autoPipDoneRef = useRef<Set<string>>(new Set()); useEffect(() => {
@@ -315,6 +306,9 @@ function App() {
   useEffect(() => {
     playingRef.current = playing;
   }, [playing]);
+  useEffect(() => {
+    cropToolRef.current = cropTool;
+  }, [cropTool]);
   useEffect(() => {
     monitorVolumeRef.current = monitorVolume;
     monitorMutedRef.current = monitorMuted;
@@ -436,33 +430,8 @@ function App() {
     return null;
   }, [timeline, selectedClipId]);
 
-  const videoUnderPlayhead = useMemo(
-    () => stableUnderPlayhead(timeline, playhead, "video", videoUnderCache),
-    [timeline, playhead],
-  );
-
-  const audioUnderPlayhead = useMemo(
-    () => stableUnderPlayhead(timeline, playhead, "audio", audioUnderCache),
-    [timeline, playhead],
-  );
-
-  const audioUnderPlayhead2 = useMemo(() => {
-    if (!timeline) {
-      audioUnder2Cache.current = null;
-      return null;
-    }
-    const hit = secondAudioAt(
-      timeline,
-      playhead,
-      audioUnderPlayhead?.clip.id ?? null,
-    );
-    const prev = audioUnder2Cache.current;
-    if (hit && prev && prev.clip.id === hit.clip.id && prev.clip === hit.clip) {
-      return prev;
-    }
-    audioUnder2Cache.current = hit;
-    return hit;
-  }, [timeline, playhead, audioUnderPlayhead]);
+  /** Base (bottom-most) video clip under the playhead; overlays stack above. */
+  const videoUnderPlayhead = videoStack[0] ?? null;
 
   const timelineAudio2Src = useMemo(() => {
     const clip = audioUnderPlayhead2?.clip;
@@ -474,17 +443,17 @@ function App() {
     }
   }, [audioUnderPlayhead2]);
 
+  // Refs are already updated synchronously where the under-playhead sets are
+  // detected (commitPlayhead / timeline resync); this effect mirrors the
+  // remaining render-phase values.
   useEffect(() => {
-    videoUnderRef.current = videoUnderPlayhead;
-    audioUnderRef.current = audioUnderPlayhead;
-    audioUnder2Ref.current = audioUnderPlayhead2;
     selectedClipIdRef.current = selectedClipId;
     previewModeRef.current = videoUnderPlayhead
       ? "video"
       : audioUnderPlayhead
         ? "audio"
         : "empty";
-  }, [videoUnderPlayhead, audioUnderPlayhead, audioUnderPlayhead2]);
+  }, [selectedClipId, videoUnderPlayhead, audioUnderPlayhead, audioUnderPlayhead2]);
 
   const previewMode: PreviewMode = videoUnderPlayhead
     ? "video"
@@ -519,12 +488,12 @@ function App() {
   /** Overlay layers: every video-track clip under the playhead ABOVE the
    * base clip. The base (bottom-most, on the main video element) keeps
    * playing normally underneath — overlays composite on top, exactly like
-   * the export overlay chain. */
+   * the export overlay chain. Recomputed only when the covering-clip set
+   * changes, not per playback tick. */
   const monitorLayers = useMemo(() => {
     if (!timeline) return [] as { clip: Clip; src: string; isImage: boolean }[];
-    const stack = videoStackAtPlayhead(timeline, playhead);
     const out: { clip: Clip; src: string; isImage: boolean }[] = [];
-    for (const { clip } of stack.slice(1)) {
+    for (const { clip } of videoStack.slice(1)) {
       // Magic Remove overlay layers preview through their sidecar too.
       const rp = magicResultReady(
         (findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null,
@@ -539,7 +508,7 @@ function App() {
       if (src) out.push({ clip, src, isImage: isImagePath(path) });
     }
     return out;
-  }, [timeline, playhead]);
+  }, [timeline, videoStack]);
 
   /** Timeline A-track path for Project Monitor (video is muted; this drives sound). */
   const timelineAudioPath = useMemo(() => {
@@ -740,27 +709,78 @@ function App() {
     }
   }, [previewSrc, timelineAudioSrc, timelineAudio2Src, previewMode, audioUnderPlayhead2]);
 
-  const commitPlayhead = useCallback((t: number, immediate = false) => {
-    const next = Math.max(0, t);
-    playheadRef.current = next;
-    // Live playhead moves with zero React involvement.
-    movePlayheadRef.current?.(next);
-    if (immediate || !playingRef.current) {
-      window.clearTimeout(playheadUiTimer.current);
-      playheadUiTimer.current = 0;
-      setPlayhead(next);
+  /** Re-detect which clips cover the playhead. Runs on every seek frame and
+   * playback tick, but only touches React state when the covering set actually
+   * changes (clip boundary crossings / timeline edits replacing clip objects). */
+  const updateUnderPlayhead = useCallback((t: number) => {
+    const tl = timelineRef.current;
+    if (!tl) {
+      if (videoStackRef.current.length !== 0) {
+        videoStackRef.current = [];
+        videoUnderRef.current = null;
+        setVideoStack([]);
+      }
+      if (audioUnderRef.current) {
+        audioUnderRef.current = null;
+        setAudioUnderPlayhead(null);
+      }
+      if (audioUnder2Ref.current) {
+        audioUnder2Ref.current = null;
+        setAudioUnderPlayhead2(null);
+      }
       return;
     }
-    if (playheadUiTimer.current) return;
-    playheadUiTimer.current = window.setTimeout(() => {
-      playheadUiTimer.current = 0;
-      setPlayhead(playheadRef.current);
-    }, PLAYHEAD_UI_MS);
+    const stack = videoStackAtPlayhead(tl, t);
+    const prevStack = videoStackRef.current;
+    const stackChanged =
+      stack.length !== prevStack.length ||
+      stack.some((s, i) => s.clip.id !== prevStack[i]?.clip.id);
+    // Always refresh the base ref: reconcile may have replaced the clip
+    // object (edit) without changing its id.
+    videoUnderRef.current = stack[0] ?? null;
+    if (stackChanged) {
+      videoStackRef.current = stack;
+      setVideoStack(stack);
+    }
+    const aHit = clipAtPlayhead(tl, t, "audio");
+    if (
+      (aHit?.clip.id ?? null) !== (audioUnderRef.current?.clip.id ?? null) ||
+      (aHit && aHit.clip !== audioUnderRef.current?.clip)
+    ) {
+      audioUnderRef.current = aHit;
+      setAudioUnderPlayhead(aHit);
+    }
+    const a2 = secondAudioAt(tl, t, aHit?.clip.id ?? null);
+    if (
+      (a2?.clip.id ?? null) !== (audioUnder2Ref.current?.clip.id ?? null) ||
+      (a2 && a2.clip !== audioUnder2Ref.current?.clip)
+    ) {
+      audioUnder2Ref.current = a2;
+      setAudioUnderPlayhead2(a2);
+    }
   }, []);
 
+  const commitPlayhead = useCallback(
+    (t: number, immediate = false) => {
+      const next = Math.max(0, t);
+      playheadRef.current = next;
+      // Live playhead line moves with zero React involvement.
+      movePlayheadRef.current?.(next);
+      updateUnderPlayhead(next);
+      // Time displays (timecodes, sliders, overlay-layer styles) subscribe to
+      // the clock store. Playback publishes are throttled internally to
+      // PLAYHEAD_UI_MS; paused seeks publish immediately so they are exact.
+      playbackClock.publish(next, immediate || !playingRef.current);
+    },
+    [updateUnderPlayhead],
+  );
+
+  /** Timeline edits can move/replace clips under a stationary playhead —
+   * refresh the covering set whenever the timeline changes. */
   useEffect(() => {
-    return () => window.clearTimeout(playheadUiTimer.current);
-  }, []);
+    updateUnderPlayhead(playheadRef.current);
+  }, [timeline, updateUnderPlayhead]);
+
 
   /** Master playback clock: one rAF loop reads the media element per frame. */
   useEffect(() => {
@@ -778,11 +798,10 @@ function App() {
       if (active.paused) return;
 
       const tl = timelineRef.current;
-      const currentPh = playheadRef.current;
-      const hit = tl
-        ? (clipAtPlayhead(tl, currentPh, mode === "video" ? "video" : "audio") ??
-          (mode === "video" ? videoUnderRef.current : audioUnderRef.current))
-        : (mode === "video" ? videoUnderRef.current : audioUnderRef.current);
+      // The covering clip is maintained by commitPlayhead's boundary
+      // detection — no per-frame timeline scan needed here.
+      const hit =
+        mode === "video" ? videoUnderRef.current : audioUnderRef.current;
       if (!hit) return;
 
       // Still images have no media clock — the gap ticker advances the
@@ -2790,12 +2809,19 @@ function App() {
     };
   }, [monitorTargetClip]);
 
-  /** Magic Remove state for the monitor tool: params of the magicremove
-   * filter on the clip under the playhead + its media-time anchor. */
-  const magicMediaTime = useMemo(() => {
-    const hit = videoUnderPlayhead;
-    return hit ? mediaTimeForClip(hit.clip, playhead) : playhead;
-  }, [videoUnderPlayhead, playhead]);
+  /** Media time of the clip under the playhead — the Magic Remove drawing
+   * anchor. Subscribes to the playback clock only while the tool is open so
+   * the rest of the app never re-renders for it. */
+  const [magicMediaTime, setMagicMediaTime] = useState(0);
+  useEffect(() => {
+    if (!magicTool) return;
+    const compute = (t: number) => {
+      const hit = videoUnderRef.current;
+      return hit ? mediaTimeForClip(hit.clip, t) : t;
+    };
+    setMagicMediaTime(compute(playbackClock.get()));
+    return playbackClock.subscribe((t) => setMagicMediaTime(compute(t)));
+  }, [magicTool, videoUnderPlayhead]);
 
   const magicParams = useMemo(() => {
     const clip = videoUnderPlayhead?.clip;
@@ -3114,7 +3140,7 @@ function App() {
         );
         const opacity = String(style.opacity);
         const clipPath = style.clipPath ?? "";
-        const isCropping = cropTool;
+        const isCropping = cropToolRef.current;
         const objectViewBox = isCropping ? "" : (style.objectViewBox ?? "");
         const objectFit = isCropping ? "" : (style.objectFit ?? "");
 
@@ -3429,14 +3455,22 @@ function App() {
     }
   }, [monitorPitchKey, audioUnderPlayhead]);
 
-  // Keep monitor opacity / volume in sync with playhead fades.
+  // Keep monitor opacity / volume in sync with playhead fades: driven by the
+  // playback clock (imperative DOM writes — no React re-render per tick).
   useEffect(() => {
     applyPreviewFades(
-      playhead,
-      videoUnderPlayhead?.clip ?? null,
-      audioUnderPlayhead?.clip ?? null,
+      playbackClock.get(),
+      videoUnderRef.current?.clip ?? null,
+      audioUnderRef.current?.clip ?? null,
     );
-  }, [playhead, videoUnderPlayhead, audioUnderPlayhead, cropTool, applyPreviewFades]);
+    return playbackClock.subscribe((t) => {
+      applyPreviewFades(
+        t,
+        videoUnderRef.current?.clip ?? null,
+        audioUnderRef.current?.clip ?? null,
+      );
+    });
+  }, [videoUnderPlayhead, audioUnderPlayhead, applyPreviewFades]);
 
   // When timeline structure changes (clip trimmed, split, moved, rate stretched, deleted, undo/redo),
   // immediately resynchronize the monitor video/audio to match the playhead position.
@@ -3747,7 +3781,6 @@ function App() {
             previewMode={previewMode}
             previewSrc={previewSrc}
             playing={playing}
-            playhead={playhead}
             duration={projectDuration}
             previewError={previewError}
             aspect={previewAspect}
@@ -3861,7 +3894,6 @@ function App() {
             timeline={timeline}
             library={library}
             selectedClipId={selectedClipId}
-            playhead={playhead}
             playheadRef={playheadRef}
             tool={tool}
             status={status}
@@ -4018,28 +4050,6 @@ function App() {
   );
 }
 
-/** Ensure newer timeline fields exist when talking to older payloads. */
-function normalizeTimeline(t: Timeline): Timeline {
-  return {
-    ...t,
-    edit_mode: t.edit_mode ?? "normal",
-    markers: t.markers ?? [],
-    zone_in: t.zone_in ?? null,
-    zone_out: t.zone_out ?? null,
-    tracks: t.tracks.map((tr) => ({
-      ...tr,
-      hidden: tr.hidden ?? false,
-      clips: tr.clips.map((c) => ({
-        ...c,
-        fade_in: c.fade_in ?? 0,
-        fade_out: c.fade_out ?? 0,
-        filters: (c.filters ?? []).map((f) => ({
-          ...f,
-          params: (f.params ?? {}) as Record<string, unknown>,
-        })),
-      })),
-    })),
-  };
-}
-
+/** Ensure newer timeline fields exist when talking to older payloads:
+ * normalization now happens inside reconcileTimeline (src/timeline/reconcile.ts). */
 export default App;

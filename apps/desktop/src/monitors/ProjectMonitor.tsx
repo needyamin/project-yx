@@ -3,6 +3,7 @@ import { clipFadeGain, formatTime, mediaTimeForClip, type Clip } from "../timeli
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
 import { previewVideoStyle, type FilterInstance } from "../effects/effects";
 import { subscribeBinDrag } from "../bin/binDrag";
+import { usePlayheadTime } from "../playback/playbackClock";
 import { TextPresetPicker, type TextPresetParams } from "./TextPresets";
 import { ImagePicker, type MonitorImageItem } from "./ImagePicker";
 import { MagicRemoveOverlay } from "./MagicRemove";
@@ -34,7 +35,6 @@ type Props = {
   previewMode: PreviewMode;
   previewSrc: string | null;
   playing: boolean;
-  playhead: number;
   duration: number;
   previewError?: string | null;
   aspect: PreviewAspect;
@@ -289,7 +289,6 @@ export function ProjectMonitor({
   previewMode,
   previewSrc,
   playing,
-  playhead,
   duration,
   previewError,
   aspect,
@@ -345,7 +344,6 @@ export function ProjectMonitor({
   fileDropActive = false,
   fileDropLabel = null,
 }: Props) {
-  const safeDur = Math.max(0.001, duration);
   const tiktok = aspect === "tiktok";
   const frameRef = useRef<HTMLDivElement | null>(null);
   const [fullView, setFullView] = useState(false);
@@ -1533,7 +1531,6 @@ export function ProjectMonitor({
               key={l.clip.id}
               layer={l}
               playing={playing}
-              playhead={playhead}
               registerEl={registerLayerEl}
               onMediaSize={onLayerMediaSize}
             />
@@ -1899,16 +1896,7 @@ export function ProjectMonitor({
         <button type="button" className="play-btn sm" onClick={onTogglePlay} disabled={!canPlay}>
           {playing ? "❚❚" : "▶"}
         </button>
-        <span className="timecode">{formatTime(playhead)}</span>
-        <input
-          className="scrub"
-          type="range"
-          min={0}
-          max={1000}
-          value={Math.round((playhead / safeDur) * 1000)}
-          disabled={!canPlay}
-          onChange={(e) => onSeekRatio(Number(e.target.value) / 1000)}
-        />
+        <MonitorTransportTime duration={duration} canPlay={canPlay} onSeekRatio={onSeekRatio} />
         <span className="timecode muted-tc">{formatTime(duration)}</span>
         <button
           type="button"
@@ -1970,25 +1958,57 @@ export function ProjectMonitor({
   );
 }
 
+/** Playhead-driven transport bits (timecode + scrub slider). Subscribes to
+ * the authoritative playback clock directly so the monitor body never
+ * re-renders because playback advanced. */
+const MonitorTransportTime = memo(function MonitorTransportTime({
+  duration,
+  canPlay,
+  onSeekRatio,
+}: {
+  duration: number;
+  canPlay: boolean;
+  onSeekRatio: (ratio: number) => void;
+}) {
+  const playhead = usePlayheadTime();
+  const safeDur = Math.max(0.001, duration);
+  return (
+    <>
+      <span className="timecode">{formatTime(playhead)}</span>
+      <input
+        className="scrub"
+        type="range"
+        min={0}
+        max={1000}
+        value={Math.round((playhead / safeDur) * 1000)}
+        disabled={!canPlay}
+        onChange={(e) => onSeekRatio(Number(e.target.value) / 1000)}
+      />
+    </>
+  );
+});
+
 /** An overlay clip composited ABOVE the main preview (PiP layer).
  * Video layers play in sync with the main clock (muted — their audio lives
  * on the linked audio track); images are static. Per-clip filters, fades
  * and transform are applied exactly like the export composites them.
- * Memoized: monitor-only re-renders (drags) skip layer reconciliation. */
+ * The playhead arrives via the playback clock subscription: this tiny
+ * component updates at the clock's throttled rate while its parent stays
+ * stable during playback. Memoized: monitor-only re-renders (drags) skip
+ * layer reconciliation. */
 const MonitorLayer = memo(function MonitorLayer({
   layer,
   playing,
-  playhead,
   registerEl,
   onMediaSize,
 }: {
   layer: MonitorLayerClip;
   playing: boolean;
-  playhead: number;
   registerEl: (clipId: string, el: HTMLElement | null) => void;
   onMediaSize: (clipId: string, w: number, h: number) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const playhead = usePlayheadTime();
   const { clip, src, isImage } = layer;
 
   const style = useMemo(() => {

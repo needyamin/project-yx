@@ -1,9 +1,9 @@
 import type { EditMode, PerformanceTier } from "./types";
 import { formatTime } from "./types";
 import { IconSnap } from "./icons";
+import { usePlayheadTime } from "../playback/playbackClock";
 
 type Props = {
-  playhead: number;
   editMode: EditMode;
   tier: PerformanceTier;
   snap: boolean;
@@ -12,13 +12,15 @@ type Props = {
 };
 
 export function TimelineStatusBar({
-  playhead,
   editMode,
   tier,
   snap,
   onSnap,
   status,
 }: Props) {
+  // Subscribes to the authoritative playback clock directly: the whole
+  // timeline panel never re-renders because the playhead moved.
+  const playhead = usePlayheadTime();
   return (
     <div className="tl-statusbar">
       <div className="tl-status-toggles">
