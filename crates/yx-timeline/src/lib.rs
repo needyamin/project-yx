@@ -690,6 +690,17 @@ impl TimelineEditor {
         }
     }
 
+    /// Adopt an externally loaded project (save file). The undo history is
+    /// cleared — undo must never reach back into a different project.
+    pub fn with_timeline(timeline: Timeline) -> Self {
+        Self {
+            timeline,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            max_history: 100,
+        }
+    }
+
     pub fn timeline(&self) -> &Timeline {
         &self.timeline
     }
@@ -2305,6 +2316,9 @@ impl Timeline {
         issues
     }
 }
+
+#[cfg(test)]
+mod bench;
 
 #[cfg(test)]
 mod tests {

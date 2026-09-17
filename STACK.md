@@ -22,7 +22,7 @@ App ID `com.projectyx.editor` · GPL-3.0-or-later · Version lives in root `Carg
 
 | Crate | Responsibility |
 |---|---|
-| `yx-timeline` | Pure in-memory model: tracks, clips, cuts (normal/insert/overwrite), ripple/slip/spacer, transitions, filters, markers, zones, undo/redo. Zero disk I/O. |
+| `yx-timeline` | Pure in-memory model: tracks, clips, cuts (normal/insert/overwrite), ripple/slip/spacer, transitions, filters, markers, zones, undo/redo, consistency validation, engine benchmarks. Zero disk I/O. |
 | `yx-media` | FFmpeg/ffprobe driver: probing, effect filter chains (WYSIWYG with preview), background export with progress, loudnorm/de-esser/drawtext/lut3d etc. |
 | `yx-detect` | Hardware probe at launch (CPU/RAM/GPU/encoders) → performance tier; binary discovery (next-to-exe → PATH). |
 | `yx-proxy` | Background proxy transcoder: single worker queue, auto hot-swap when ready, skips audio/images. |
@@ -33,21 +33,29 @@ App ID `com.projectyx.editor` · GPL-3.0-or-later · Version lives in root `Carg
 | Module | Role |
 |---|---|
 | `bin/` | Project Bin: import, tabs (All/Audio/Effects/Applied), drag to timeline |
-| `timeline/` | Timeline panel, ClipBlock drag engine, Ruler, screen recorder, voiceover |
+| `timeline/` | Timeline panel, ClipBlock drag engine, Ruler, waveform/thumbnail surfaces, viewport culling, screen recorder, voiceover |
 | `monitors/` | Project Monitor (crop tool, transform drag, text overlay) and Clip Monitor |
+| `playback/` | The playback clock store: one authoritative playhead, throttled subscriptions for time-displaying leaves |
+| `jobs/` | Background job scheduler: priorities (scrub > playback > visible > background), AbortSignal cancellation, request coalescing |
 | `audio/` + `video/` | Advanced Audio Tools (voice clean, waveform) and video dialogs |
 | `effects/` | Effect catalog, WYSIWYG preview styles, inspector |
 | `export/` | Presets, output preview, progress |
 | `layout/` | Menubar, About dialog |
+| `dev/` | Benchmark harness (mock Tauri backend), served only by `bench.html` in dev |
 
 ## Key engineering decisions
 
-- **Imperative playback layer** — playhead, scrub and snap guides are painted via direct DOM writes on one `requestAnimationFrame` clock; React state only feeds the timecode at 4 Hz. Timeline clips are memoized, so playback and drags don't re-render them.
-- **One media clock** — the rAF loop reads the active element per frame; cuts are double-buffered (hidden second `<video>`), gaps and still-image clips advance on wall clock.
+- **Presented-frame playback clock** — in video mode the timeline position is derived from `requestVideoFrameCallback` metadata (each *delivered* frame carries its media timestamp), with a self-healing rAF sampler as fallback. Correct pacing for 23.976/29.97/60 fps; buffer starvation surfaces as status text, never a frozen clock.
+- **One authoritative playhead** — `playback/playbackClock.ts` is the single store; timecodes, scrub sliders and overlay layers subscribe as tiny leaves, so playback and scrubbing re-render only those leaves — never the project tree. The playhead line, snap guides and fade styles are imperative DOM writes (~µs per publish).
+- **Identity-preserving timeline updates** — the Rust engine returns the whole timeline per edit; `timeline/reconcile.ts` reuses previous object references for unchanged tracks/clips/filters so memoized clips skip re-render (moving clip #37 re-renders one clip, not 500).
+- **Viewport culling + zoom-aware clips** — only clips intersecting the scrolled viewport render; extreme zoom-out drops handles/text/waveforms so DOM size stays independent of project length.
+- **Background job manager** — waveforms and thumbnails go through a priority scheduler (scrub > playback > visible > background) with AbortSignal cancellation and request coalescing; the UI thread never blocks.
+- **Waveform pipeline** — one decode + one 4096-bin peak overview per media file, computed in rAF chunks; drawing samples it at display resolution, so zooming never regenerates data.
+- **Thumbnail pipeline** — FFmpeg extracts a 192px JPEG per (file, mtime, 0.25s bucket) into a disk cache on the blocking pool; unchanged media never regenerates, and original media is used (never proxies).
+- **Persistence & recovery** — `.yxp` save/open with atomic tmp+rename writes on Rust's blocking pool; a background autosave lands a few seconds after every edit and is restored automatically at next launch after a crash.
 - **WYSIWYG effects** — filters are stored once per clip; the monitor renders CSS approximations and export renders FFmpeg filter chains from the same params (crop fills via object-view-box ↔ `crop+scale`).
 - **Proxy pipeline** — imports enqueue a background proxy; a Tauri event hot-swaps the timeline onto the proxy when ready. Images and audio skip proxies.
 - **Recordings finalize through FFmpeg** — a stream-copy remux regenerates duration metadata that MediaRecorder omits, so clips import at their true length.
-- **Voiceover + screen recorder** — MediaRecorder captures; recordings are saved to the app cache and placed on the timeline as normal clips at the playhead.
 - **Bundled binaries** — `prepare-binaries.js` stages ffmpeg/ffprobe into `src-tauri/bin/`; Tauri resources ship them next to the exe (`<exe>/bin/`, `<exe>/resources/bin/` lookups).
 
 ## Packaging

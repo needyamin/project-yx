@@ -70,6 +70,163 @@ fn get_timeline_issues(state: State<'_, AppState>) -> Vec<String> {
     state.editor.lock().timeline().validate()
 }
 
+/* --- Project persistence ------------------------------------------------ */
+
+fn autosave_path() -> PathBuf {
+    dirs_cache()
+        .with_file_name("autosave")
+        .join("project.autosave.json")
+}
+
+/// Write the project atomically (tmp + rename) on a blocking thread so the
+/// UI never waits on disk.
+#[tauri::command]
+async fn save_project(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let timeline = state.editor.lock().timeline().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = serde_json::to_string(&timeline).map_err(|e| e.to_string())?;
+        let p = PathBuf::from(&path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let tmp = p.with_extension("yxp.tmp");
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("save task failed: {e}"))?
+}
+
+/// Replace the in-memory project with a loaded file (undo history resets).
+#[tauri::command]
+async fn load_project(path: String, state: State<'_, AppState>) -> Result<Timeline, String> {
+    let read = tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read_to_string(PathBuf::from(&path)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("load task failed: {e}"))??;
+    let timeline: Timeline = serde_json::from_str(&read).map_err(|e| e.to_string())?;
+    timeline.validate().iter().for_each(|issue| {
+        tracing::warn!("loaded project issue: {issue}");
+    });
+    let mut editor = state.editor.lock();
+    *editor = TimelineEditor::with_timeline(timeline.clone());
+    Ok(timeline)
+}
+
+/// Background autosave snapshot (never blocks the UI; cheap even for large
+/// projects — serialization happens on the blocking pool).
+#[tauri::command]
+async fn save_autosave(state: State<'_, AppState>) -> Result<(), String> {
+    let timeline = state.editor.lock().timeline().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let json = serde_json::to_string(&timeline).map_err(|e| e.to_string())?;
+        let dir = dirs_cache().with_file_name("autosave");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join("project.autosave.json");
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("autosave task failed: {e}"))?
+}
+
+/// The last autosave, if one exists — boot-time crash recovery.
+#[tauri::command]
+async fn get_autosave(state: State<'_, AppState>) -> Result<Option<Timeline>, String> {
+    let _ = state;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = autosave_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<Timeline>(&json) {
+                Ok(timeline) => Ok(Some(timeline)),
+                Err(_) => Ok(None), // corrupt snapshot: ignore, start fresh
+            },
+            Err(_) => Ok(None),
+        }
+    })
+    .await
+    .map_err(|e| format!("autosave read failed: {e}"))?
+}
+
+/// Generate (or fetch from the disk cache) a small preview JPEG for the
+/// timeline. Cache key = canonical path + file mtime + 0.25s time bucket,
+/// so unchanged media never regenerates. Runs on the blocking pool — the
+/// UI thread is never involved. Original media is used (never proxies) so
+/// thumbnails stay valid when proxies finish.
+#[tauri::command]
+async fn get_media_thumbnail(
+    source: String,
+    time: f64,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let src = PathBuf::from(&source);
+    let src = state.proxies.original_path(&src);
+    let bucket = (time.max(0.0) * 4.0).round() / 4.0;
+    let key_src = src.canonicalize().unwrap_or_else(|_| src.clone());
+    let mtime = std::fs::metadata(&key_src)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key_src.display().to_string().hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    format!("{bucket:.2}").hash(&mut hasher);
+    let out = dirs_cache()
+        .with_file_name("thumbs")
+        .join(format!("thumb_{:016x}.jpg", hasher.finish()));
+
+    if out.is_file() {
+        return Ok(out.display().to_string());
+    }
+
+    let src_str = src.display().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(out.parent().unwrap_or(&out)).map_err(|e| e.to_string())?;
+        if !out.is_file() {
+            let tmp = out.with_extension("tmp.jpg");
+            let status = yx_detect::command_ffmpeg()
+                .args([
+                    "-y",
+                    "-ss",
+                    &format!("{bucket:.3}"),
+                    "-i",
+                    &src_str,
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=192:-2",
+                    "-q:v",
+                    "5",
+                    tmp.to_str().ok_or("bad tmp path")?,
+                ])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !status.status.success() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!(
+                    "thumbnail failed: {}",
+                    String::from_utf8_lossy(&status.stderr).trim().chars().take(200).collect::<String>()
+                ));
+            }
+            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+        }
+        Ok(out.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("thumbnail task failed: {e}"))?
+}
+
 #[tauri::command]
 fn reprobe_hardware(state: State<'_, AppState>) -> BootInfo {
     let (profile, policy) = probe_and_policy();
@@ -1665,6 +1822,11 @@ pub fn run() {
             get_boot_info,
             get_timeline,
             get_timeline_issues,
+            get_media_thumbnail,
+            save_project,
+            load_project,
+            save_autosave,
+            get_autosave,
             debug_agent_log,
             reprobe_hardware,
             import_media,

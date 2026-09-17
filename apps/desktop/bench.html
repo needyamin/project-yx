@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Project YX — Benchmark Harness</title>
+    <style>
+      body { background: #12141a; color: #d8dbe2; font: 13px/1.5 monospace; margin: 16px; }
+      h1 { font-size: 15px; }
+      table { border-collapse: collapse; margin: 12px 0; }
+      td, th { border: 1px solid #2c313d; padding: 3px 10px; text-align: left; }
+      th { color: #8fa3ff; }
+      .ok { color: #7bd88f; } .warn { color: #ffd866; } .bad { color: #ff6188; }
+      #status { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Project YX — Benchmark Harness (dev only)</h1>
+    <div id="app-under-test"></div>
+    <pre id="status">initializing…</pre>
+    <script type="module" src="/src/dev/bench.ts"></script>
+  </body>
+</html>

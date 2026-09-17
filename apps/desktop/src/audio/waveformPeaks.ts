@@ -16,6 +16,116 @@ const BINS = 256;
 const MAX_SAMPLES = 2_500_000;
 const BINS_PER_CHUNK = 32;
 
+/* ------------------------------------------------------------------ */
+/* Multi-resolution per-file overview (timeline waveforms)             */
+/* ------------------------------------------------------------------ */
+
+/** Bins across the whole file. 4096 bins ≈ 14 bins/second for an hour of
+ * media — drawing at any zoom samples this array, so zooming NEVER
+ * regenerates peak data; only the decode (once per file) is expensive. */
+export const OVERVIEW_BINS = 4096;
+const OVERVIEW_CHUNK = 256;
+export type PeakOverview = { peaks: Float32Array; duration: number };
+const overviewCache = new Map<string, PeakOverview>();
+const overviewFailed = new Set<string>();
+/** in-flight overview builders, so concurrent clips share one build. */
+const overviewPending = new Map<string, Promise<PeakOverview | null>>();
+
+export function getCachedOverview(src: string): PeakOverview | null {
+  return overviewCache.get(src) ?? null;
+}
+
+export function overviewFailedFor(src: string): boolean {
+  return overviewFailed.has(src);
+}
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+/**
+ * Build (or join) the per-file peak overview. Decodes the file once
+ * (shared with the Advanced Audio preview path), computes peaks in rAF
+ * chunks so the UI never blocks, and caches the result for every clip.
+ * `signal` aborts cooperatively (job manager).
+ */
+export function loadOverviewPeaks(
+  src: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<PeakOverview | null> {
+  const cached = overviewCache.get(src);
+  if (cached) return Promise.resolve(cached);
+  const pending = overviewPending.get(src);
+  if (pending) return pending;
+
+  const build = async (): Promise<PeakOverview | null> => {
+    try {
+      let decoded = decodedCache.get(src);
+      if (!decoded) {
+        const res = await fetch(src, { signal: opts.signal });
+        if (opts.signal?.aborted) return null;
+        const buf = await res.arrayBuffer();
+        if (opts.signal?.aborted) return null;
+        await yieldToUi();
+        const ctx = audioContext();
+        decoded = await ctx.decodeAudioData(buf);
+        if (opts.signal?.aborted) return null;
+        decodedCache.set(src, decoded);
+        // Keep the decode cache bounded (decoded PCM is large).
+        if (decodedCache.size > 24) {
+          const oldest = decodedCache.keys().next().value;
+          if (oldest !== undefined && oldest !== src) {
+            decodedCache.delete(oldest);
+          }
+        }
+      }
+      const ch = decoded.getChannelData(0);
+      const bins = new Float32Array(OVERVIEW_BINS);
+      const perBin = Math.max(1, Math.floor(ch.length / OVERVIEW_BINS));
+      let maxAbs = 1e-6;
+      for (let binStart = 0; binStart < OVERVIEW_BINS; binStart += OVERVIEW_CHUNK) {
+        if (opts.signal?.aborted) return null;
+        const binEnd = Math.min(OVERVIEW_BINS, binStart + OVERVIEW_CHUNK);
+        for (let b = binStart; b < binEnd; b++) {
+          let peak = 0;
+          const start = b * perBin;
+          const end = Math.min(ch.length, start + perBin);
+          // Overview stride: sample at most ~16k points per bin.
+          const stride = Math.max(1, Math.floor(perBin / 16000));
+          for (let j = start; j < end; j += stride) {
+            const v = Math.abs(ch[j]);
+            if (v > peak) peak = v;
+          }
+          bins[b] = peak;
+          if (peak > maxAbs) maxAbs = peak;
+        }
+        await yieldToUi();
+      }
+      // Normalize so quiet files still render visibly.
+      if (maxAbs > 0 && maxAbs < 1) {
+        const gain = Math.min(4, 0.92 / maxAbs);
+        for (let b = 0; b < OVERVIEW_BINS; b++) {
+          bins[b] = Math.min(1, bins[b] * gain);
+        }
+      }
+      overviewCache.set(src, { peaks: bins, duration: decoded.duration });
+      return { peaks: bins, duration: decoded.duration };
+    } catch {
+      // Unsupported container/codec for Web Audio — leave waveform blank
+      // rather than retrying forever.
+      overviewFailed.add(src);
+      return null;
+    } finally {
+      overviewPending.delete(src);
+    }
+  };
+  const p = build();
+  overviewPending.set(src, p);
+  return p;
+}
+
 let sharedCtx: AudioContext | null = null;
 function audioContext(): AudioContext {
   if (!sharedCtx || sharedCtx.state === "closed") {
@@ -24,11 +134,6 @@ function audioContext(): AudioContext {
   return sharedCtx;
 }
 
-function yieldToUi(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => resolve());
-  });
-}
 
 function cacheKey(mediaPath: string, inPoint: number, outPoint: number): string {
   return `${mediaPath}|${inPoint.toFixed(3)}|${outPoint.toFixed(3)}`;

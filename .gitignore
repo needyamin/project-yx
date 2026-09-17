@@ -68,3 +68,11 @@ Desktop.ini
 # Local notes / scratch (optional personal files)
 *.local.md
 .scratch/
+context_memory.txt
+
+# Benchmarks: harness code is committed, generated media is not
+# (regenerate with bundled ffmpeg — see benchmark/README.md)
+benchmark/media/
+
+# Project save atomic-write temp files
+*.yxp.tmp

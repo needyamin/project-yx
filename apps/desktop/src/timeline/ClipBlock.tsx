@@ -1,4 +1,5 @@
-import { memo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Clip, EditMode, IndexedObstacle, Obstacle, TimelineTool } from "./types";
 import {
   clipTimelineDuration,
@@ -8,6 +9,12 @@ import {
   resolveNonOverlappingStart,
 } from "./types";
 import type { TimelineView } from "./useTimelineView";
+import { WaveformCanvas } from "./WaveformCanvas";
+import {
+  getCachedThumbnail,
+  markThumbnailFailed,
+  requestThumbnail,
+} from "./thumbnails";
 
 export type ClipEditAction =
   | {
@@ -110,6 +117,33 @@ function ClipBlockImpl({
   const previewing = !draft && previewDraft != null;
   const fadeInPx = Math.min(width, view.timeToX(Math.max(0, fadeIn)));
   const fadeOutPx = Math.min(width, view.timeToX(Math.max(0, fadeOut)));
+
+  /** Zoom-aware simplification: extreme zoom-out drops text, handles,
+   * fades, thumbnails and waveforms so hundreds of clips stay cheap. */
+  const micro = width < 26;
+  const compact = width < 90;
+
+  /** Video clips show a cached mid-clip thumbnail (background-generated). */
+  const thumbMid = (clip.in_point + clip.out_point) / 2;
+  const [thumbSrc, setThumbSrc] = useState<string | null>(() =>
+    clip.role === "video" && !micro
+      ? getCachedThumbnail(clip.media_path, thumbMid)
+      : null,
+  );
+  useEffect(() => {
+    if (clip.role !== "video" || micro) return;
+    return requestThumbnail(clip.media_path, thumbMid, setThumbSrc);
+  }, [clip.role, clip.media_path, thumbMid, micro]);
+
+  /** Audio clips render the cached peak overview (background-generated). */
+  const waveformSrc = (() => {
+    if (clip.role !== "audio" || micro) return null;
+    try {
+      return convertFileSrc(clip.media_path);
+    } catch {
+      return null;
+    }
+  })();
 
   function beginDrag(e: ReactPointerEvent, mode: DragMode) {
     if (locked) return;
@@ -512,7 +546,7 @@ function ClipBlockImpl({
   return (
     <div
       data-clip-id={clip.id}
-      className={`tl-clip role-${clip.role} ${selected ? "selected" : ""} ${clip.linked_clip_id ? "linked" : ""} ${draft || previewing ? "dragging" : ""}`}
+      className={`tl-clip role-${clip.role} ${selected ? "selected" : ""} ${clip.linked_clip_id ? "linked" : ""} ${draft || previewing ? "dragging" : ""} ${micro ? "micro" : ""} ${compact ? "compact" : ""}`}
       style={{ left, width, cursor }}
       onPointerDown={(e) => beginDrag(e, "move")}
       onContextMenu={(e) => {
@@ -524,7 +558,7 @@ function ClipBlockImpl({
       title={`${fileName(clip.media_path)} — drag to move · corners for fade · right-click for tools`}
     >
       {/*style Fade Ramps with Diagonal Stroke Lines */}
-      {fadeInPx > 1 && (
+      {fadeInPx > 1 && !micro && !compact && (
         <div
           className="tl-fade tl-fade-in"
           style={{ width: fadeInPx }}
@@ -535,7 +569,7 @@ function ClipBlockImpl({
           </svg>
         </div>
       )}
-      {fadeOutPx > 1 && (
+      {fadeOutPx > 1 && !micro && !compact && (
         <div
           className="tl-fade tl-fade-out"
           style={{ width: fadeOutPx }}
@@ -547,45 +581,74 @@ function ClipBlockImpl({
         </div>
       )}
 
+      {/* Audio waveform from the cached per-file peak overview. */}
+      {waveformSrc && (
+        <WaveformCanvas
+          src={waveformSrc}
+          inPoint={inPoint}
+          outPoint={outPoint}
+          width={width}
+          height={48}
+        />
+      )}
+
+      {/* Video thumbnail (single cached frame, background-generated). */}
+      {thumbSrc && !micro && (
+        <img
+          className="tl-clip-thumb"
+          src={thumbSrc}
+          alt=""
+          draggable={false}
+          onError={() => markThumbnailFailed(clip.media_path, thumbMid)}
+        />
+      )}
+
       {/* Left Trim Handle (Trim-In style) */}
-      <span
-        className={`tl-edge left ${dragMode === "trim-left" ? "active" : ""}`}
-        onPointerDown={(e) => beginDrag(e, "trim-left")}
-        title={tool === "ripple" ? "Ripple trim in / extend" : "Trim in / extend (drag left/right)"}
-      >
-        <span className="tl-edge-bar" aria-hidden />
-      </span>
+      {!micro && (
+        <span
+          className={`tl-edge left ${dragMode === "trim-left" ? "active" : ""}`}
+          onPointerDown={(e) => beginDrag(e, "trim-left")}
+          title={tool === "ripple" ? "Ripple trim in / extend" : "Trim in / extend (drag left/right)"}
+        >
+          <span className="tl-edge-bar" aria-hidden />
+        </span>
+      )}
 
       {/* Left Fade Handle ( circular grab dot) */}
-      <span
-        className={`tl-fade-handle left ${fadeIn > 0 ? "has-fade" : ""} ${dragMode === "fade-in" ? "active" : ""}`}
-        onPointerDown={(e) => beginDrag(e, "fade-in")}
-        title={fadeIn > 0 ? `Fade in: ${fadeIn.toFixed(2)}s (drag to adjust)` : "Drag to fade in"}
-        style={{ left: fadeInPx }}
-      />
+      {!micro && !compact && (
+        <span
+          className={`tl-fade-handle left ${fadeIn > 0 ? "has-fade" : ""} ${dragMode === "fade-in" ? "active" : ""}`}
+          onPointerDown={(e) => beginDrag(e, "fade-in")}
+          title={fadeIn > 0 ? `Fade in: ${fadeIn.toFixed(2)}s (drag to adjust)` : "Drag to fade in"}
+          style={{ left: fadeInPx }}
+        />
+      )}
 
       <div className="tl-clip-body">
-        <span className="tl-clip-name">{fileName(clip.media_path)}</span>
-        <small>{formatTime(dur)}</small>
+        {!micro && !compact && <span className="tl-clip-name">{fileName(clip.media_path)}</span>}
+        {!micro && <small>{formatTime(dur)}</small>}
       </div>
 
       {/* Right Fade Handle ( circular grab dot) */}
-      <span
-        className={`tl-fade-handle right ${fadeOut > 0 ? "has-fade" : ""} ${dragMode === "fade-out" ? "active" : ""}`}
-        onPointerDown={(e) => beginDrag(e, "fade-out")}
-        title={fadeOut > 0 ? `Fade out: ${fadeOut.toFixed(2)}s (drag to adjust)` : "Drag to fade out"}
-        style={{ right: fadeOutPx }}
-      />
+      {!micro && !compact && (
+        <span
+          className={`tl-fade-handle right ${fadeOut > 0 ? "has-fade" : ""} ${dragMode === "fade-out" ? "active" : ""}`}
+          onPointerDown={(e) => beginDrag(e, "fade-out")}
+          title={fadeOut > 0 ? `Fade out: ${fadeOut.toFixed(2)}s (drag to adjust)` : "Drag to fade out"}
+          style={{ right: fadeOutPx }}
+        />
+      )}
 
       {/* Right Trim Handle ( Trim-Out style) */}
-      <span
-        className={`tl-edge right ${dragMode === "trim-right" ? "active" : ""}`}
-        onPointerDown={(e) => beginDrag(e, "trim-right")}
-        title={tool === "ripple" ? "Ripple trim out / extend" : "Trim out / extend (drag left/right)"}
-      >
-        <span className="tl-edge-bar" aria-hidden />
-      </span>
-
+      {!micro && (
+        <span
+          className={`tl-edge right ${dragMode === "trim-right" ? "active" : ""}`}
+          onPointerDown={(e) => beginDrag(e, "trim-right")}
+          title={tool === "ripple" ? "Ripple trim out / extend" : "Trim out / extend (drag left/right)"}
+        >
+          <span className="tl-edge-bar" aria-hidden />
+        </span>
+      )}
       {/* Floating  HUD tooltips during resize or fade */}
       {dragMode === "trim-left" && (
         <div className="tl-hud tl-hud-edge left">

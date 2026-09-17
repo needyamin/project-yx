@@ -233,6 +233,10 @@ function App() {
    * seconds — failures must never be silent. */
   const [magicError, setMagicError] = useState<string | null>(null);
   const [snapOn, setSnapOn] = useState(true);
+  const snapOnRef = useRef(true);
+  useEffect(() => {
+    snapOnRef.current = snapOn;
+  }, [snapOn]);
   const [monitorVolume, setMonitorVolume] = useState(1);
   const [monitorMuted, setMonitorMuted] = useState(false);
   const [clipMonitorOpen, setClipMonitorOpen] = useState(true);
@@ -318,12 +322,39 @@ function App() {
     const info = await invoke<BootInfo>("get_boot_info");
     setBoot(info);
     setTimeline(normalizeTimeline(info.timeline));
+    // Crash recovery: adopt the last autosave when one exists (an empty
+    // default project is never treated as recoverable content).
+    try {
+      const autosave = await invoke<Timeline | null>("get_autosave");
+      if (autosave && autosave.tracks.some((t) => t.clips.length > 0)) {
+        setTimeline(normalizeTimeline(autosave));
+        setStatus("Restored autosaved project — Ctrl+S to save it as a file");
+        return;
+      }
+    } catch {
+      /* autosave probe failed: start fresh */
+    }
     setStatus(`Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`);
   }, []);
 
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
+
+  // Background autosave: debounced after every edit, serialized + written
+  // entirely on Rust's blocking pool — the UI thread never touches disk.
+  const autosaveTimer = useRef(0);
+  useEffect(() => {
+    if (!timeline || !boot) return;
+    window.clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = window.setTimeout(() => {
+      void invoke("save_autosave").catch(() => undefined);
+    }, 4000);
+    return () => window.clearTimeout(autosaveTimer.current);
+  }, [timeline, boot]);
+  useEffect(() => {
+    return () => window.clearTimeout(autosaveTimer.current);
+  }, []);
 
   // Magic Remove pipeline progress (tracking / background reconstruction).
   useEffect(() => {
@@ -782,21 +813,22 @@ function App() {
   }, [timeline, updateUnderPlayhead]);
 
 
-  /** Master playback clock: one rAF loop reads the media element per frame. */
+  /** Master playback clock.
+   *
+   * Video mode uses requestVideoFrameCallback when available: each PRESENTED
+   * decoded frame carries its media timestamp, so the playhead is derived
+   * from actual frame delivery — no sampling jitter, correct behavior for
+   * 23.976/29.97/50/59.94/60 fps content. rAF sampling remains the fallback
+   * and drives audio-only playback. The gap ticker (separate effect) covers
+   * gaps and still images. */
   useEffect(() => {
     if (!playing || previewMode === "empty") return;
     let raf = 0;
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
-      if (!playingRef.current) return;
-      const mode = previewModeRef.current;
-      const active = mode === "video" ? videoRef.current : audioRef.current;
-      if (!active) return;
-      // Paused media means either reverse playback (own stepper drives the
-      // playhead) or a pending seek — the media clock is stale, so
-      // skip instead of corrupting the playhead with a frozen currentTime.
-      if (active.paused) return;
+    let stopped = false;
 
+    /** Shared per-frame advance: map a media-file time to the timeline,
+     * keep A-track/overdub audio locked, and handle cuts / gaps / end. */
+    const advance = (mode: "video" | "audio", active: HTMLMediaElement, mediaTime: number) => {
       const tl = timelineRef.current;
       // The covering clip is maintained by commitPlayhead's boundary
       // detection — no per-frame timeline scan needed here.
@@ -811,8 +843,8 @@ function App() {
       const speed = clipSpeed(hit.clip);
       const reversed = mode === "video" && !!hit.clip.reverse;
       const localMedia = reversed
-        ? hit.clip.out_point - active.currentTime
-        : active.currentTime - hit.clip.in_point;
+        ? hit.clip.out_point - mediaTime
+        : mediaTime - hit.clip.in_point;
       const timelineTime = hit.clip.start + localMedia / speed;
       commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
 
@@ -912,8 +944,66 @@ function App() {
         }
       }
     };
+
+    /** rAF fallback: samples the media clock once per frame. In video mode
+     * it defers to the presented-frame clock below and only takes over if
+     * that chain has gone quiet (e.g. after a mid-playback source swap) —
+     * self-healing without explicit re-arm bookkeeping. */
+    let lastFrameClockCommit = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      if (!playingRef.current) return;
+      const mode = previewModeRef.current;
+      const active = mode === "video" ? videoRef.current : audioRef.current;
+      if (!active) return;
+      // Paused media means either reverse playback (own stepper drives the
+      // playhead) or a pending seek — the media clock is stale, so
+      // skip instead of corrupting the playhead with a frozen currentTime.
+      if (active.paused) return;
+      if (mode === "empty") return;
+      if (
+        mode === "video" &&
+        performance.now() - lastFrameClockCommit < 100
+      ) {
+        return;
+      }
+      advance(mode, active, active.currentTime);
+    };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+
+    /** Presented-frame chain: superseded chains (after a source swap or a
+     * re-arm) go inert via the generation guard instead of piling up. */
+    let chainId = 0;
+    const armFrameClock = () => {
+      const v = videoRef.current;
+      if (!v || stopped) return;
+      if (!("requestVideoFrameCallback" in v)) return;
+      const my = ++chainId;
+      const step = (_now: number, meta: { mediaTime: number }) => {
+        if (stopped || !playingRef.current || my !== chainId) return;
+        if (previewModeRef.current === "video" && !v.paused) {
+          lastFrameClockCommit = performance.now();
+          advance("video", v, meta.mediaTime);
+        }
+        v.requestVideoFrameCallback(step);
+      };
+      v.requestVideoFrameCallback(step);
+    };
+    if (previewMode === "video") armFrameClock();
+
+    // After a mid-playback source swap (cut to different media) the old
+    // chain dies with the element's source; restart it when frames flow.
+    const videoEl = videoRef.current;
+    const onFramesFlowing = () => {
+      if (playingRef.current) armFrameClock();
+    };
+    videoEl?.addEventListener("playing", onFramesFlowing);
+
+    return () => {
+      stopped = true;
+      cancelAnimationFrame(raf);
+      videoEl?.removeEventListener("playing", onFramesFlowing);
+    };
   }, [playing, previewMode, commitPlayhead]);
 
   // Media element state listeners (play/pause/error).
@@ -936,7 +1026,9 @@ function App() {
     };
     const onPause = (ev: Event) => {
       if (!isActiveElement(ev)) return;
-      if (transitioningRef.current) return;
+      // The engine pauses media deliberately at cuts/gaps while the session
+      // keeps playing — only a pause with no live session stops playback.
+      if (playingRef.current || transitioningRef.current) return;
       cancelAnimationFrame(reverseRafRef.current);
       reverseRafRef.current = 0;
       cancelAnimationFrame(gapRafRef.current);
@@ -951,19 +1043,40 @@ function App() {
       if (!isActiveElement(ev)) return;
       setPreviewError("Could not load preview.");
     };
+    // Buffer starvation: surface it, never freeze the clock — the playhead
+    // resumes with the media element ('playing' fires when frames return).
+    let bufferingTicked = false;
+    const onWaiting = () => {
+      if (!playingRef.current || bufferingTicked) return;
+      bufferingTicked = true;
+      setStatus("Buffering…");
+    };
+    const onRecover = () => {
+      if (bufferingTicked) {
+        bufferingTicked = false;
+        setStatus("");
+      }
+    };
 
     active.addEventListener("play", onPlay);
     active.addEventListener("pause", onPause);
     active.addEventListener("error", onErr);
+    active.addEventListener("waiting", onWaiting);
+    active.addEventListener("stalled", onWaiting);
+    active.addEventListener("playing", onRecover);
     return () => {
       active.removeEventListener("play", onPlay);
       active.removeEventListener("pause", onPause);
       active.removeEventListener("error", onErr);
+      active.removeEventListener("waiting", onWaiting);
+      active.removeEventListener("stalled", onWaiting);
+      active.removeEventListener("playing", onRecover);
     };
   }, [previewMode, timelineAudioSrc, commitPlayhead]);
 
   // Gap playback ticker: drives playhead across gaps AND still-image clips
   // at 1x (blank frame / picture) when no real video is playing.
+  const gapChainGenRef = useRef(0);
   useEffect(() => {
     const videoUnder = videoUnderRef.current;
     const realVideoPlaying =
@@ -973,14 +1086,23 @@ function App() {
         cancelAnimationFrame(gapRafRef.current);
         gapRafRef.current = 0;
       }
+      gapChainGenRef.current++;
       return;
     }
+    // Generation guard: any orphaned chain from a previous effect instance
+    // terminates itself instead of stacking (stacked chains multiplied the
+    // playhead rate).
+    const gen = ++gapChainGenRef.current;
 
     let lastWall = performance.now();
 
     const tick = (now: number) => {
-      if (!playingRef.current) return;
-      const dt = Math.min(0.1, (now - lastWall) / 1000);
+      if (!playingRef.current || gen !== gapChainGenRef.current) {
+        gapRafRef.current = 0;
+        return; // terminal: stop the chain instead of leaving a zombie loop
+      }
+      gapRafRef.current = requestAnimationFrame(tick);
+      const dt = Math.min(0.05, (now - lastWall) / 1000);
       lastWall = now;
 
       const currentPh = playheadRef.current;
@@ -994,6 +1116,8 @@ function App() {
         setPlaying(false);
         const audio = audioRef.current;
         if (audio && !audio.paused) audio.pause();
+        gapChainGenRef.current++;
+        gapRafRef.current = 0;
         return;
       }
 
@@ -1023,8 +1147,6 @@ function App() {
       } else if (audio2 && !audio2.paused && !aHit2) {
         audio2.pause();
       }
-
-      gapRafRef.current = requestAnimationFrame(tick);
     };
 
     gapRafRef.current = requestAnimationFrame(tick);
@@ -2567,6 +2689,42 @@ function App() {
       .catch(() => setExportPreviewFrame(null));
   }
 
+  /** Open a .yxp project file (replaces the in-memory project; undo history
+   * resets with it). Playback stops first so media elements are quiescent. */
+  async function openProject() {
+    try {
+      const picked = await open({
+        multiple: false,
+        filters: [{ name: "Project YX", extensions: ["yxp", "json"] }],
+      });
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (!path) return;
+      stopPlayback();
+      const tl = await invoke<Timeline>("load_project", { path });
+      setTimeline(normalizeTimeline(tl));
+      setSelectedClipId(null);
+      seekTimeline(0);
+      setStatus(`Opened ${fileName(path)}`);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
+  /** Save the project as a .yxp file (atomic write on the Rust side). */
+  async function saveProjectAs() {
+    try {
+      const path = await save({
+        filters: [{ name: "Project YX", extensions: ["yxp", "json"] }],
+        defaultPath: "project.yxp",
+      });
+      if (!path) return;
+      await invoke("save_project", { path });
+      setStatus(`Project saved → ${fileName(path)}`);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
   async function runExport(settings: ExportSettings) {
     if (!canExport) {
       setStatus("Add media to the timeline (or select a file) to export");
@@ -3354,6 +3512,114 @@ function App() {
     }
   }
 
+  /** Standalone stop (K / programmatic) — pauses all media elements. */
+  function stopPlayback() {
+    cancelAnimationFrame(reverseRafRef.current);
+    reverseRafRef.current = 0;
+    cancelAnimationFrame(gapRafRef.current);
+    gapRafRef.current = 0;
+    playingRef.current = false;
+    setPlaying(false);
+    videoRef.current?.pause();
+    audioRef.current?.pause();
+    audio2Ref.current?.pause();
+    if (videoRef.current) {
+      try {
+        videoRef.current.playbackRate = 1;
+      } catch {
+        /* ignore */
+      }
+    }
+    if (audioRef.current) {
+      try {
+        audioRef.current.playbackRate = 1;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** Reverse playback (J): steps the video's currentTime backwards on an
+   * rAF loop — HTML5 media can't play backwards natively. Audio is muted
+   * and paused during the reverse pass (professional NLEs do the same). */
+  function playReverse() {
+    const video = videoRef.current;
+    if (playingRef.current) {
+      stopPlayback();
+      return;
+    }
+    const tl = timelineRef.current;
+    const ph = playheadRef.current;
+    const hit = tl ? clipAtPlayhead(tl, ph, "video") : null;
+    if (!hit || isImagePath(hit.clip.media_path) || !video) {
+      // No video here: nudge the playhead back a second.
+      seekTimeline(Math.max(0, ph - 1));
+      return;
+    }
+    const clip = hit.clip;
+    const wantSrc = convertFileSrc(
+      (!magicToolRef.current &&
+        magicResultReady((findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
+        clip.media_path,
+    );
+    if (wantSrc && video.getAttribute("src") !== wantSrc) {
+      video.src = wantSrc;
+      video.load();
+    }
+    try {
+      video.currentTime = mediaTimeForClip(clip, ph);
+    } catch {
+      /* metadata not ready */
+    }
+    playingRef.current = true;
+    setPlaying(true);
+    audioRef.current?.pause();
+    audio2Ref.current?.pause();
+    const wall0 = performance.now();
+    const ph0 = ph;
+    const step = () => {
+      if (!playingRef.current) return;
+      const elapsed = (performance.now() - wall0) / 1000;
+      const nextPh = Math.max(clip.start, ph0 - elapsed);
+      commitPlayhead(nextPh, false);
+      try {
+        video.currentTime = mediaTimeForClip(clip, nextPh);
+      } catch {
+        /* ignore */
+      }
+      applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
+      if (nextPh <= clip.start + 0.02) {
+        reverseRafRef.current = 0;
+        stopPlayback();
+        return;
+      }
+      reverseRafRef.current = requestAnimationFrame(step);
+    };
+    reverseRafRef.current = requestAnimationFrame(step);
+  }
+
+  /** Shuttle forward (L): start playback, or double the rate while playing. */
+  function shuttleForward() {
+    const video = videoRef.current;
+    if (!playingRef.current) {
+      togglePlay();
+      return;
+    }
+    const next = Math.min(4, (video?.playbackRate ?? 1) * 2);
+    try {
+      if (video) video.playbackRate = next;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Toggle snapping (N) — kept current via the keyHandlers ref. */
+  function toggleSnap() {
+    const next = !snapOnRef.current;
+    setSnapOn(next);
+    viewControlsRef.current?.setSnap(next);
+  }
+
   const seekTimeline = useCallback(
     (t: number, immediate = true) => {
       const next = Math.max(0, t);
@@ -3562,6 +3828,12 @@ function App() {
     setZoneOut,
     onRemove,
     seekTimeline,
+    saveProjectAs,
+    openProject,
+    playReverse,
+    stopPlayback,
+    shuttleForward,
+    toggleSnap,
   });
   useEffect(() => {
     keyHandlersRef.current = {
@@ -3574,6 +3846,12 @@ function App() {
       setZoneOut,
       onRemove,
       seekTimeline,
+      saveProjectAs,
+      openProject,
+      playReverse,
+      stopPlayback,
+      shuttleForward,
+      toggleSnap,
     };
   });
 
@@ -3595,26 +3873,48 @@ function App() {
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "b" || e.key === "B")) {
         e.preventDefault();
         void h.splitAtPlayhead();
-      } else if (e.key === "s" || e.key === "S") {
+      } else if ((e.key === "s" || e.key === "S") && !e.ctrlKey && !e.metaKey) {
         h.setTool("select");
-      } else if (e.key === "x" || e.key === "X") {
+      } else if ((e.key === "x" || e.key === "X") && !e.ctrlKey && !e.metaKey) {
         h.setTool("razor");
-      } else if (e.key === "m" || e.key === "M") {
+      } else if ((e.key === "m" || e.key === "M") && !e.ctrlKey && !e.metaKey) {
         h.setTool("spacer");
-      } else if (e.key === "y" || e.key === "Y") {
+      } else if ((e.key === "y" || e.key === "Y") && !e.ctrlKey && !e.metaKey) {
         h.setTool("slip");
-      } else if (e.key === "r" || e.key === "R") {
+      } else if ((e.key === "r" || e.key === "R") && !e.ctrlKey && !e.metaKey) {
         h.setTool("ripple");
-      } else if (e.key === "i" || e.key === "I") {
+      } else if ((e.key === "i" || e.key === "I") && !e.ctrlKey && !e.metaKey) {
         void h.setZoneIn();
-      } else if (e.key === "o" || e.key === "O") {
+      } else if ((e.key === "o" || e.key === "O") && !e.ctrlKey && !e.metaKey) {
         void h.setZoneOut();
       } else if (e.key === "Delete" || e.key === "Backspace") {
         void h.onRemove();
       } else if (e.key === "ArrowLeft") {
-        h.seekTimeline(playheadRef.current - (e.shiftKey ? 1 : 1 / 30));
+        // Frame-accurate stepping: 1 frame of the PROJECT frame rate
+        // (correct for 23.976/25/29.97/50/59.94/60 — not a hardcoded 30).
+        const fps = timelineRef.current?.frame_rate || 30;
+        h.seekTimeline(playheadRef.current - (e.shiftKey ? 1 : 1 / fps));
       } else if (e.key === "ArrowRight") {
-        h.seekTimeline(playheadRef.current + (e.shiftKey ? 1 : 1 / 30));
+        const fps = timelineRef.current?.frame_rate || 30;
+        h.seekTimeline(playheadRef.current + (e.shiftKey ? 1 : 1 / fps));
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        void h.saveProjectAs();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) {
+        e.preventDefault();
+        void h.openProject();
+      } else if (e.key === "j" || e.key === "J") {
+        e.preventDefault();
+        h.playReverse();
+      } else if (e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        h.stopPlayback();
+      } else if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        h.shuttleForward();
+      } else if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        h.toggleSnap();
       }
     }
     window.addEventListener("keydown", onKey);

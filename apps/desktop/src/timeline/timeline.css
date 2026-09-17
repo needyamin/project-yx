@@ -925,3 +925,42 @@ body.resizing-tl-headers {
   background: #ef4444;
   box-shadow: 0 0 8px rgba(239, 68, 68, 0.8);
 }
+/* --- Timeline media surfaces (waveform / thumbnail) + micro clips --- */
+
+.tl-clip-thumb {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  object-fit: cover;
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+
+.tl-waveform {
+  opacity: 0.85;
+}
+
+/* Extreme zoom-out: clip is a bare bar — no text, handles or media. */
+.tl-clip.micro .tl-clip-body {
+  display: none;
+}
+.tl-clip.micro .tl-edge,
+.tl-clip.micro .tl-fade-handle,
+.tl-clip.micro .tl-hud {
+  display: none;
+}
+/* Compact: keep trim handles, drop secondary chrome. */
+.tl-clip.compact .tl-fade-handle,
+.tl-clip.compact .tl-fade {
+  display: none;
+}
+.tl-clip.compact .tl-clip-name {
+  display: none;
+}
+.tl-clip.compact .tl-clip-body {
+  align-items: center;
+}

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 // @ts-expect-error type error without @types/node package
@@ -27,6 +28,11 @@ export default defineConfig(() => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+    },
+    // Serve the benchmark media directory over /@fs/ for the dev-only
+    // benchmark harness (bench.html). No effect on production builds.
+    fs: {
+      allow: [process.cwd(), path.resolve(process.cwd(), "../..")],
     },
   },
 }));

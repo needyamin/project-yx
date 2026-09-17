@@ -9,6 +9,8 @@ Project YX is a free, open-source desktop video editor (Windows / Linux) built t
 ## Features
 
 - **Timeline editing** — split, ripple, slip, spacer, fade handles, unlimited undo/redo
+- **Audio waveforms & video thumbnails** — clips show cached waveforms (decoded once per file, zoom-independent) and background-generated thumbnails; extreme zoom-out simplifies clips automatically
+- **Project files** — save/open `.yxp`, background autosave every few seconds, automatic crash recovery on next launch
 - **Images & GIFs** — import, place, trim freely; loop on export
 - **Screen recorder** — capture any screen/window with mic, straight to the timeline
 - **Voiceover** — one-click mic recording onto an audio track
@@ -36,11 +38,13 @@ The app detects your hardware at launch and adjusts proxies and quality automati
 | Key | Action | Key | Action |
 |---|---|---|---|
 | S | Select tool | Space | Play / pause |
-| X | Razor | Ctrl+B | Split at playhead |
-| M | Spacer | ← → | Step frame (Shift = 1s) |
-| Y | Slip | Ctrl+Z / Y | Undo / redo |
-| R | Ripple | Del | Delete clip |
-| I / O | Zone in / out | Ctrl+wheel | Zoom timeline |
+| X | Razor | J / K / L | Reverse / stop / play (L again = 2×, 4×) |
+| M | Spacer | Ctrl+B | Split at playhead |
+| Y | Slip | ← → | Step one frame of the project frame rate (Shift = 1s) |
+| R | Ripple | Ctrl+Z / Y | Undo / redo |
+| I / O | Zone in / out | Del | Delete clip |
+| N | Toggle snapping | Ctrl+wheel | Zoom timeline |
+| Ctrl+S | Save project (.yxp) | Ctrl+O | Open project |
 
 ## Download & install
 
@@ -66,6 +70,12 @@ npm run dist:win   # build setup.exe + msix
 ```
 
 Requirements: Rust stable, Node.js 20+, FFmpeg on PATH (bundled in releases).
+
+**Benchmarks:** the repo ships a repeatable performance harness — a browser
+page that mounts the real app against a mock backend (edit latency, scroll/zoom
+pacing, playback FPS, A/V drift) and a Rust engine benchmark with regression
+budgets. Setup and regeneration scripts: [benchmark/README.md](benchmark/README.md).
+
 Full stack map: [STACK.md](STACK.md) · Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Repository layout
@@ -73,6 +83,7 @@ Full stack map: [STACK.md](STACK.md) · Contributing: [CONTRIBUTING.md](CONTRIBU
 ```
 apps/desktop/        Tauri app: React UI + Rust shell
 crates/yx-*          Rust engine crates
+benchmark/           Performance harness + generated test media (media gitignored)
 scripts/             Packaging (NSIS, Inno, MSIX, portable, AppImage)
 installer/ docker/   Installer templates, Linux build
 ```
