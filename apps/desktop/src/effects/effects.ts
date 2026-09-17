@@ -66,65 +66,65 @@ export const EFFECT_CATALOG: {
   /** Short editable-param summary for the inspector hint. */
   params?: string[];
 }[] = [
-  { id: "transform", label: "Transform", roles: ["video"] },
-  { id: "crop", label: "Crop", roles: ["video"] },
-  { id: "exposure", label: "Exposure", roles: ["video"] },
-  { id: "contrast", label: "Contrast", roles: ["video"] },
-  { id: "saturation", label: "Saturation", roles: ["video"] },
-  { id: "blur", label: "Blur", heavy: true, roles: ["video"] },
-  { id: "flip", label: "Flip", roles: ["video"] },
-  { id: "chromakey", label: "Chroma Key (BG remove)", heavy: true, roles: ["video"] },
-  { id: "volume", label: "Volume", roles: ["audio"] },
-  { id: "equalizer", label: "Equalizer", roles: ["audio"] },
-  { id: "compressor", label: "Compressor", roles: ["audio"] },
-  { id: "highpass", label: "High-pass", roles: ["audio"] },
-  { id: "lowpass", label: "Low-pass", roles: ["audio"] },
-  { id: "gate", label: "Noise gate", roles: ["audio"] },
-  { id: "denoise", label: "Noise remove", heavy: true, roles: ["audio"] },
-  { id: "limiter", label: "Limiter", roles: ["audio"] },
-  { id: "reverb", label: "Reverb", roles: ["audio"] },
-  { id: "invert", label: "Invert phase", roles: ["audio"] },
-  { id: "pitch", label: "Change voice", roles: ["audio"] },
-  { id: "text", label: "Text / Title", roles: ["video"] },
-  { id: "temperature", label: "Temperature", roles: ["video"] },
-  { id: "hue", label: "Hue rotate", roles: ["video"] },
-  { id: "vignette", label: "Vignette", roles: ["video"] },
-  { id: "sharpen", label: "Sharpen", roles: ["video"] },
-  { id: "vdenoise", label: "Video denoise", heavy: true, roles: ["video"] },
-  { id: "stabilize", label: "Stabilize", heavy: true, roles: ["video"] },
-  { id: "lut3d", label: "LUT (.cube)", heavy: true, roles: ["video"] },
-  { id: "transition", label: "Cross Dissolve", roles: ["video"] },
-  { id: "normalize", label: "Normalize (loudness)", roles: ["audio"] },
+    { id: "transform", label: "Transform", roles: ["video"] },
+    { id: "crop", label: "Crop", roles: ["video"] },
+    { id: "exposure", label: "Exposure", roles: ["video"] },
+    { id: "contrast", label: "Contrast", roles: ["video"] },
+    { id: "saturation", label: "Saturation", roles: ["video"] },
+    { id: "blur", label: "Blur", heavy: true, roles: ["video"] },
+    { id: "flip", label: "Flip", roles: ["video"] },
+    { id: "chromakey", label: "Chroma Key (BG remove)", heavy: true, roles: ["video"] },
+    { id: "volume", label: "Volume", roles: ["audio"] },
+    { id: "equalizer", label: "Equalizer", roles: ["audio"] },
+    { id: "compressor", label: "Compressor", roles: ["audio"] },
+    { id: "highpass", label: "High-pass", roles: ["audio"] },
+    { id: "lowpass", label: "Low-pass", roles: ["audio"] },
+    { id: "gate", label: "Noise gate", roles: ["audio"] },
+    { id: "denoise", label: "Noise remove", heavy: true, roles: ["audio"] },
+    { id: "limiter", label: "Limiter", roles: ["audio"] },
+    { id: "reverb", label: "Reverb", roles: ["audio"] },
+    { id: "invert", label: "Invert phase", roles: ["audio"] },
+    { id: "pitch", label: "Change voice", roles: ["audio"] },
+    { id: "text", label: "Text / Title", roles: ["video"] },
+    { id: "temperature", label: "Temperature", roles: ["video"] },
+    { id: "hue", label: "Hue rotate", roles: ["video"] },
+    { id: "vignette", label: "Vignette", roles: ["video"] },
+    { id: "sharpen", label: "Sharpen", roles: ["video"] },
+    { id: "vdenoise", label: "Video denoise", heavy: true, roles: ["video"] },
+    { id: "stabilize", label: "Stabilize", heavy: true, roles: ["video"] },
+    { id: "lut3d", label: "LUT (.cube)", heavy: true, roles: ["video"] },
+    { id: "transition", label: "Cross Dissolve", roles: ["video"] },
+    { id: "normalize", label: "Normalize (loudness)", roles: ["audio"] },
 
-  /* --- Motion / Shake / Glitch / Light / Magic / Cinematic / Retro /
-     Trending (Vita-style live effects). All accept intensity, speed,
-     duration and direction where meaningful. --- */
-  { id: "shake", label: "Camera Shake", roles: ["video"], category: "Shake", params: ["intensity", "speed", "direction"] },
-  { id: "wiggle", label: "Wiggle", roles: ["video"], category: "Shake", params: ["intensity", "speed"] },
-  { id: "bounce", label: "Bounce", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
-  { id: "zoompulse", label: "Zoom Pulse", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
-  { id: "zoomin", label: "Dynamic Zoom", roles: ["video"], category: "Motion", params: ["intensity", "duration", "direction"] },
-  { id: "spin", label: "Spin", roles: ["video"], category: "Motion", params: ["speed", "duration", "direction"] },
-  { id: "motionblur", label: "Motion Blur", roles: ["video"], category: "Motion", params: ["intensity"] },
-  { id: "rgbsplit", label: "RGB Split", roles: ["video"], category: "Glitch", params: ["intensity", "direction"] },
-  { id: "glitch", label: "Glitch", roles: ["video"], category: "Glitch", params: ["intensity", "speed"] },
-  { id: "flash", label: "Flash", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
-  { id: "pulse", label: "Beat Pulse", roles: ["video"], category: "Trending", params: ["intensity", "speed"] },
-  { id: "glow", label: "Glow", roles: ["video"], category: "Light", params: ["intensity"] },
-  { id: "neon", label: "Neon Cycle", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
-  { id: "vhs", label: "VHS Retro", roles: ["video"], category: "Retro", params: ["intensity"] },
-  { id: "cinematic", label: "Cinematic", roles: ["video"], category: "Cinematic", params: ["intensity"] },
-  { id: "dream", label: "Dream Bloom", roles: ["video"], category: "Magic", params: ["intensity"] },
-  { id: "magic", label: "Magic Hue", roles: ["video"], category: "Magic", params: ["intensity", "speed"] },
-  {
-    id: "magicremove",
-    label: "Magic Remove (AI Eraser)",
-    heavy: true,
-    roles: ["video"],
-    category: "Magic",
-    params: ["brushSize", "feather", "expand", "trackingAccuracy", "removalStrength"],
-  },
-];
+    /* --- Motion / Shake / Glitch / Light / Magic / Cinematic / Retro /
+       Trending (live effects). All accept intensity, speed,
+       duration and direction where meaningful. --- */
+    { id: "shake", label: "Camera Shake", roles: ["video"], category: "Shake", params: ["intensity", "speed", "direction"] },
+    { id: "wiggle", label: "Wiggle", roles: ["video"], category: "Shake", params: ["intensity", "speed"] },
+    { id: "bounce", label: "Bounce", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
+    { id: "zoompulse", label: "Zoom Pulse", roles: ["video"], category: "Motion", params: ["intensity", "speed"] },
+    { id: "zoomin", label: "Dynamic Zoom", roles: ["video"], category: "Motion", params: ["intensity", "duration", "direction"] },
+    { id: "spin", label: "Spin", roles: ["video"], category: "Motion", params: ["speed", "duration", "direction"] },
+    { id: "motionblur", label: "Motion Blur", roles: ["video"], category: "Motion", params: ["intensity"] },
+    { id: "rgbsplit", label: "RGB Split", roles: ["video"], category: "Glitch", params: ["intensity", "direction"] },
+    { id: "glitch", label: "Glitch", roles: ["video"], category: "Glitch", params: ["intensity", "speed"] },
+    { id: "flash", label: "Flash", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
+    { id: "pulse", label: "Beat Pulse", roles: ["video"], category: "Trending", params: ["intensity", "speed"] },
+    { id: "glow", label: "Glow", roles: ["video"], category: "Light", params: ["intensity"] },
+    { id: "neon", label: "Neon Cycle", roles: ["video"], category: "Light", params: ["intensity", "speed"] },
+    { id: "vhs", label: "VHS Retro", roles: ["video"], category: "Retro", params: ["intensity"] },
+    { id: "cinematic", label: "Cinematic", roles: ["video"], category: "Cinematic", params: ["intensity"] },
+    { id: "dream", label: "Dream Bloom", roles: ["video"], category: "Magic", params: ["intensity"] },
+    { id: "magic", label: "Magic Hue", roles: ["video"], category: "Magic", params: ["intensity", "speed"] },
+    {
+      id: "magicremove",
+      label: "Magic Remove (AI Eraser)",
+      heavy: true,
+      roles: ["video"],
+      category: "Magic",
+      params: ["brushSize", "feather", "expand", "trackingAccuracy", "removalStrength"],
+    },
+  ];
 
 export function defaultParams(kind: string): Record<string, unknown> {
   switch (kind) {
@@ -186,7 +186,6 @@ export function defaultParams(kind: string): Record<string, unknown> {
       return { target: -16 };
     case "transition":
       return { kind: "dissolve", duration: 0.5 };
-    /* --- Vita-style motion / look effects --- */
     case "shake":
       return { intensity: 0.06, speed: 8, direction: "both", duration: 0 };
     case "wiggle":
@@ -448,6 +447,41 @@ export function previewVideoStyle(
           // matching the export's crop + aspect-preserving scale + pad.
           objectViewBox = `inset(${top.toFixed(3)}% ${right.toFixed(3)}% ${bottom.toFixed(3)}% ${left.toFixed(3)}%)`;
           objectFit = "contain";
+        }
+        break;
+      }
+      case "dream": {
+        const intensity = n(p, "intensity", 0.5);
+        if (intensity > 0.01) {
+          parts.push(`brightness(${1 + intensity * 0.15}) saturate(${1 + intensity * 0.3}) contrast(${1 - intensity * 0.05})`);
+        }
+        break;
+      }
+      case "magic": {
+        const intensity = n(p, "intensity", 0.3);
+        if (intensity > 0.01) {
+          parts.push(`hue-rotate(${intensity * 120}deg) saturate(${1 + intensity * 0.4})`);
+        }
+        break;
+      }
+      case "glow": {
+        const intensity = n(p, "intensity", 0.6);
+        if (intensity > 0.01) {
+          parts.push(`brightness(${1 + intensity * 0.2}) contrast(${1 + intensity * 0.1})`);
+        }
+        break;
+      }
+      case "cinematic": {
+        const intensity = n(p, "intensity", 0.5);
+        if (intensity > 0.01) {
+          parts.push(`contrast(${1 + intensity * 0.2}) saturate(${1 - intensity * 0.2})`);
+        }
+        break;
+      }
+      case "vhs": {
+        const intensity = n(p, "intensity", 5);
+        if (intensity > 0.01) {
+          parts.push("contrast(1.1) saturate(1.4) sepia(0.1)");
         }
         break;
       }

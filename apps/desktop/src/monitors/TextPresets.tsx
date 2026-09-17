@@ -21,7 +21,7 @@ export type TextPreset = {
   params: TextPresetParams;
 };
 
-/** Popular title styles (VITA-style gallery). Colors are #RRGGBB[AA] so
+/** Popular title styles (style gallery). Colors are #RRGGBB[AA] so
  * preview (CSS) and export (FFmpeg) read the same value. */
 export const TEXT_PRESETS: TextPreset[] = [
   { id: "clean", name: "Clean White", params: { size: 8, color: "#FFFFFF", y: 0.55, box: false, shadow: true } },

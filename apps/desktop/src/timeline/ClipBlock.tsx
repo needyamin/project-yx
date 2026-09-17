@@ -10,12 +10,12 @@ import type { TimelineView } from "./useTimelineView";
 
 export type ClipEditAction =
   | {
-      type: "move";
-      clipId: string;
-      newStart: number;
-      /** When set, drop the clip onto this track (cross-track move). */
-      targetTrackId?: string | null;
-    }
+    type: "move";
+    clipId: string;
+    newStart: number;
+    /** When set, drop the clip onto this track (cross-track move). */
+    targetTrackId?: string | null;
+  }
   | { type: "trim"; clipId: string; inPoint: number; outPoint: number; keepEnd: boolean }
   | { type: "razor"; clipId: string; at: number }
   | { type: "rippleTrim"; clipId: string; edge: "left" | "right"; newEdgeTime: number }
@@ -508,7 +508,7 @@ function ClipBlockImpl({
       }}
       title={`${fileName(clip.media_path)} — drag to move · corners for fade · right-click for tools`}
     >
-      {/* Kdenlive-style Fade Ramps with Diagonal Stroke Lines */}
+      {/*style Fade Ramps with Diagonal Stroke Lines */}
       {fadeInPx > 1 && (
         <div
           className="tl-fade tl-fade-in"
@@ -532,7 +532,7 @@ function ClipBlockImpl({
         </div>
       )}
 
-      {/* Left Trim Handle (Kdenlive Trim-In style) */}
+      {/* Left Trim Handle (Trim-In style) */}
       <span
         className={`tl-edge left ${dragMode === "trim-left" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "trim-left")}
@@ -541,7 +541,7 @@ function ClipBlockImpl({
         <span className="tl-edge-bar" aria-hidden />
       </span>
 
-      {/* Left Fade Handle (Kdenlive circular grab dot) */}
+      {/* Left Fade Handle ( circular grab dot) */}
       <span
         className={`tl-fade-handle left ${fadeIn > 0 ? "has-fade" : ""} ${dragMode === "fade-in" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "fade-in")}
@@ -554,7 +554,7 @@ function ClipBlockImpl({
         <small>{formatTime(dur)}</small>
       </div>
 
-      {/* Right Fade Handle (Kdenlive circular grab dot) */}
+      {/* Right Fade Handle ( circular grab dot) */}
       <span
         className={`tl-fade-handle right ${fadeOut > 0 ? "has-fade" : ""} ${dragMode === "fade-out" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "fade-out")}
@@ -562,7 +562,7 @@ function ClipBlockImpl({
         style={{ right: fadeOutPx }}
       />
 
-      {/* Right Trim Handle (Kdenlive Trim-Out style) */}
+      {/* Right Trim Handle ( Trim-Out style) */}
       <span
         className={`tl-edge right ${dragMode === "trim-right" ? "active" : ""}`}
         onPointerDown={(e) => beginDrag(e, "trim-right")}
@@ -571,7 +571,7 @@ function ClipBlockImpl({
         <span className="tl-edge-bar" aria-hidden />
       </span>
 
-      {/* Floating Kdenlive HUD tooltips during resize or fade */}
+      {/* Floating  HUD tooltips during resize or fade */}
       {dragMode === "trim-left" && (
         <div className="tl-hud tl-hud-edge left">
           <span className="tl-hud-title">In: {formatTime(inPoint)}</span>

@@ -42,7 +42,7 @@ pub enum MediaRole {
     Audio,
 }
 
-/// Timeline edit tool mode (Kdenlive-style insert / overwrite).
+/// Timeline edit tool mode (style insert / overwrite).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EditMode {
@@ -210,6 +210,23 @@ pub enum FilterKind {
     // alias keeps timelines saved with the old snake_case name loading.
     #[serde(rename = "magicremove", alias = "magic_remove")]
     MagicRemove,
+    Dream,
+    Magic,
+    Shake,
+    Wiggle,
+    Bounce,
+    Zoompulse,
+    Zoomin,
+    Spin,
+    Motionblur,
+    Rgbsplit,
+    Glitch,
+    Flash,
+    Pulse,
+    Glow,
+    Neon,
+    Vhs,
+    Cinematic,
 }
 
 impl FilterKind {
@@ -310,6 +327,23 @@ impl FilterKind {
                 "renderKey": "",
                 "resultPath": ""
             }),
+            Self::Dream => serde_json::json!({ "intensity": 0.5, "duration": 0.0 }),
+            Self::Magic => serde_json::json!({ "intensity": 0.3, "speed": 0.25, "duration": 0.0 }),
+            Self::Shake => serde_json::json!({ "intensity": 0.06, "speed": 8.0, "direction": "both", "duration": 0.0 }),
+            Self::Wiggle => serde_json::json!({ "intensity": 0.03, "speed": 20.0, "duration": 0.0 }),
+            Self::Bounce => serde_json::json!({ "intensity": 0.08, "speed": 2.0, "duration": 0.0 }),
+            Self::Zoompulse => serde_json::json!({ "intensity": 0.15, "speed": 2.0, "duration": 0.0 }),
+            Self::Zoomin => serde_json::json!({ "intensity": 0.3, "duration": 5.0, "direction": "in" }),
+            Self::Spin => serde_json::json!({ "speed": 0.25, "duration": 3.0, "direction": "cw" }),
+            Self::Motionblur => serde_json::json!({ "intensity": 2.0, "duration": 0.0 }),
+            Self::Rgbsplit => serde_json::json!({ "intensity": 6.0, "direction": "horizontal", "duration": 0.0 }),
+            Self::Glitch => serde_json::json!({ "intensity": 8.0, "speed": 2.0, "duration": 0.0 }),
+            Self::Flash => serde_json::json!({ "intensity": 0.25, "speed": 2.0, "duration": 0.0 }),
+            Self::Pulse => serde_json::json!({ "intensity": 0.12, "speed": 2.0, "duration": 0.0 }),
+            Self::Glow => serde_json::json!({ "intensity": 0.6, "duration": 0.0 }),
+            Self::Neon => serde_json::json!({ "intensity": 0.5, "speed": 0.25, "duration": 0.0 }),
+            Self::Vhs => serde_json::json!({ "intensity": 5.0, "duration": 0.0 }),
+            Self::Cinematic => serde_json::json!({ "intensity": 0.5, "duration": 0.0 }),
         }
     }
 }
@@ -564,7 +598,7 @@ pub enum EditCommand {
         clip_id: ClipId,
         filter_id: Uuid,
     },
-    /// Set Kdenlive-style fade-in / fade-out durations (seconds).
+    /// Set style fade-in / fade-out durations (seconds).
     SetClipFades {
         clip_id: ClipId,
         fade_in: f64,

@@ -204,7 +204,7 @@
   transition: background 0.12s ease, height 0.12s ease, box-shadow 0.12s ease;
 }
 
-/* In Kdenlive, left edge is green (trim-in) and right edge is red (trim-out) */
+/* In left edge is green (trim-in) and right edge is red (trim-out) */
 .tl-edge.left:hover,
 .tl-edge.left.active {
   background: rgba(46, 204, 113, 0.4);
@@ -240,23 +240,19 @@
 
 .tl-fade-in {
   left: 0;
-  background: linear-gradient(
-    135deg,
-    rgba(255, 71, 87, 0.3) 0%,
-    rgba(0, 0, 0, 0.55) 75%,
-    transparent 100%
-  );
+  background: linear-gradient(135deg,
+      rgba(255, 71, 87, 0.3) 0%,
+      rgba(0, 0, 0, 0.55) 75%,
+      transparent 100%);
   clip-path: polygon(0 0, 100% 0, 0 100%);
 }
 
 .tl-fade-out {
   right: 0;
-  background: linear-gradient(
-    -135deg,
-    rgba(255, 71, 87, 0.3) 0%,
-    rgba(0, 0, 0, 0.55) 75%,
-    transparent 100%
-  );
+  background: linear-gradient(-135deg,
+      rgba(255, 71, 87, 0.3) 0%,
+      rgba(0, 0, 0, 0.55) 75%,
+      transparent 100%);
   clip-path: polygon(100% 0, 0 0, 100% 100%);
 }
 
@@ -269,7 +265,7 @@
   pointer-events: none;
 }
 
-/* Kdenlive-style circular fade grab dots at top corners */
+/* style circular fade grab dots at top corners */
 .tl-fade-handle {
   position: absolute;
   top: 0;
@@ -291,7 +287,7 @@
   transform: translate(50%, -50%);
 }
 
-/* In Kdenlive, fade dots are revealed on clip hover, or remain visible when active/has fade */
+/* In fade dots are revealed on clip hover, or remain visible when active/has fade */
 .tl-clip:hover .tl-fade-handle,
 .tl-fade-handle.has-fade,
 .tl-fade-handle.active {
@@ -312,7 +308,7 @@
   transform: translate(50%, -50%) scale(1.35);
 }
 
-/* Floating Kdenlive HUD tooltips during resize or fade */
+/* Floating HUD tooltips during resize or fade */
 .tl-hud {
   position: absolute;
   z-index: 100;
@@ -904,13 +900,11 @@ body.resizing-tl-headers {
   position: absolute;
   top: 0;
   bottom: 0;
-  background: repeating-linear-gradient(
-    -45deg,
-    rgba(239, 68, 68, 0.32),
-    rgba(239, 68, 68, 0.32) 8px,
-    rgba(239, 68, 68, 0.18) 8px,
-    rgba(239, 68, 68, 0.18) 16px
-  );
+  background: repeating-linear-gradient(-45deg,
+      rgba(239, 68, 68, 0.32),
+      rgba(239, 68, 68, 0.32) 8px,
+      rgba(239, 68, 68, 0.18) 8px,
+      rgba(239, 68, 68, 0.18) 16px);
   border-right: 2px solid #ef4444;
 }
 

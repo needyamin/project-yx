@@ -424,6 +424,43 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     ));
                 }
             }
+            "dream" => {
+                let intensity = num(p, "intensity", 0.5).clamp(0.0, 1.0);
+                if intensity > 0.01 {
+                    let b = intensity * 0.08;
+                    let s = 1.0 + intensity * 0.25;
+                    parts.push(format!("eq=brightness={b:.3}:saturation={s:.3}"));
+                }
+            }
+            "magic" => {
+                let intensity = num(p, "intensity", 0.3).clamp(0.0, 1.0);
+                if intensity > 0.01 {
+                    let deg = intensity * 120.0;
+                    parts.push(format!("hue=h={deg:.1}"));
+                }
+            }
+            "glow" => {
+                let intensity = num(p, "intensity", 0.6).clamp(0.0, 1.0);
+                if intensity > 0.01 {
+                    let b = intensity * 0.12;
+                    let c = 1.0 + intensity * 0.1;
+                    parts.push(format!("eq=brightness={b:.3}:contrast={c:.3}"));
+                }
+            }
+            "cinematic" => {
+                let intensity = num(p, "intensity", 0.5).clamp(0.0, 1.0);
+                if intensity > 0.01 {
+                    let c = 1.0 + intensity * 0.2;
+                    let s = (1.0 - intensity * 0.15).max(0.1);
+                    parts.push(format!("eq=contrast={c:.3}:saturation={s:.3}"));
+                }
+            }
+            "vhs" => {
+                let intensity = num(p, "intensity", 5.0).clamp(0.0, 10.0);
+                if intensity > 0.01 {
+                    parts.push("eq=contrast=1.1:saturation=1.3:gamma_r=1.05:gamma_b=0.95".into());
+                }
+            }
             _ => {}
         }
     }

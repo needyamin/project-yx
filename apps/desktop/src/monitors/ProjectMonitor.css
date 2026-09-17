@@ -14,7 +14,7 @@
   cursor: crosshair;
 }
 
-/* Direct manipulation (Kdenlive / VN style): pointer drags never scroll or
+/* Direct manipulation (VN style): pointer drags never scroll or
    trigger browser gestures, and the whole frame shows a grabbing cursor
    while a transform drag is in flight. */
 .monitor-frame {
@@ -26,7 +26,7 @@
   cursor: grabbing !important;
 }
 
-/* Overlay layers composite ABOVE the main preview (VITA PiP): transparent
+/* Overlay layers composite ABOVE the main preview: transparent
    background so the base video shows through; pointer-events off — gestures
    route through the frame to the selected clip. z 3 = above main (z2),
    below crop UI. */
@@ -726,7 +726,7 @@
   cursor: pointer;
 }
 
-.magic-modes button + button {
+.magic-modes button+button {
   border-left: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -747,7 +747,7 @@
   white-space: nowrap;
 }
 
-.magic-slider > span:first-child {
+.magic-slider>span:first-child {
   color: #b3aac6;
   min-width: 42px;
   text-align: right;
@@ -855,4 +855,3 @@
   color: #a99fc0;
   font-size: 10.5px;
 }
-

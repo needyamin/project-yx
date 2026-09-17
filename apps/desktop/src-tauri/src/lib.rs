@@ -145,7 +145,8 @@ async fn add_media_to_timeline(
 
 /// First visible, unlocked track of `kind` whose time range at
 /// [start, start + dur) is completely free — or `TrackId::nil()` when every
-/// candidate is busy (the caller then adds a fresh track, VITA-style).
+/// candidate is busy (the caller then adds a fresh track, style).
+#[allow(dead_code)]
 fn first_free_track(
     timeline: &Timeline,
     kind: TrackKind,
@@ -193,47 +194,28 @@ fn place_media_on_timeline(
     };
     let source = media_path.clone();
     let path = playback_path(state, &media_path);
+    let mut actual_start = start;
     let mut editor = state.editor.lock();
 
-    // VITA-style stacking: visual media lands ABOVE the topmost video track
-    // occupied at the drop range, so it always renders in front of existing
-    // content; a fresh track is added when nothing free remains above it.
-    // (Array order is the compositing order: first video track = bottom.)
+    // Visual media: place on the same track at the end (or requested start if free).
+    // Do not open multiple tracks when adding clips to the timeline.
     if info.has_video {
-        let video_track = {
+        let (primary_track, track_end) = {
             let timeline = editor.timeline();
-            let video_tracks: Vec<(usize, TrackId)> = timeline
+            let primary = timeline
                 .tracks
                 .iter()
-                .enumerate()
-                .filter(|(_, t)| t.kind == TrackKind::Video && !t.hidden && !t.locked)
-                .map(|(i, t)| (i, t.id))
-                .collect();
-            let occupied_at = |tid: &TrackId| -> bool {
-                timeline
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == *tid)
-                    .map(|t| {
-                        t.clips
-                            .iter()
-                            .any(|c| !(c.end() <= start + 1e-6 || c.start >= start + out_point - 1e-6))
-                    })
-                    .unwrap_or(false)
-            };
-            let top_occupied = video_tracks
-                .iter()
-                .filter(|(_, tid)| occupied_at(tid))
-                .map(|(i, _)| *i)
-                .max();
-            video_tracks
-                .iter()
-                .filter(|(i, _)| top_occupied.map_or(true, |top| *i > top))
-                .find(|(_, tid)| !occupied_at(tid))
-                .map(|(_, tid)| *tid)
-                .unwrap_or_default()
+                .find(|t| t.kind == TrackKind::Video && !t.hidden && !t.locked);
+            match primary {
+                Some(t) => {
+                    let end = t.clips.iter().map(|c| c.end()).fold(0.0, f64::max);
+                    (t.id, end)
+                }
+                None => (TrackId::nil(), 0.0),
+            }
         };
-        let video_track = if video_track.is_nil() {
+
+        let video_track = if primary_track.is_nil() {
             editor
                 .apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
                 .map_err(|e| e.to_string())?;
@@ -246,17 +228,36 @@ fn place_media_on_timeline(
                 .map(|t| t.id)
                 .ok_or_else(|| "no video track".to_string())?
         } else {
-            video_track
+            let occupied = {
+                let timeline = editor.timeline();
+                timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == primary_track)
+                    .map(|t| {
+                        t.clips
+                            .iter()
+                            .any(|c| !(c.end() <= actual_start + 1e-6 || c.start >= actual_start + out_point - 1e-6))
+                    })
+                    .unwrap_or(false)
+            };
+            if occupied {
+                actual_start = track_end;
+            }
+            primary_track
         };
 
         if info.has_audio {
-            // Linked audio: prefer a free audio track so the sound lands at
-            // the drop point instead of stacking on existing music.
-            let audio_track = {
+            let primary_audio = {
                 let timeline = editor.timeline();
-                first_free_track(timeline, TrackKind::Audio, start, out_point)
+                timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.kind == TrackKind::Audio && !t.hidden && !t.locked)
+                    .map(|t| t.id)
+                    .unwrap_or_default()
             };
-            let audio_track = if audio_track.is_nil() {
+            let audio_track = if primary_audio.is_nil() {
                 editor
                     .apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
                     .map_err(|e| e.to_string())?;
@@ -269,7 +270,7 @@ fn place_media_on_timeline(
                     .map(|t| t.id)
                     .ok_or_else(|| "no audio track".to_string())?
             } else {
-                audio_track
+                primary_audio
             };
             editor
                 .apply(EditCommand::AddAvPair {
@@ -277,7 +278,7 @@ fn place_media_on_timeline(
                     audio_track_id: audio_track,
                     media_path: path,
                     source_path: Some(source),
-                    start,
+                    start: actual_start,
                     in_point: 0.0,
                     out_point,
                 })
@@ -288,7 +289,7 @@ fn place_media_on_timeline(
                     track_id: video_track,
                     media_path: path,
                     source_path: Some(source),
-                    start,
+                    start: actual_start,
                     in_point: 0.0,
                     out_point,
                     role: MediaRole::Video,
@@ -297,32 +298,57 @@ fn place_media_on_timeline(
                 .map_err(|e| e.to_string())?;
         }
     } else if info.has_audio {
-        // Voiceovers/overdubs: first FREE audio track at the drop point; when
-        // every track is busy (e.g. voiceover over a full music bed), add a
-        // fresh track instead of stacking invisibly on existing clips.
-        let mut audio_track = {
+        let (primary_audio, audio_end) = {
             let timeline = editor.timeline();
-            first_free_track(timeline, TrackKind::Audio, start, out_point)
+            let primary = timeline
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio && !t.hidden && !t.locked);
+            match primary {
+                Some(t) => {
+                    let end = t.clips.iter().map(|c| c.end()).fold(0.0, f64::max);
+                    (t.id, end)
+                }
+                None => (TrackId::nil(), 0.0),
+            }
         };
-        if audio_track.is_nil() {
+        let audio_track = if primary_audio.is_nil() {
             editor
                 .apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
                 .map_err(|e| e.to_string())?;
-            audio_track = editor
+            editor
                 .timeline()
                 .tracks
                 .iter()
                 .filter(|t| t.kind == TrackKind::Audio)
                 .last()
                 .map(|t| t.id)
-                .ok_or_else(|| "no audio track".to_string())?;
-        }
+                .ok_or_else(|| "no audio track".to_string())?
+        } else {
+            let occupied = {
+                let timeline = editor.timeline();
+                timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == primary_audio)
+                    .map(|t| {
+                        t.clips
+                            .iter()
+                            .any(|c| !(c.end() <= actual_start + 1e-6 || c.start >= actual_start + out_point - 1e-6))
+                    })
+                    .unwrap_or(false)
+            };
+            if occupied {
+                actual_start = audio_end;
+            }
+            primary_audio
+        };
         editor
             .apply(EditCommand::AddClip {
                 track_id: audio_track,
                 media_path: path,
                 source_path: Some(source),
-                start,
+                start: actual_start,
                 in_point: 0.0,
                 out_point,
                 role: MediaRole::Audio,
@@ -801,6 +827,23 @@ fn parse_filter_kind(kind: &str) -> Result<FilterKind, String> {
         "transition" => FilterKind::Transition,
         "deesser" => FilterKind::Deesser,
         "magicremove" => FilterKind::MagicRemove,
+        "dream" => FilterKind::Dream,
+        "magic" => FilterKind::Magic,
+        "shake" => FilterKind::Shake,
+        "wiggle" => FilterKind::Wiggle,
+        "bounce" => FilterKind::Bounce,
+        "zoompulse" => FilterKind::Zoompulse,
+        "zoomin" => FilterKind::Zoomin,
+        "spin" => FilterKind::Spin,
+        "motionblur" => FilterKind::Motionblur,
+        "rgbsplit" => FilterKind::Rgbsplit,
+        "glitch" => FilterKind::Glitch,
+        "flash" => FilterKind::Flash,
+        "pulse" => FilterKind::Pulse,
+        "glow" => FilterKind::Glow,
+        "neon" => FilterKind::Neon,
+        "vhs" => FilterKind::Vhs,
+        "cinematic" => FilterKind::Cinematic,
         other => return Err(format!("unknown filter: {other}")),
     })
 }
@@ -1008,7 +1051,7 @@ fn collect_export_segments(
     proxies: &ProxyManager,
 ) -> Vec<ExportSegment> {
     // Video: every visible track, in track order (first track = bottom layer,
-    // later tracks composite on top = VITA-style overlays). Audio: all
+    // later tracks composite on top = style overlays). Audio: all
     // unmuted/visible tracks so FX on A2+ still export.
     let tracks: Vec<_> = timeline
         .tracks
@@ -1084,6 +1127,23 @@ fn collect_export_segments(
                         FilterKind::Transition => "transition",
                         FilterKind::Deesser => "deesser",
                         FilterKind::MagicRemove => "magicremove",
+                        FilterKind::Dream => "dream",
+                        FilterKind::Magic => "magic",
+                        FilterKind::Shake => "shake",
+                        FilterKind::Wiggle => "wiggle",
+                        FilterKind::Bounce => "bounce",
+                        FilterKind::Zoompulse => "zoompulse",
+                        FilterKind::Zoomin => "zoomin",
+                        FilterKind::Spin => "spin",
+                        FilterKind::Motionblur => "motionblur",
+                        FilterKind::Rgbsplit => "rgbsplit",
+                        FilterKind::Glitch => "glitch",
+                        FilterKind::Flash => "flash",
+                        FilterKind::Pulse => "pulse",
+                        FilterKind::Glow => "glow",
+                        FilterKind::Neon => "neon",
+                        FilterKind::Vhs => "vhs",
+                        FilterKind::Cinematic => "cinematic",
                     }
                     .into(),
                     enabled: f.enabled,

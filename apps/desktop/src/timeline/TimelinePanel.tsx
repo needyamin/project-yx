@@ -58,7 +58,7 @@ type Props = {
   onTool: (t: TimelineTool) => void;
   onTimeline: (t: Timeline) => void;
   onSelectClip: (id: string | null) => void;
-  onSeek: (t: number) => void;
+  onSeek: (t: number, immediate?: boolean) => void;
   onStatus: (s: string) => void;
   onEditMode: (m: EditMode) => void;
   onSetZoneIn: () => void;
@@ -656,8 +656,8 @@ export function TimelinePanel({
         hoverTrack && !hoverTrack.hidden
           ? hoverTrack
           : tl.tracks.find((t) => t.kind === preferKind && !t.hidden) ??
-            tl.tracks.find((t) => !t.hidden) ??
-            tl.tracks[0];
+          tl.tracks.find((t) => !t.hidden) ??
+          tl.tracks[0];
       if (!track) {
         setBinDropPreview(null);
         return;
@@ -689,7 +689,7 @@ export function TimelinePanel({
     [tool, onSeek],
   );
 
-  /** Kdenlive-style scrub: press and drag moves the playhead (rAF batched). */
+  /**style scrub: press and drag moves the playhead (rAF batched). */
   const beginScrub = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (tool === "spacer") return;
@@ -700,10 +700,12 @@ export function TimelinePanel({
 
       let raf = 0;
       let pendingX: number | null = null;
-      const seekAt = (clientX: number) => {
-        onSeek(timeFromClientXRef.current(clientX));
+      let lastX = e.clientX;
+      const seekAt = (clientX: number, immediate: boolean) => {
+        lastX = clientX;
+        onSeek(timeFromClientXRef.current(clientX), immediate);
       };
-      seekAt(e.clientX);
+      seekAt(e.clientX, true);
 
       const onMoveWin = (ev: PointerEvent) => {
         pendingX = ev.clientX;
@@ -711,7 +713,7 @@ export function TimelinePanel({
           raf = requestAnimationFrame(() => {
             raf = 0;
             if (pendingX != null) {
-              seekAt(pendingX);
+              seekAt(pendingX, false);
               pendingX = null;
             }
           });
@@ -726,6 +728,7 @@ export function TimelinePanel({
           raf = 0;
         }
         pendingX = null;
+        seekAt(lastX, true);
         viewRef.current.showSnapGuide(null);
       };
       window.addEventListener("pointermove", onMoveWin);
@@ -880,7 +883,7 @@ export function TimelinePanel({
     return track.kind === "video" ? 64 : 48;
   }
 
-  /** Rows render top→bottom as FRONT→BACK (VITA/NLE convention): the highest
+  /** Rows render top→bottom as FRONT→BACK (NLE convention): the highest
    * video track is the topmost row and composites in front; audio tracks sit
    * below. The engine stacks array order bottom→top, so this keeps "visually
    * higher = renders in front" true everywhere. */
@@ -1023,16 +1026,16 @@ export function TimelinePanel({
           const ph = playheadRef.current;
           const clip =
             selectedClip &&
-            ph > selectedClip.start &&
-            ph < selectedClip.start + clipTimelineDuration(selectedClip)
+              ph > selectedClip.start &&
+              ph < selectedClip.start + clipTimelineDuration(selectedClip)
               ? selectedClip
               : timeline.tracks
-                  .flatMap((t) => t.clips.map((c) => ({ track: t, clip: c })))
-                  .find(({ track, clip: c }) => {
-                    if (track.locked) return false;
-                    const end = c.start + clipTimelineDuration(c);
-                    return ph > c.start && ph < end;
-                  })?.clip;
+                .flatMap((t) => t.clips.map((c) => ({ track: t, clip: c })))
+                .find(({ track, clip: c }) => {
+                  if (track.locked) return false;
+                  const end = c.start + clipTimelineDuration(c);
+                  return ph > c.start && ph < end;
+                })?.clip;
           if (!clip) {
             onStatus("Playhead must be inside a clip");
             return;
@@ -1126,45 +1129,45 @@ export function TimelinePanel({
           {displayTracks.map((track) => {
             const sameKind = timeline.tracks.filter((t) => t.kind === track.kind).length;
             return (
-            <TrackHeaderMemo
-              key={track.id}
-              track={track}
-              height={trackHeight(track)}
-              canDelete={sameKind > 1}
-              onMute={() =>
-                void run("set_track_mute", {
-                  trackId: track.id,
-                  muted: !track.muted,
-                })
-              }
-              onLock={() =>
-                void run("set_track_lock", {
-                  trackId: track.id,
-                  locked: !track.locked,
-                })
-              }
-              onHide={() =>
-                void run(
-                  "set_track_hidden",
-                  {
+              <TrackHeaderMemo
+                key={track.id}
+                track={track}
+                height={trackHeight(track)}
+                canDelete={sameKind > 1}
+                onMute={() =>
+                  void run("set_track_mute", {
                     trackId: track.id,
-                    hidden: !track.hidden,
-                  },
-                  track.hidden ? `Show ${track.name}` : `Hide ${track.name}`,
-                )
-              }
-              onDelete={() => {
-                if (
-                  !window.confirm(
-                    `Delete track ${track.name}? Clips on this track will be removed.`,
-                  )
-                ) {
-                  return;
+                    muted: !track.muted,
+                  })
                 }
-                void run("remove_track", { trackId: track.id }, `Deleted ${track.name}`);
-              }}
-              onContextMenu={handleTrackContext(track, sameKind > 1 && !track.locked)}
-            />
+                onLock={() =>
+                  void run("set_track_lock", {
+                    trackId: track.id,
+                    locked: !track.locked,
+                  })
+                }
+                onHide={() =>
+                  void run(
+                    "set_track_hidden",
+                    {
+                      trackId: track.id,
+                      hidden: !track.hidden,
+                    },
+                    track.hidden ? `Show ${track.name}` : `Hide ${track.name}`,
+                  )
+                }
+                onDelete={() => {
+                  if (
+                    !window.confirm(
+                      `Delete track ${track.name}? Clips on this track will be removed.`,
+                    )
+                  ) {
+                    return;
+                  }
+                  void run("remove_track", { trackId: track.id }, `Deleted ${track.name}`);
+                }}
+                onContextMenu={handleTrackContext(track, sameKind > 1 && !track.locked)}
+              />
             );
           })}
         </div>
@@ -1331,8 +1334,8 @@ export function TimelinePanel({
             const clip =
               ctxMenu.target.kind === "clip"
                 ? timeline.tracks
-                    .flatMap((tr) => tr.clips)
-                    .find((c) => c.id === clipId)
+                  .flatMap((tr) => tr.clips)
+                  .find((c) => c.id === clipId)
                 : selectedClip;
             if (!clip) return;
             const end = clip.start + clipTimelineDuration(clip);

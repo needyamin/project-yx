@@ -759,14 +759,6 @@ button:disabled {
   z-index: 1;
 }
 
-.monitor-video.is-front {
-  z-index: 2;
-}
-
-.monitor-video.is-back {
-  visibility: hidden;
-}
-
 .monitor-empty,
 .monitor-audio-only {
   position: absolute;

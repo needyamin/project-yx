@@ -30,9 +30,9 @@ type Props = {
   onToggleLink: () => void;
   onRippleDelete: () => void;
   onSplitAtPlayhead: () => void;
-  /** Kdenlive: Remove Space in All Tracks (at playhead). */
+  /** Remove Space in All Tracks (at playhead). */
   onRemoveSpaceAllTracks: () => void;
-  /** Kdenlive: Remove All Spaces After Cursor (all tracks from playhead). */
+  /**Remove All Spaces After Cursor (all tracks from playhead). */
   onRemoveAllSpacesAfterCursor: () => void;
   onUndo: () => void;
   onRedo: () => void;

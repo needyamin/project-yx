@@ -102,6 +102,7 @@ impl MagicJob {
     /// Stable hash for the sidecar cache key.
     pub fn cache_hash(&self, include_keyframes: bool) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        "magic_v3".hash(&mut h);
         self.source.display().to_string().hash(&mut h);
         for s in &self.strokes {
             for p in &s.points {
@@ -191,39 +192,37 @@ pub fn rasterize_mask(
     mask
 }
 
-/// Separable box blur on a u8 alpha buffer (radius in px, approximated with
-/// two passes for a soft falloff).
+/// Separable box blur on a u8 alpha buffer (radius in px).
 fn blur_u8(src: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
     if radius == 0 || w == 0 || h == 0 {
         return src.to_vec();
     }
-    let mut tmp = vec![0u32; w * h];
-    // Horizontal
+    let r = radius as i64;
+    let mut tmp = vec![0u8; w * h];
     for y in 0..h {
         let row = y * w;
-        let mut acc: u32 = 0;
-        for x in 0..w.min(radius + 1) {
-            acc += src[row + x] as u32;
-        }
         for x in 0..w {
-            let add_x = (x + radius + 1).min(w - 1);
-            let sub_x = x.saturating_sub(radius);
-            tmp[row + x] = acc;
-            acc = acc + src[row + add_x] as u32 - src[row + sub_x] as u32;
+            let x0 = (x as i64 - r).max(0) as usize;
+            let x1 = (x as i64 + r).min(w as i64 - 1) as usize;
+            let count = (x1 - x0 + 1) as u32;
+            let mut sum: u32 = 0;
+            for k in x0..=x1 {
+                sum += src[row + k] as u32;
+            }
+            tmp[row + x] = (sum / count) as u8;
         }
     }
     let mut out = vec![0u8; w * h];
-    let win = ((radius * 2 + 1) as u32).min((h as u32).max(1));
     for x in 0..w {
-        let mut acc: u32 = 0;
-        for y in 0..h.min(radius + 1) {
-            acc += tmp[y * w + x];
-        }
         for y in 0..h {
-            let add_y = (y + radius + 1).min(h - 1);
-            let sub_y = y.saturating_sub(radius);
-            out[y * w + x] = (acc / win).min(255) as u8;
-            acc = acc + tmp[add_y * w + x] - tmp[sub_y * w + x];
+            let y0 = (y as i64 - r).max(0) as usize;
+            let y1 = (y as i64 + r).min(h as i64 - 1) as usize;
+            let count = (y1 - y0 + 1) as u32;
+            let mut sum: u32 = 0;
+            for k in y0..=y1 {
+                sum += tmp[k * w + x] as u32;
+            }
+            out[y * w + x] = (sum / count) as u8;
         }
     }
     out
@@ -271,6 +270,24 @@ fn dilate_bool(mask: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
 /// pixels become 0).
 fn shift_buffer(src: &[u8], w: usize, h: usize, sx: i64, sy: i64) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        let ny = y as i64 - sy;
+        if ny < 0 || ny >= h as i64 {
+            continue;
+        }
+        for x in 0..w {
+            let nx = x as i64 - sx;
+            if nx < 0 || nx >= w as i64 {
+                continue;
+            }
+            out[y * w + x] = src[ny as usize * w + nx as usize];
+        }
+    }
+    out
+}
+
+fn shift_buffer_bool(src: &[bool], w: usize, h: usize, sx: i64, sy: i64) -> Vec<bool> {
+    let mut out = vec![false; w * h];
     for y in 0..h {
         let ny = y as i64 - sy;
         if ny < 0 || ny >= h as i64 {
@@ -536,7 +553,7 @@ pub fn track_mask(
                 let nx = px as i64 + off.0;
                 let ny = py as i64 + off.1;
                 if nx >= 0 && ny >= 0 && nx < tw as i64 && ny < th as i64 {
-                    refresh[i] = gray[ny as usize * tw as usize + px as usize];
+                    refresh[i] = gray[ny as usize * tw as usize + nx as usize];
                 }
             }
             since_refresh = 0;
@@ -767,7 +784,12 @@ pub fn render_inpaint(
     let dilated = dilate_bool(&binary0, w, h, expand_px);
     let mut alpha0: Vec<u8> = dilated.iter().map(|v| if *v { 255u8 } else { 0u8 }).collect();
     if feather_px > 0 {
-        alpha0 = blur_u8(&alpha0, w, h, feather_px);
+        let blurred = blur_u8(&alpha0, w, h, feather_px);
+        // The core of the mask MUST remain 255 (100% removal).
+        // The blurred fringe extends outward for a smooth boundary.
+        for i in 0..alpha0.len() {
+            alpha0[i] = if dilated[i] { 255 } else { blurred[i] };
+        }
     }
     let binary_for_fill = dilated;
     if !binary_for_fill.iter().any(|v| *v) {
@@ -841,7 +863,7 @@ pub fn render_inpaint(
     }
 
     let strength = job.strength.clamp(0.0, 1.0);
-    let max_dist = (w.min(h) as i64 / 4).max(8);
+    let max_dist = (w.max(h) as i64).max(64);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -875,11 +897,13 @@ pub fn render_inpaint(
         let (fdx, fdy) = offset_at(&job.keyframes, fi as f64 / fps);
         let sx = (fdx * w as f64).round() as i64;
         let sy = (fdy * h as f64).round() as i64;
-        let alpha: &[u8] = if sx == 0 && sy == 0 {
-            &alpha0
+        let shifted_binary: Option<Vec<bool>>;
+        let (alpha, binary_ref): (&[u8], &[bool]) = if sx == 0 && sy == 0 {
+            (&alpha0, &binary_for_fill)
         } else {
             shifted = shift_buffer(&alpha0, w, h, sx, sy);
-            &shifted
+            shifted_binary = Some(shift_buffer_bool(&binary_for_fill, w, h, sx, sy));
+            (&shifted, shifted_binary.as_ref().unwrap())
         };
 
         let mut out_frame = cur.clone();
@@ -923,7 +947,7 @@ pub fn render_inpaint(
                 let base = done;
                 let cur = &*cur;
                 let alpha = alpha;
-                let binary = &binary_for_fill;
+                let binary = binary_ref;
                 let bg = &bg;
                 let bg_age = &bg_age;
                 s.spawn(move || {

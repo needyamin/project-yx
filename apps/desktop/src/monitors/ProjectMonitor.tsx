@@ -23,7 +23,7 @@ export type PreviewAspect = "landscape" | "tiktok";
 export type CropRect = { left: number; top: number; right: number; bottom: number };
 
 /** A video-track clip UNDER the playhead that renders beneath the main
- * (top-most) preview — the VITA-style overlay stack, bottom → top. */
+ * (top-most) preview — overlay stack, bottom → top. */
 export type MonitorLayerClip = {
   clip: Clip;
   src: string;
@@ -40,8 +40,8 @@ type Props = {
   aspect: PreviewAspect;
   onAspect: (a: PreviewAspect) => void;
   videoRef: RefObject<HTMLVideoElement | null>;
-  /** Hidden second video used to preload the next clip for gapless cuts. */
-  shadowVideoRef: RefObject<HTMLVideoElement | null>;
+  /** Optional hidden/secondary video ref preserved for backwards compatibility */
+  shadowVideoRef?: RefObject<HTMLVideoElement | null>;
   /** Still-image preview element (image/gif clips). */
   imageRef?: RefObject<HTMLImageElement | null>;
   /** When true the under-playhead visual is a still image, not a video. */
@@ -142,7 +142,7 @@ type Props = {
   /** Whether the project timeline contains any clips. */
   hasTimelineClips?: boolean;
   /** Overlay layers: video-track clips under the playhead ABOVE the base
-   * clip, composited on top of the main preview (VITA PiP stack). */
+   * clip, composited on top of the main preview (PiP stack). */
   layers?: MonitorLayerClip[];
   /** Selected timeline clip — when it is one of the layers, gestures target it. */
   selectedClipId?: string | null;
@@ -295,7 +295,6 @@ export function ProjectMonitor({
   aspect,
   onAspect,
   videoRef,
-  shadowVideoRef,
   imageRef,
   previewIsImage = false,
   audioRef,
@@ -431,10 +430,48 @@ export function ProjectMonitor({
     setActiveCrop(cropDraft ?? null);
   }, [cropDraft]);
 
-  // New media source: drop the stale natural size until metadata loads.
+  function activeVisualEl(): HTMLElement | null {
+    return previewIsImage
+      ? (imageRef?.current ?? null)
+      : (videoRef.current ?? null);
+  }
+
+  /** Natural size of the active visual, read live from the DOM element. */
+  function liveMediaSize(): { w: number; h: number } | null {
+    const el = activeVisualEl();
+    if (!el) return null;
+    if (el instanceof HTMLImageElement) {
+      return el.naturalWidth > 0 ? { w: el.naturalWidth, h: el.naturalHeight } : null;
+    }
+    const v = el as HTMLVideoElement;
+    return v.videoWidth > 0 ? { w: v.videoWidth, h: v.videoHeight } : null;
+  }
+
+  // New media source: preserve live element size if available, otherwise clear until metadata loads.
   useEffect(() => {
-    setMediaSize(null);
+    const live = liveMediaSize();
+    if (live) {
+      setMediaSize(live);
+    } else {
+      setMediaSize(null);
+    }
   }, [previewSrc]);
+
+  // Keep mediaSize synchronized directly from the DOM video element whenever it loads metadata.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const onMeta = () => {
+      if (v.videoWidth > 0 && v.videoHeight > 0) {
+        setMediaSize({ w: v.videoWidth, h: v.videoHeight });
+      }
+    };
+    if (v.videoWidth > 0 && v.videoHeight > 0) {
+      setMediaSize({ w: v.videoWidth, h: v.videoHeight });
+    }
+    v.addEventListener("loadedmetadata", onMeta);
+    return () => v.removeEventListener("loadedmetadata", onMeta);
+  }, [previewSrc, videoRef]);
 
   // Highlight while a library item is dragged over the monitor frame.
   useEffect(() => {
@@ -492,11 +529,12 @@ export function ProjectMonitor({
   }, [cropTool, activeCrop, cropDraft, onCropCommit, onCropTool]);
 
   const fit: FitMode = tiktok ? "cover" : "contain";
+  const effectiveMediaSize = mediaSize ?? liveMediaSize();
   const content: ContentRect = displayedContentRect(
     frameSize.w,
     frameSize.h,
-    mediaSize?.w ?? 0,
-    mediaSize?.h ?? 0,
+    effectiveMediaSize?.w ?? 0,
+    effectiveMediaSize?.h ?? 0,
     fit,
   );
 
@@ -535,29 +573,12 @@ export function ProjectMonitor({
    * the media handles so both never clutter the frame at once. */
   const textHandlesActive = textDraggable && !textEditing && (textHover || textDragging || textResizing);
   const handlesVisible =
-    transformEnabled && (manipulableLayer != null || !!mediaSize) && !textHandlesActive;
+    transformEnabled && (manipulableLayer != null || !!effectiveMediaSize) && !textHandlesActive;
   const currentOpacityPct = Math.round(
     (manipulableLayer
       ? (parseClipTransform(manipulableLayer.clip)?.opacity ?? 1)
       : (transformParams?.opacity ?? 1)) * 100,
   );
-
-  function activeVisualEl(): HTMLElement | null {
-    return previewIsImage
-      ? (imageRef?.current ?? null)
-      : (videoRef.current ?? null);
-  }
-
-  /** Natural size of the active visual, read live from the DOM element. */
-  function liveMediaSize(): { w: number; h: number } | null {
-    const el = activeVisualEl();
-    if (!el) return null;
-    if (el instanceof HTMLImageElement) {
-      return el.naturalWidth > 0 ? { w: el.naturalWidth, h: el.naturalHeight } : null;
-    }
-    const v = el as HTMLVideoElement;
-    return v.videoWidth > 0 ? { w: v.videoWidth, h: v.videoHeight } : null;
-  }
 
   /** Displayed content rect from live DOM state (accurate at gesture start). */
   function liveContent(): ContentRect {
@@ -652,7 +673,7 @@ export function ProjectMonitor({
     };
   }
 
-  /* --- Direct manipulation (Kdenlive / VN style): the layer under the
+  /* --- Direct manipulation ( VN style): the layer under the
      pointer is the gesture target — clicking an image selects it and the
      drag moves it in one press. No timeline selection round-trip. --- */
 
@@ -848,7 +869,8 @@ export function ProjectMonitor({
   }
 
   /** Corner-handle resize: drag outward/inward from the frame center. */
-  function beginScaleDrag(e: ReactPointerEvent) {    const target = resolveGestureTarget(e.clientX, e.clientY);
+  function beginScaleDrag(e: ReactPointerEvent) {
+    const target = resolveGestureTarget(e.clientX, e.clientY);
     if (!target) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1302,22 +1324,22 @@ export function ProjectMonitor({
     },
     ...(onRemoveTarget && removeTargetLabel
       ? ([
-          { type: "sep" as const },
-          {
-            type: "item" as const,
-            label: `Delete "${removeTargetLabel}" (Del)`,
-            action: () => onRemoveTarget(),
-          },
-        ] as ContextMenuItem[])
+        { type: "sep" as const },
+        {
+          type: "item" as const,
+          label: `Delete "${removeTargetLabel}" (Del)`,
+          action: () => onRemoveTarget(),
+        },
+      ] as ContextMenuItem[])
       : []),
     ...(onRemoveTitle && textOverlay
       ? ([
-          {
-            type: "item" as const,
-            label: "Remove title",
-            action: () => onRemoveTitle(),
-          },
-        ] as ContextMenuItem[])
+        {
+          type: "item" as const,
+          label: "Remove title",
+          action: () => onRemoveTitle(),
+        },
+      ] as ContextMenuItem[])
       : []),
     { type: "sep" },
     {
@@ -1349,12 +1371,12 @@ export function ProjectMonitor({
     },
     ...(onShowClipMonitor
       ? ([
-          {
-            type: "item" as const,
-            label: "Show Clip Monitor",
-            action: () => onShowClipMonitor(),
-          },
-        ] as ContextMenuItem[])
+        {
+          type: "item" as const,
+          label: "Show Clip Monitor",
+          action: () => onShowClipMonitor(),
+        },
+      ] as ContextMenuItem[])
       : []),
   ];
 
@@ -1376,21 +1398,21 @@ export function ProjectMonitor({
    * outline stroke, shadow) so the overlay is WYSIWYG. */
   const textStyle: React.CSSProperties = textOverlay
     ? {
-        left: `${50 + textOverlay.x * 50}%`,
-        top: `${50 + textOverlay.y * 50}%`,
-        transform: "translate(-50%, -50%)",
-        fontSize: `${Math.max(10, (textOverlay.size / 100) * frameSize.h)}px`,
-        color: textOverlay.color,
-        background: textOverlay.box
-          ? (textOverlay.boxcolor ?? "rgba(0,0,0,0.45)")
-          : "transparent",
-        textShadow:
-          textOverlay.shadow === false ? "none" : "3px 3px 6px rgba(0,0,0,0.55)",
-        WebkitTextStroke:
-          textOverlay.borderw && textOverlay.borderw > 0
-            ? `${Math.max(1, (textOverlay.borderw * frameSize.h) / 1080).toFixed(2)}px ${textOverlay.bordercolor ?? "#000000"}`
-            : undefined,
-      }
+      left: `${50 + textOverlay.x * 50}%`,
+      top: `${50 + textOverlay.y * 50}%`,
+      transform: "translate(-50%, -50%)",
+      fontSize: `${Math.max(10, (textOverlay.size / 100) * frameSize.h)}px`,
+      color: textOverlay.color,
+      background: textOverlay.box
+        ? (textOverlay.boxcolor ?? "rgba(0,0,0,0.45)")
+        : "transparent",
+      textShadow:
+        textOverlay.shadow === false ? "none" : "3px 3px 6px rgba(0,0,0,0.55)",
+      WebkitTextStroke:
+        textOverlay.borderw && textOverlay.borderw > 0
+          ? `${Math.max(1, (textOverlay.borderw * frameSize.h) / 1080).toFixed(2)}px ${textOverlay.bordercolor ?? "#000000"}`
+          : undefined,
+    }
     : {};
 
   return (
@@ -1504,7 +1526,7 @@ export function ProjectMonitor({
           onDoubleClick={onFrameDoubleClick}
           title={transformEnabled ? "Drag to move · wheel or corner handles to resize · double-click to reset" : undefined}
         >
-          {/* Overlay stack: video-track clips above the base clip (VITA
+          {/* Overlay stack: video-track clips above the base clip (
               PiP). Playback-synced, per-clip effects/fades/transform. */}
           {layers.map((l) => (
             <MonitorLayer
@@ -1518,28 +1540,16 @@ export function ProjectMonitor({
           ))}
           <video
             ref={videoRef}
-            className="monitor-video is-front"
+            className="monitor-video"
             playsInline
             muted
-            preload="metadata"
+            preload="auto"
             onClick={onVideoClick}
             onLoadedMetadata={(e) => onVisualMetadata(e.currentTarget)}
             style={{
               display: previewMode === "video" && previewSrc && !previewIsImage ? "block" : "none",
               cursor: chromakeyActive ? "crosshair" : transformEnabled ? "move" : undefined,
               background: layers.length > 0 ? "transparent" : undefined,
-            }}
-          />
-          {/* Buffer: preloads the next clip so cuts don't stall the pipeline. */}
-          <video
-            ref={shadowVideoRef}
-            className="monitor-video is-back"
-            playsInline
-            muted
-            preload="metadata"
-            onLoadedMetadata={(e) => onVisualMetadata(e.currentTarget)}
-            style={{
-              display: previewMode === "video" && previewSrc && !previewIsImage ? "block" : "none",
             }}
           />
           {/* Text filter overlay (WYSIWYG with drawtext export) */}
@@ -1960,7 +1970,7 @@ export function ProjectMonitor({
   );
 }
 
-/** An overlay clip composited ABOVE the main preview (VITA PiP layer).
+/** An overlay clip composited ABOVE the main preview (PiP layer).
  * Video layers play in sync with the main clock (muted — their audio lives
  * on the linked audio track); images are static. Per-clip filters, fades
  * and transform are applied exactly like the export composites them.
@@ -2068,6 +2078,7 @@ const MonitorLayer = memo(function MonitorLayer({
   return (
     <video
       ref={(el) => {
+        videoRef.current = el;
         registerEl(clip.id, el);
       }}
       className="monitor-layer"
