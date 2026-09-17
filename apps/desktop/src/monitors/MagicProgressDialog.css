@@ -1,0 +1,141 @@
+/* Magic Remove global progress window — floating card, non-modal. */
+
+.magic-progress-window {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 1400;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 380px;
+  max-width: min(92vw, 560px);
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(20, 17, 30, 0.97);
+  border: 1px solid rgba(183, 106, 240, 0.45);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(8px);
+  color: #ece6f6;
+  animation: mpw-in 0.18s ease-out;
+  pointer-events: auto;
+}
+
+@keyframes mpw-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+.mpw-icon {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(183, 106, 240, 0.18);
+  border: 1px solid rgba(183, 106, 240, 0.4);
+}
+
+.mpw-spin {
+  font-size: 16px;
+  animation: mpw-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes mpw-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.25);
+    opacity: 0.65;
+  }
+}
+
+.mpw-body {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.mpw-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f0e8fb;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mpw-track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.mpw-fill {
+  height: 100%;
+  min-width: 6px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8d4ddb, #b76af0);
+  transition: width 0.2s ease-out;
+}
+
+.mpw-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 10.5px;
+  color: #a99fc0;
+}
+
+.mpw-nums {
+  flex: none;
+  color: #8fc7ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.mpw-cancel {
+  flex: none;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 110, 110, 0.4);
+  background: rgba(255, 255, 255, 0.04);
+  color: #ffb3b3;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.mpw-cancel:hover {
+  background: rgba(255, 110, 110, 0.15);
+}
+
+/* Error variant — failures are always visible, never silent. */
+.magic-progress-window.error {
+  border-color: rgba(255, 110, 110, 0.55);
+}
+
+.mpw-icon.error {
+  background: rgba(255, 110, 110, 0.15);
+  border-color: rgba(255, 110, 110, 0.45);
+  font-size: 15px;
+  color: #ff9d9d;
+}
+
+.mpw-error-text {
+  font-size: 11.5px;
+  color: #ffc9c9;
+  line-height: 1.45;
+}

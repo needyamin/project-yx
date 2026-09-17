@@ -44,8 +44,8 @@ type Props = {
     anchorTime?: number;
   }) => void;
   onParamChange: (patch: Record<string, unknown>) => void;
-  onTrack: () => void;
-  onRemove: () => void;
+  onTrack: (mask: { strokes: MagicStroke[]; anchorTime: number | null }) => void;
+  onRemove: (mask: { strokes: MagicStroke[]; anchorTime: number | null }) => void;
   onCancel: () => void;
   onDone: () => void;
 };
@@ -424,7 +424,12 @@ export function MagicRemoveOverlay({
                   className="magic-btn"
                   disabled={!hasStrokes}
                   title="Track this mask across the clip (follows motion)"
-                  onClick={onTrack}
+                  onClick={() =>
+                    onTrack({
+                      strokes: shownStrokes,
+                      anchorTime: (params?.anchorTime as number | undefined) ?? mediaTime,
+                    })
+                  }
                 >
                   Auto Track
                 </button>
@@ -433,7 +438,12 @@ export function MagicRemoveOverlay({
                   className="magic-btn primary"
                   disabled={!hasStrokes}
                   title="Remove the selected content and rebuild the background"
-                  onClick={onRemove}
+                  onClick={() =>
+                    onRemove({
+                      strokes: shownStrokes,
+                      anchorTime: (params?.anchorTime as number | undefined) ?? mediaTime,
+                    })
+                  }
                 >
                   ✨ Remove
                 </button>

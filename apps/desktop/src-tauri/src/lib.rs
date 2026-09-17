@@ -694,7 +694,9 @@ async fn magic_remove_track(
         Ok(serde_json::json!({ "keyframes": kf }))
     })
     .await
-    .map_err(|e| format!("magic track task failed: {e}"))?;
+    .map_err(|e| format!("magic track task failed: {e}"));
+    // Always reset BEFORE any early return — a stuck flag makes every
+    // subsequent click fail instantly with nothing visible in the UI.
     state.magic_busy.store(false, Ordering::SeqCst);
     if result.is_ok() {
         let _ = app.emit(
@@ -705,7 +707,7 @@ async fn magic_remove_track(
             },
         );
     }
-    result
+    result?
 }
 
 /// Render the inpainted sidecar clip (cached by source + mask + settings).
@@ -744,7 +746,7 @@ async fn magic_remove_render(
         Ok(out.display().to_string())
     })
     .await
-    .map_err(|e| format!("magic render task failed: {e}"))?;
+    .map_err(|e| format!("magic render task failed: {e}"));
     state.magic_busy.store(false, Ordering::SeqCst);
     if result.is_ok() {
         let _ = app.emit(
@@ -755,7 +757,7 @@ async fn magic_remove_render(
             },
         );
     }
-    result
+    result?
 }
 
 /// Cooperative cancel for the running Magic Remove track/render job.

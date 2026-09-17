@@ -193,6 +193,9 @@ pub enum FilterKind {
     Hue,
     Vignette,
     Sharpen,
+    // Serialized as "vdenoise" to match the frontend catalog id; the alias
+    // keeps timelines saved with the old snake_case name loading.
+    #[serde(rename = "vdenoise", alias = "video_denoise")]
     VideoDenoise,
     Stabilize,
     Lut3d,
@@ -203,6 +206,9 @@ pub enum FilterKind {
     Deesser,
     /// Magic Remove / AI Eraser: brush mask + auto tracking + background
     /// reconstruction rendered to a non-destructive sidecar clip.
+    // Serialized as "magicremove" to match the frontend kind string; the
+    // alias keeps timelines saved with the old snake_case name loading.
+    #[serde(rename = "magicremove", alias = "magic_remove")]
     MagicRemove,
 }
 
@@ -3601,3 +3607,4 @@ mod tests {
         assert!((right.fade_out - 2.0).abs() < 1e-9);
     }
 }
+

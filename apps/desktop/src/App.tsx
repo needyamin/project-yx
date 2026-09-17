@@ -37,6 +37,7 @@ import {
   type AdvancedVideoTarget,
 } from "./video/AdvancedVideoDialog";
 import "./monitors/ProjectMonitor.css";
+import { MagicProgressDialog } from "./monitors/MagicProgressDialog";
 import { TimelinePanel } from "./timeline/TimelinePanel";
 import {
   clipAtPlayhead,
@@ -245,6 +246,11 @@ function App() {
   const [magicDraft, setMagicDraft] = useState<Record<string, unknown> | null>(null);
   const magicDraftRef = useRef<Record<string, unknown> | null>(null);
   const magicStatusTickRef = useRef(0);
+  /** When the current Magic Remove job started (epoch ms). */
+  const [magicStartedAt, setMagicStartedAt] = useState(0);
+  /** Last Magic Remove failure, shown in the floating window for a few
+   * seconds — failures must never be silent. */
+  const [magicError, setMagicError] = useState<string | null>(null);
   const [snapOn, setSnapOn] = useState(true);
   const [monitorVolume, setMonitorVolume] = useState(1);
   const [monitorMuted, setMonitorMuted] = useState(false);
@@ -331,6 +337,17 @@ function App() {
   }, [refreshBoot]);
 
   // Magic Remove pipeline progress (tracking / background reconstruction).
+  useEffect(() => {
+    if (magicBusy && !magicStartedAt) setMagicStartedAt(Date.now());
+    if (!magicBusy && magicStartedAt) setMagicStartedAt(0);
+  }, [magicBusy, magicStartedAt]);
+
+  useEffect(() => {
+    if (!magicError) return;
+    const id = window.setTimeout(() => setMagicError(null), 8000);
+    return () => window.clearTimeout(id);
+  }, [magicError]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<{ percent: number; phase: string }>("magic-progress", (event) => {
@@ -1723,18 +1740,78 @@ function App() {
   }
 
   /** Clip-scoped filter param update (updateFilterParams is bound to the
-   * selected clip, which may differ from the clip under the playhead). */
+   * selected clip, which may differ from the clip under the playhead).
+   * Returns the fresh Timeline so callers can read back the saved filter
+   * without racing React state. */
   async function updateFilterParamsOnClip(
     clipId: string,
     filterId: string,
     params: Record<string, unknown>,
-  ) {
+  ): Promise<Timeline | null> {
     try {
-      setTimeline(
-        normalizeTimeline(await invoke<Timeline>("update_filter", { clipId, filterId, params })),
+      const next = normalizeTimeline(
+        await invoke<Timeline>("update_filter", { clipId, filterId, params }),
       );
+      setTimeline(next);
+      return next;
     } catch (e) {
       setStatus(String(e));
+      return null;
+    }
+  }
+
+  /** Find the magicremove filter in a Timeline RESPONSE (never stale). */
+  function findMagicIn(tl: Timeline | null, clipId: string) {
+    if (!tl) return null;
+    const clip = tl.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+    const f = clip?.filters?.find((x) => x.kind === "magicremove");
+    return f
+      ? { filterId: f.id, params: (f.params ?? {}) as Record<string, unknown> }
+      : null;
+  }
+
+  /** Strip Rust error noise for user-facing messages. */
+  function cleanMagicErr(msg: string): string {
+    return msg
+      .replace(/^\s*Error:\s*/i, "")
+      .replace(/^"|"$/g, "")
+      .trim()
+      .slice(0, 200);
+  }
+
+  /** Add or update the magicremove filter and return the SAVED filter read
+   * from the invoke response — immune to stale timeline state. */
+  async function commitMagicFilter(
+    clipId: string,
+    patch: Record<string, unknown>,
+  ): Promise<{ filterId: string; params: Record<string, unknown> } | null> {
+    const tl = timelineRef.current;
+    const clip = tl?.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+    const existing = clip?.filters?.find((x) => x.kind === "magicremove");
+    if (existing) {
+      const next = await updateFilterParamsOnClip(clipId, existing.id, {
+        ...((existing.params ?? {}) as Record<string, unknown>),
+        ...patch,
+      });
+      return findMagicIn(next, clipId);
+    }
+    const hasStrokes = Array.isArray(patch.strokes) && patch.strokes.length > 0;
+    if (!hasStrokes) return null; // nothing durable to persist yet
+    try {
+      const next = normalizeTimeline(
+        await invoke<Timeline>("add_filter", {
+          clipId,
+          kind: "magicremove",
+          params: { ...defaultParams("magicremove"), ...magicDraftRef.current, ...patch },
+        }),
+      );
+      setTimeline(next);
+      setMagicDraft(null);
+      magicDraftRef.current = null;
+      return findMagicIn(next, clipId);
+    } catch (e) {
+      setStatus(String(e));
+      return null;
     }
   }
 
@@ -1845,28 +1922,39 @@ function App() {
     }
   }
 
-  async function runMagicTrack() {
+  async function runMagicTrack(mask?: {
+    strokes?: MagicStroke[];
+    anchorTime?: number | null;
+  }) {
     const clip = resolveMagicTarget();
-    const f = magicFilterOf(clip);
     if (!clip) {
-      setStatus("No video clip under the playhead");
+      setMagicError("Scrub the playhead over a video clip first, then brush and track.");
       return;
     }
-    if (!f) return;
-    const p = (f.params ?? {}) as Record<string, unknown>;
-    if (!Array.isArray(p.strokes) || p.strokes.length === 0) {
-      setStatus("Brush over the element to remove first");
-      return;
-    }
+    // Window FIRST — the user must immediately see that something happened.
     setMagicBusy({ phase: "tracking", percent: 0 });
     setMagicStatus(null);
     setStatus("✨ Magic Remove: tracking the mask across the clip — watch it follow on the timeline.");
     try {
+      let f = findMagicIn(timelineRef.current, clip.id);
+      // Self-heal: mask visible in the panel but not saved yet (commit race
+      // or earlier failure) → save the panel's mask now, then continue.
+      if (!f || !(Array.isArray(f.params.strokes) && f.params.strokes.length)) {
+        if (!mask?.strokes?.length) {
+          throw new Error("No mask saved — brush over the element first, then try again");
+        }
+        f = await commitMagicFilter(clip.id, {
+          strokes: mask.strokes,
+          ...(mask.anchorTime != null ? { anchorTime: mask.anchorTime } : {}),
+        });
+        if (!f) throw new Error("Could not save the mask — brush again and retry");
+      }
+      const p = f.params;
       const res = await invoke<{ keyframes: MagicKeyframe[] }>("magic_remove_track", {
         source: clip.media_path,
         params: { ...p },
       });
-      await updateFilterParamsOnClip(clip.id, f.id, {
+      await updateFilterParamsOnClip(clip.id, f.filterId, {
         ...p,
         keyframes: res.keyframes ?? [],
         status: "tracked",
@@ -1876,63 +1964,81 @@ function App() {
       setMagicStatus(
         "Tracked across the clip — press ✨ Remove, or use Adjust to correct the mask.",
       );
+      setStatus("✨ Magic Remove: mask tracked across the clip.");
     } catch (e) {
-      const msg = String(e);
-      if (msg.includes("cancelled")) {
-        setMagicStatus("Tracking cancelled.");
-      } else {
-        setMagicStatus(`Tracking failed: ${msg}`);
-      }
+      handleMagicError(e, "Tracking");
     } finally {
       setMagicBusy(null);
     }
   }
 
-  async function runMagicRemoveRender() {
+  async function runMagicRemoveRender(mask?: {
+    strokes?: MagicStroke[];
+    anchorTime?: number | null;
+  }) {
     const clip = resolveMagicTarget();
-    const f = magicFilterOf(clip);
     if (!clip) {
-      setStatus("No video clip under the playhead");
+      setMagicError("Scrub the playhead over a video clip first, then brush and press Remove.");
       return;
     }
-    if (!f) return;
-    const p = (f.params ?? {}) as Record<string, unknown>;
-    if (!Array.isArray(p.strokes) || p.strokes.length === 0) {
-      setStatus("Brush over the element to remove first");
-      return;
-    }
+    // Window FIRST — the user must immediately see that Remove is working.
     setMagicBusy({ phase: "inpainting", percent: 0 });
     setMagicStatus(null);
-    const srcDur = library.find((m) => m.path === clip.media_path)?.duration ?? 0;
-    setStatus(
-      `✨ Magic Remove: rebuilding the background across ${fmtLen(srcDur)} of video — longer clips take a few minutes. Keep editing; progress shows on the monitor.`,
-    );
     try {
+      let f = findMagicIn(timelineRef.current, clip.id);
+      // Self-heal: mask visible in the panel but not saved yet → save it now.
+      if (!f || !(Array.isArray(f.params.strokes) && f.params.strokes.length)) {
+        if (!mask?.strokes?.length) {
+          throw new Error("No mask saved — brush over the element first, then press Remove again");
+        }
+        f = await commitMagicFilter(clip.id, {
+          strokes: mask.strokes,
+          ...(mask.anchorTime != null ? { anchorTime: mask.anchorTime } : {}),
+        });
+        if (!f) throw new Error("Could not save the mask — brush again and retry");
+      }
+      const p = f.params;
+      const srcDur = library.find((m) => m.path === clip.media_path)?.duration ?? 0;
+      setStatus(
+        `✨ Magic Remove: rebuilding the background across ${fmtLen(srcDur)} of video — longer clips take longer. Keep editing; progress shows on the monitor.`,
+      );
       const path = await invoke<string>("magic_remove_render", {
         source: clip.media_path,
         params: { ...p },
         keyframes: Array.isArray(p.keyframes) ? p.keyframes : [],
       });
-      await updateFilterParamsOnClip(clip.id, f.id, {
+      const saved = await updateFilterParamsOnClip(clip.id, f.filterId, {
         ...p,
         resultPath: path,
         renderKey: magicRenderKey(p),
         status: "ready",
       });
-      setMagicStatus("Removed ✓ — scrub or play to preview; export bakes it in.");
-      setStatus("✨ Magic Remove done — the monitor now previews the cleaned video (original file untouched).");
-    } catch (e) {
-      const msg = String(e);
-      if (msg.includes("cancelled")) {
-        setMagicStatus("Removal cancelled — nothing changed.");
-        setStatus("✨ Magic Remove cancelled — nothing changed.");
-      } else {
-        setMagicStatus(`Removal failed: ${msg}`);
-        setStatus(`✨ Magic Remove failed: ${msg}`);
+      if (!saved) {
+        throw new Error(
+          "Render finished but saving failed — press Remove again (the render is cached and will be instant)",
+        );
       }
+      setMagicStatus("Removed ✓ — scrub or play to preview; export bakes it in.");
+      setStatus("✨ Magic Remove finished — the monitor now previews the cleaned video (original file untouched).");
+    } catch (e) {
+      handleMagicError(e, "Removal");
     } finally {
       setMagicBusy(null);
     }
+  }
+
+  /** Every Magic Remove failure lands somewhere visible: floating error
+   * card, tool panel line and the status bar — never a silent return. */
+  function handleMagicError(e: unknown, what: string) {
+    const msg = cleanMagicErr(String(e));
+    if (msg.toLowerCase().includes("cancelled")) {
+      setMagicStatus(`${what} cancelled — nothing changed.`);
+      setStatus(`✨ Magic Remove ${what.toLowerCase()} cancelled — nothing changed.`);
+      return;
+    }
+    setMagicStatus(`${what} failed: ${msg}`);
+    setMagicError(`${what} failed — ${msg}`);
+    setStatus(`✨ Magic Remove ${what.toLowerCase()} failed: ${msg}`);
   }
 
   function cancelMagic() {
@@ -3611,8 +3717,8 @@ function App() {
             }
             onMagicCommit={commitMagic}
             onMagicParamChange={(patch) => void upsertMagicParams(patch)}
-            onMagicTrack={() => void runMagicTrack()}
-            onMagicRemove={() => void runMagicRemoveRender()}
+            onMagicTrack={(m) => void runMagicTrack(m)}
+            onMagicRemove={(m) => void runMagicRemoveRender(m)}
             onMagicCancel={cancelMagic}
             onShowClipMonitor={
               clipMonitorOpen ? undefined : () => setClipMonitorOpen(true)
@@ -3720,6 +3826,18 @@ function App() {
             if (advancedVideo.clipId) setSelectedClipId(advancedVideo.clipId);
           }}
           onStatus={setStatus}
+        />
+      )}
+      {(magicBusy || magicError) && (
+        <MagicProgressDialog
+          phase={magicBusy?.phase ?? "inpainting"}
+          percent={magicBusy?.percent ?? 0}
+          startedAt={magicStartedAt || Date.now()}
+          error={magicError}
+          onCancel={() => {
+            if (magicBusy) cancelMagic();
+            else setMagicError(null);
+          }}
         />
       )}
       <ExportDialog

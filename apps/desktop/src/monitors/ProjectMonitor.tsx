@@ -128,8 +128,14 @@ type Props = {
     anchorTime?: number;
   }) => void;
   onMagicParamChange?: (patch: Record<string, unknown>) => void;
-  onMagicTrack?: () => void;
-  onMagicRemove?: () => void;
+  onMagicTrack?: (mask: {
+    strokes: MagicStroke[];
+    anchorTime: number | null;
+  }) => void;
+  onMagicRemove?: (mask: {
+    strokes: MagicStroke[];
+    anchorTime: number | null;
+  }) => void;
   onMagicCancel?: () => void;
   /** When Clip Monitor is hidden, show a control to restore it. */
   onShowClipMonitor?: () => void;
@@ -1683,19 +1689,11 @@ export function ProjectMonitor({
               status={magicStatus}
               onCommit={(patch) => onMagicCommit?.(patch)}
               onParamChange={(patch) => onMagicParamChange?.(patch)}
-              onTrack={() => onMagicTrack?.()}
-              onRemove={() => onMagicRemove?.()}
+              onTrack={(m) => onMagicTrack?.(m)}
+              onRemove={(m) => onMagicRemove?.(m)}
               onCancel={() => onMagicCancel?.()}
               onDone={() => onMagicTool?.(false)}
             />
-          )}
-          {/* Magic Remove job keeps running even when the tool is closed —
-              keep the user informed with a small badge on the monitor. */}
-          {magicBusy && !magicTool && (
-            <div className="magic-processing-badge">
-              ✨ {magicBusy.phase === "tracking" ? "Tracking mask" : "Removing"}…{" "}
-              {Math.round(magicBusy.percent * 100)}%
-            </div>
           )}
           {gestureBadge && <div className="tf-badge">{gestureBadge}</div>}
           {handlesVisible && (
