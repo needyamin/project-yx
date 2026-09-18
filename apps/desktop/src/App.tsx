@@ -322,39 +322,12 @@ function App() {
     const info = await invoke<BootInfo>("get_boot_info");
     setBoot(info);
     setTimeline(normalizeTimeline(info.timeline));
-    // Crash recovery: adopt the last autosave when one exists (an empty
-    // default project is never treated as recoverable content).
-    try {
-      const autosave = await invoke<Timeline | null>("get_autosave");
-      if (autosave && autosave.tracks.some((t) => t.clips.length > 0)) {
-        setTimeline(normalizeTimeline(autosave));
-        setStatus("Restored autosaved project — Ctrl+S to save it as a file");
-        return;
-      }
-    } catch {
-      /* autosave probe failed: start fresh */
-    }
     setStatus(`Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`);
   }, []);
 
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
-
-  // Background autosave: debounced after every edit, serialized + written
-  // entirely on Rust's blocking pool — the UI thread never touches disk.
-  const autosaveTimer = useRef(0);
-  useEffect(() => {
-    if (!timeline || !boot) return;
-    window.clearTimeout(autosaveTimer.current);
-    autosaveTimer.current = window.setTimeout(() => {
-      void invoke("save_autosave").catch(() => undefined);
-    }, 4000);
-    return () => window.clearTimeout(autosaveTimer.current);
-  }, [timeline, boot]);
-  useEffect(() => {
-    return () => window.clearTimeout(autosaveTimer.current);
-  }, []);
 
   // Magic Remove pipeline progress (tracking / background reconstruction).
   useEffect(() => {
@@ -2728,6 +2701,27 @@ function App() {
     }
   }
 
+  /** Start a fresh project: resets the engine timeline (undo history resets
+   * with it). */
+  async function newProject() {
+    if (
+      timeline?.tracks.some((t) => t.clips.length > 0) &&
+      !window.confirm("Start a new project? The current timeline will be cleared.")
+    ) {
+      return;
+    }
+    try {
+      stopPlayback();
+      const tl = await invoke<Timeline>("new_project");
+      setTimeline(normalizeTimeline(tl));
+      setSelectedClipId(null);
+      seekTimeline(0);
+      setStatus("New project");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }
+
   async function runExport(settings: ExportSettings) {
     if (!canExport) {
       setStatus("Add media to the timeline (or select a file) to export");
@@ -3808,6 +3802,7 @@ function App() {
     seekTimeline,
     saveProjectAs,
     openProject,
+    newProject,
     playReverse,
     stopPlayback,
     shuttleForward,
@@ -3826,6 +3821,7 @@ function App() {
       seekTimeline,
       saveProjectAs,
       openProject,
+      newProject,
       playReverse,
       stopPlayback,
       shuttleForward,
@@ -3881,6 +3877,9 @@ function App() {
       } else if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) {
         e.preventDefault();
         void h.openProject();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === "n" || e.key === "N")) {
+        e.preventDefault();
+        void h.newProject();
       } else if (e.key === "j" || e.key === "J") {
         e.preventDefault();
         h.playReverse();
@@ -3932,6 +3931,7 @@ function App() {
       clipMonitorOpen={clipMonitorOpen}
       onImport={() => void onImport()}
       onExport={openExportDialog}
+      onNewProject={() => void newProject()}
       onUndo={() => void onUndo()}
       onRedo={() => void onRedo()}
       onDelete={() => void onRemove()}

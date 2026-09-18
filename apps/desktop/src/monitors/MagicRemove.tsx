@@ -366,10 +366,6 @@ export function MagicRemoveOverlay({
             <button type="button" className="magic-btn danger" onClick={onCancel}>
               Cancel
             </button>
-            <div className="magic-status" style={{ flexBasis: "100%" }}>
-              Every frame of the clip is processed — longer videos take longer. You
-              can keep editing; the result appears on the monitor automatically.
-            </div>
           </div>
         ) : (
           <>

@@ -210,8 +210,6 @@ export function installMockTauri(opts: { clips: number; mediaUrls: string[] }): 
       store.set(cacheKey, data);
       return data;
     },
-    save_autosave: async () => null,
-    get_autosave: async () => null,
     undo: async () => {
       const prev = undoStack.pop();
       if (!prev) throw new Error("nothing to undo");

@@ -72,12 +72,6 @@ fn get_timeline_issues(state: State<'_, AppState>) -> Vec<String> {
 
 /* --- Project persistence ------------------------------------------------ */
 
-fn autosave_path() -> PathBuf {
-    dirs_cache()
-        .with_file_name("autosave")
-        .join("project.autosave.json")
-}
-
 /// Write the project atomically (tmp + rename) on a blocking thread so the
 /// UI never waits on disk.
 #[tauri::command]
@@ -115,44 +109,13 @@ async fn load_project(path: String, state: State<'_, AppState>) -> Result<Timeli
     Ok(timeline)
 }
 
-/// Background autosave snapshot (never blocks the UI; cheap even for large
-/// projects — serialization happens on the blocking pool).
+/// Start a fresh project: reset the in-memory timeline (undo history resets
+/// with it).
 #[tauri::command]
-async fn save_autosave(state: State<'_, AppState>) -> Result<(), String> {
-    let timeline = state.editor.lock().timeline().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let json = serde_json::to_string(&timeline).map_err(|e| e.to_string())?;
-        let dir = dirs_cache().with_file_name("autosave");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join("project.autosave.json");
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("autosave task failed: {e}"))?
-}
-
-/// The last autosave, if one exists — boot-time crash recovery.
-#[tauri::command]
-async fn get_autosave(state: State<'_, AppState>) -> Result<Option<Timeline>, String> {
-    let _ = state;
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = autosave_path();
-        if !path.is_file() {
-            return Ok(None);
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(json) => match serde_json::from_str::<Timeline>(&json) {
-                Ok(timeline) => Ok(Some(timeline)),
-                Err(_) => Ok(None), // corrupt snapshot: ignore, start fresh
-            },
-            Err(_) => Ok(None),
-        }
-    })
-    .await
-    .map_err(|e| format!("autosave read failed: {e}"))?
+fn new_project(state: State<'_, AppState>) -> Timeline {
+    let mut editor = state.editor.lock();
+    *editor = TimelineEditor::new();
+    editor.timeline().clone()
 }
 
 /// Generate (or fetch from the disk cache) a small preview JPEG for the
@@ -1825,8 +1788,7 @@ pub fn run() {
             get_media_thumbnail,
             save_project,
             load_project,
-            save_autosave,
-            get_autosave,
+            new_project,
             debug_agent_log,
             reprobe_hardware,
             import_media,

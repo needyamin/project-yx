@@ -18,6 +18,7 @@ type Props = {
   clipMonitorOpen: boolean;
   onImport: () => void;
   onExport: () => void;
+  onNewProject: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onDelete: () => void;
@@ -51,6 +52,7 @@ export function TopMenubar({
   clipMonitorOpen,
   onImport,
   onExport,
+  onNewProject,
   onUndo,
   onRedo,
   onDelete,
@@ -147,6 +149,9 @@ export function TopMenubar({
         </div>
 
         <Menu label="File" id="file" open={open} onToggle={toggle}>
+          <button type="button" role="menuitem" disabled={busy} onClick={item(onNewProject)}>
+            New Project
+          </button>
           <button type="button" role="menuitem" disabled={busy} onClick={item(onImport)}>
             Import…
           </button>
