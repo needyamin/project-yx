@@ -1,12 +1,15 @@
 {
   "name": "project-yx-workspace",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/sync-version.js",
     "dev": "npm --prefix apps/desktop run tauri dev",
     "tauri": "npm --prefix apps/desktop run tauri",
+    "prebuild": "node scripts/sync-version.js",
     "build": "npm --prefix apps/desktop run tauri build",
+    "version:sync": "node scripts/sync-version.js",
     "dist": "node scripts/build-windows.js",
     "dist:nsis": "node scripts/build-windows.js --nsis-only",
     "dist:portable": "node scripts/build-portable.js",

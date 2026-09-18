@@ -2,7 +2,7 @@
 
 What Project YX is built with and how the pieces connect. Short version: **Tauri 2 shell + React UI + Rust engine crates + bundled FFmpeg. No Electron.**
 
-App ID `com.projectyx.editor` · GPL-3.0-or-later · Version lives in root `Cargo.toml` (sync with `apps/desktop/package.json` and `tauri.conf.json`).
+App ID `com.projectyx.editor` · GPL-3.0-or-later · Version lives in root `package.json` (build scripts auto-sync `Cargo.toml`, `apps/desktop/package.json`, `tauri.conf.json`).
 
 ```
 ┌─────────────────────────────────────────────┐

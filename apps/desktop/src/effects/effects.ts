@@ -221,7 +221,9 @@ export function defaultParams(kind: string): Record<string, unknown> {
     case "magic":
       return { intensity: 0.3, speed: 0.25, duration: 0 };
     /* Magic Remove: brush radius/feather/expand are fractions of frame
-       height; strokes/keyframes live in params (see MagicRemove tool). */
+       height; strokes/keyframes live in params (see MagicRemove tool).
+       scopeIn/scopeOut bound the tracked+rendered window to the clip's
+       source range (0/0 = whole media, the legacy shape). */
     case "magicremove":
       return {
         strokes: [],
@@ -232,6 +234,8 @@ export function defaultParams(kind: string): Record<string, unknown> {
         expand: 0.004,
         trackingAccuracy: "medium",
         removalStrength: 100,
+        scopeIn: 0,
+        scopeOut: 0,
         status: "idle",
         renderKey: "",
         resultPath: "",
@@ -571,12 +575,41 @@ export function magicRenderKey(params: Record<string, unknown> | null | undefine
   });
 }
 
-/** True when the clip has a completed, non-stale Magic Remove render. */
-export function magicResultReady(params: Record<string, unknown> | null | undefined): string | null {
+/** True when the clip has a completed, non-stale Magic Remove render.
+ *
+ * `clip` enables the scope-coverage check: a clip-scoped sidecar only covers
+ * [scopeIn, scopeOut] of the source media (sidecar t=0 == scopeIn), so a
+ * later trim past the rendered window must fall back to the original until
+ * Remove runs again. Legacy params (no scope keys) always pass. */
+export function magicResultReady(
+  params: Record<string, unknown> | null | undefined,
+  clip?: { in_point: number; out_point: number },
+): string | null {
   if (!params) return null;
   const path = typeof params.resultPath === "string" ? params.resultPath : "";
   if (!path) return null;
-  return magicRenderKey(params) === params.renderKey ? path : null;
+  if (magicRenderKey(params) !== params.renderKey) return null;
+  if (clip) {
+    const sin = typeof params.scopeIn === "number" ? params.scopeIn : 0;
+    const sout = typeof params.scopeOut === "number" ? params.scopeOut : 0;
+    if (
+      sout > sin + 1e-3 &&
+      (clip.in_point < sin - 0.01 || clip.out_point > sout + 0.01)
+    ) {
+      return null;
+    }
+  }
+  return path;
+}
+
+/** Additive shift mapping element time on a ready sidecar back to source
+ * media time: sourceTime = elementTime + shift. 0 for the original media or
+ * legacy (unscoped) sidecars — sidecar t=0 is `scopeIn` for scoped renders. */
+export function magicScopeShift(
+  params: Record<string, unknown> | null | undefined,
+): number {
+  const sin = typeof params?.scopeIn === "number" ? params.scopeIn : 0;
+  return sin > 1e-3 ? sin : 0;
 }
 
 /** Linearly interpolated mask offset (normalized fractions) at media time t. */

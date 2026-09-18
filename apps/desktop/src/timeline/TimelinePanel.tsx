@@ -38,6 +38,7 @@ import {
   type TimelineMarker,
   type TimelineTool,
 } from "./types";
+import { isCurrent, lastEngineTimeline, nextSeq, recordEngine } from "./engineSync";
 import { useTimelineView } from "./useTimelineView";
 import "./timeline.css";
 
@@ -153,9 +154,15 @@ export function TimelinePanel({
   }, [view]);
 
   const timelineRef = useRef(timeline);
-  useEffect(() => {
-    timelineRef.current = timeline;
-  }, [timeline]);
+  // Sync during render, not in an effect: edit handlers read this ref to
+  // build optimistic updates, and an effect runs only after paint — a rapid
+  // second edit within that window computed its optimistic base from a stale
+  // timeline and visually reverted the first edit until the IPC responses
+  // caught up.
+  timelineRef.current = timeline;
+  // Response sequencing + engine-rollback state live in engineSync.ts and
+  // are SHARED with App.tsx: undo/redo, filter commits and load/new must
+  // participate in the same newest-wins ordering as panel edits.
 
   /* ------------------------------------------------------------------ */
   /* Memoized per-clip drag data + sorted snap anchors                   */
@@ -368,8 +375,11 @@ export function TimelinePanel({
 
   const run = useCallback(
     async (cmd: string, args: Record<string, unknown>, okMsg?: string) => {
+      const seq = nextSeq();
       try {
         const next = await invoke<Timeline>(cmd, args);
+        if (!isCurrent(seq)) return next; // superseded by a newer edit
+        recordEngine(next);
         onTimeline(next);
         if (okMsg) onStatus(okMsg);
         return next;
@@ -377,6 +387,9 @@ export function TimelinePanel({
         const msg = String(e);
         if (/no gap/i.test(msg)) onStatus("No gap at that position");
         else onStatus(msg);
+        // The engine rejected the command — roll back any optimistic update
+        // so the GUI never keeps showing a position the engine refused.
+        const engineTl = lastEngineTimeline(); if (engineTl) onTimeline(engineTl);
         return null;
       }
     },
@@ -421,6 +434,7 @@ export function TimelinePanel({
 
       switch (action.type) {
         case "move": {
+          const seq = nextSeq();
           const targetTrackId = action.targetTrackId ?? null;
           const crossTrack = Boolean(targetTrackId && srcTrackId && targetTrackId !== srcTrackId);
           if (crossTrack) {
@@ -449,6 +463,8 @@ export function TimelinePanel({
               syncLinked: true,
               targetTrackId,
             });
+            if (!isCurrent(seq)) return; // superseded by a newer edit
+            recordEngine(next);
             onTimeline(next);
             onStatus(
               crossTrack
@@ -457,6 +473,9 @@ export function TimelinePanel({
             );
           } catch (e) {
             onStatus(String(e));
+            // Roll back the optimistic update — the engine refused the move,
+            // so the clip must not keep sitting at the dropped position.
+            const engineTl = lastEngineTimeline(); if (engineTl) onTimeline(engineTl);
           } finally {
             setDragPreview(null);
           }
@@ -1002,6 +1021,12 @@ export function TimelinePanel({
       out_point: number;
     }) => {
       if (phase === "end") {
+        // ALWAYS clear the preview on gesture end — including no-op drags
+        // and simple clicks (pointerdown already set an "origin" preview).
+        // A leftover previewDraft pins the partner to its OLD position, so
+        // engine-driven moves (ripple, close gap, undo) never showed up on
+        // the partner until the next pointer interaction.
+        setDragPreview(null);
         return;
       }
       const tl = timelineRef.current;

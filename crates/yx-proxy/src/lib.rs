@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use thiserror::Error;
@@ -21,6 +22,8 @@ pub enum ProxyError {
     NotFound(Uuid),
     #[error("ffmpeg proxy failed: {0}")]
     Ffmpeg(String),
+    #[error("proxy job cancelled")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -32,6 +35,7 @@ pub enum ProxyStatus {
     Running,
     Ready,
     Failed,
+    Cancelled,
     Skipped,
 }
 
@@ -54,6 +58,9 @@ pub struct ProxyManager {
     cache_dir: PathBuf,
     queue_tx: Mutex<Option<mpsc::Sender<(Uuid, PerformancePolicy)>>>,
     notifier: Mutex<Option<ProxyNotifier>>,
+    /// Cooperative cancel flags keyed by job id; polled by the worker while
+    /// ffmpeg runs so a cancelled transcode's child is killed promptly.
+    cancels: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
 }
 
 impl ProxyManager {
@@ -63,6 +70,7 @@ impl ProxyManager {
             cache_dir: cache_dir.into(),
             queue_tx: Mutex::new(None),
             notifier: Mutex::new(None),
+            cancels: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,8 +129,23 @@ impl ProxyManager {
         std::fs::create_dir_all(&self.cache_dir)?;
 
         {
-            let guard = self.inner.lock();
+            let mut guard = self.inner.lock();
             if let Some(existing) = guard.values().find(|j| j.source_path == source) {
+                // A previously failed/cancelled job must be retryable —
+                // returning it stuck forever meant one transient ffmpeg
+                // failure permanently disabled proxies for that source.
+                if matches!(existing.status, ProxyStatus::Failed | ProxyStatus::Cancelled) {
+                    let id = existing.id;
+                    let job = guard.get_mut(&id).expect("existing job id");
+                    job.status = ProxyStatus::Queued;
+                    job.progress = 0.0;
+                    job.error = None;
+                    let requeued = job.clone();
+                    let policy = policy.clone();
+                    let tx = self.ensure_worker();
+                    let _ = tx.send((id, policy));
+                    return Ok(requeued);
+                }
                 return Ok(existing.clone());
             }
         }
@@ -178,6 +201,16 @@ impl ProxyManager {
         Ok(job)
     }
 
+    /// Request cooperative cancellation of a queued/running job. The worker
+    /// kills the ffmpeg child and marks the job Cancelled.
+    pub fn cancel(&self, id: Uuid) -> bool {
+        if let Some(flag) = self.cancels.lock().get(&id) {
+            flag.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
     fn run_job(&self, id: Uuid, policy: &PerformancePolicy) -> Result<(), ProxyError> {
         let (source, proxy_path) = {
             let mut guard = self.inner.lock();
@@ -185,6 +218,12 @@ impl ProxyManager {
             job.status = ProxyStatus::Running;
             job.progress = 0.05;
             (job.source_path.clone(), job.proxy_path.clone())
+        };
+        let cancel_flag = {
+            let mut cancels = self.cancels.lock();
+            let flag = cancels.remove(&id).unwrap_or_default();
+            cancels.insert(id, Arc::clone(&flag));
+            flag
         };
 
         let scale = format!(
@@ -194,43 +233,106 @@ impl ProxyManager {
         let bitrate = format!("{}k", policy.proxy.video_bitrate_kbps);
         let threads = policy.encode_threads.to_string();
 
-        let output = command_ffmpeg()
-            .args([
-                "-y",
-                "-i",
-                source.to_str().unwrap_or_default(),
-                "-vf",
-                &scale,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "superfast",
-                "-threads",
-                &threads,
-                "-b:v",
-                &bitrate,
-                "-c:a",
-                "aac",
-                "-ac",
-                "2",
-                "-movflags",
-                "+faststart",
-                proxy_path.to_str().unwrap_or_default(),
-            ])
-            .output()?;
+        // Write to a sibling tmp file and rename on success: a killed or
+        // failed transcode must never leave a corrupt file at the final
+        // proxy path that playback_path() could hand to the compositor.
+        let tmp_path = proxy_path.with_extension("mp4.tmp");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut child = KillOnDrop(
+            command_ffmpeg()
+                .args([
+                    "-hide_banner",
+                    "-nostats",
+                    "-y",
+                    "-i",
+                    source.to_str().unwrap_or_default(),
+                    "-vf",
+                    &scale,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "superfast",
+                    "-threads",
+                    &threads,
+                    "-b:v",
+                    &bitrate,
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "2",
+                    "-movflags",
+                    "+faststart",
+                    tmp_path.to_str().unwrap_or_default(),
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?,
+        );
+
+        // Drain stderr on its own thread: an unread pipe fills up and would
+        // block ffmpeg mid-encode.
+        let stderr_pipe = child.stderr.take();
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stderr_pipe {
+                use std::io::Read;
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        });
+
+        // Poll instead of wait() so cancellation kills the child promptly.
+        let mut last_progress = 0.05_f32;
+        let status = loop {
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.finish_job(&id, &tmp_path, ProxyStatus::Cancelled, "cancelled".to_string());
+                return Err(ProxyError::Cancelled);
+            }
+            match child.try_wait()? {
+                Some(status) => break status,
+                None => {
+                    if let Ok(meta) = std::fs::metadata(&tmp_path) {
+                        let pct = (meta.len() as f32 / 8_000_000.0).clamp(0.05, 0.95);
+                        if pct > last_progress {
+                            last_progress = pct;
+                            if let Some(job) = self.inner.lock().get_mut(&id) {
+                                job.progress = pct;
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        };
+        self.cancels.lock().remove(&id);
 
         let mut guard = self.inner.lock();
         let job = guard.get_mut(&id).ok_or(ProxyError::NotFound(id))?;
-        if output.status.success() {
+        if status.success() {
+            std::fs::rename(&tmp_path, &proxy_path)?;
             job.status = ProxyStatus::Ready;
             job.progress = 1.0;
             job.error = None;
             Ok(())
         } else {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let err = stderr_handle.join().unwrap_or_default();
+            let err = err.trim().to_string();
+            let _ = std::fs::remove_file(&tmp_path);
             job.status = ProxyStatus::Failed;
             job.error = Some(err.clone());
             Err(ProxyError::Ffmpeg(err))
+        }
+    }
+
+    fn finish_job(&self, id: &Uuid, tmp_path: &Path, status: ProxyStatus, error: String) {
+        let _ = std::fs::remove_file(tmp_path);
+        if let Some(job) = self.inner.lock().get_mut(id) {
+            job.status = status;
+            job.error = if error.is_empty() { None } else { Some(error) };
         }
     }
 
@@ -259,3 +361,143 @@ impl ProxyManager {
 
 /// Shared handle for the Tauri app state.
 pub type SharedProxyManager = Arc<ProxyManager>;
+
+/// RAII guard that kills the ffmpeg child on drop: a panicking worker thread
+/// or an unexpected error path must never leak a running encoder.
+struct KillOnDrop(std::process::Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_policy() -> PerformancePolicy {
+        PerformancePolicy {
+            tier: yx_detect::PerformanceTier::Medium,
+            preview_scale: yx_detect::PreviewScale::Half,
+            proxy: yx_detect::ProxyPreset {
+                height: 720,
+                video_bitrate_kbps: 6000,
+            },
+            encode_threads: 4,
+            preview_allows_heavy_filters: true,
+            prefer_hw_decode: false,
+            prefer_hw_encode: false,
+        }
+    }
+
+    #[test]
+    fn enqueue_requeues_failed_job_without_duplicating() {
+        let dir = std::env::temp_dir().join(format!("yx_proxy_requeue_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = Arc::new(ProxyManager::new(&dir));
+        let source = dir.join("source.mp4");
+        let id = Uuid::new_v4();
+        manager.inner.lock().insert(
+            id,
+            ProxyJob {
+                id,
+                source_path: source.clone(),
+                proxy_path: dir.join(format!("{id}.proxy.mp4")),
+                status: ProxyStatus::Failed,
+                progress: 0.0,
+                error: Some("transient ffmpeg failure".into()),
+                source_info: None,
+            },
+        );
+        // A failed proxy job must become retryable: the original bug returned
+        // the failed job forever, permanently disabling proxies for a source
+        // after one transient error.
+        let job = manager
+            .enqueue(&source, &test_policy())
+            .expect("enqueue must requeue");
+        assert_eq!(job.id, id);
+        assert_eq!(job.status, ProxyStatus::Queued);
+        assert!(job.error.is_none());
+        let count = manager
+            .inner
+            .lock()
+            .values()
+            .filter(|j| j.source_path == source)
+            .count();
+        assert_eq!(count, 1, "requeue must reuse the existing job");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_does_not_restart_ready_job() {
+        let dir = std::env::temp_dir().join(format!("yx_proxy_ready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = Arc::new(ProxyManager::new(&dir));
+        let source = dir.join("source.mp4");
+        let id = Uuid::new_v4();
+        manager.inner.lock().insert(
+            id,
+            ProxyJob {
+                id,
+                source_path: source.clone(),
+                proxy_path: dir.join(format!("{id}.proxy.mp4")),
+                status: ProxyStatus::Ready,
+                progress: 1.0,
+                error: None,
+                source_info: None,
+            },
+        );
+        let job = manager
+            .enqueue(&source, &test_policy())
+            .expect("enqueue must return existing job");
+        assert_eq!(job.status, ProxyStatus::Ready);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_unknown_job_returns_false() {
+        let manager = ProxyManager::new(std::env::temp_dir());
+        assert!(!manager.cancel(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn playback_path_never_serves_failed_proxy() {
+        let dir = std::env::temp_dir().join(format!("yx_proxy_playback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = ProxyManager::new(&dir);
+        let source = dir.join("source.mp4");
+        let proxy = dir.join("x.proxy.mp4");
+        let id = Uuid::new_v4();
+        manager.inner.lock().insert(
+            id,
+            ProxyJob {
+                id,
+                source_path: source.clone(),
+                proxy_path: proxy.clone(),
+                status: ProxyStatus::Failed,
+                progress: 0.0,
+                error: Some("boom".into()),
+                source_info: None,
+            },
+        );
+        assert_eq!(
+            manager.playback_path(&source),
+            source,
+            "failed proxy must fall back to the original"
+        );
+        assert_eq!(manager.original_path(&proxy), source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -27,7 +27,6 @@ import {
   DIST_DIR,
   ensureBuild,
   ensureDist,
-  bundleDir,
   isUnreliablePath,
 } from "./lib/paths.js";
 import { copyToDist } from "./lib/copy-artifact.js";
@@ -86,16 +85,16 @@ console.log("[yx-dist] === Windows setup .exe (NSIS) ===");
 const nsisSrc = findNsisInstaller();
 copyToDist(nsisSrc, names.setup);
 
-// Copy updater .sig next to the renamed setup if present
-const nsisDir = bundleDir("nsis");
-if (fs.existsSync(nsisDir)) {
-  for (const f of fs.readdirSync(nsisDir)) {
-    if (!f.endsWith(".sig")) continue;
-    const src = path.join(nsisDir, f);
-    const destName = `${names.setup}.sig`;
-    fs.copyFileSync(src, path.join(DIST_DIR, destName));
-    console.log(`[yx-dist] → dist/${destName}`);
-  }
+// Copy the updater .sig that belongs to the SELECTED installer — the bundle
+// dir may still hold .sig files from previous version bumps, and attaching
+// the wrong one makes updater hash verification fail for users.
+const setupSig = `${nsisSrc}.sig`;
+if (fs.existsSync(setupSig)) {
+  const destName = `${names.setup}.sig`;
+  fs.copyFileSync(setupSig, path.join(DIST_DIR, destName));
+  console.log(`[yx-dist] → dist/${destName}`);
+} else {
+  console.warn(`[yx-dist] WARN: updater signature not found for selected setup: ${setupSig}`);
 }
 
 console.log("[yx-dist] === Portable ZIP / EXE ===");

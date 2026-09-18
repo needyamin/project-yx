@@ -245,7 +245,11 @@ export function MagicRemoveOverlay({
       radius: brushSize,
       erase: mode === "erase",
     };
-    strokesRef.current = [...strokes, stroke];
+    // During an in-flight commit the props lag behind; the local ref holds
+    // the authoritative strokes (see the sync guard above). Appending to the
+    // stale prop here used to silently DROP earlier unsaved strokes.
+    const base = committedRef.current !== null ? strokesRef.current : strokes;
+    strokesRef.current = [...base, stroke];
     drawStrokeLive();
   }
 

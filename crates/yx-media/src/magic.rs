@@ -63,6 +63,28 @@ pub struct MagicJob {
     pub accuracy: String,
     /// 0..1 blend of the reconstructed background over the original.
     pub strength: f64,
+    /// Clip-scoped work window in source seconds: only this range of the
+    /// media is tracked and rendered into the sidecar (sidecar t=0 is
+    /// `scope_in`). `scope_out <= scope_in` means "whole media" — the shape
+    /// legacy (unscoped) sidecars and params keep.
+    pub scope_in: f64,
+    pub scope_out: f64,
+}
+
+impl MagicJob {
+    /// True when the job is bounded to a sub-range of the source media.
+    pub fn is_scoped(&self) -> bool {
+        self.scope_out > self.scope_in + 1e-3
+    }
+
+    /// Source-media seconds covered by the job (full duration when unscoped).
+    fn window(&self, media_duration: f64) -> (f64, f64) {
+        if self.is_scoped() {
+            (self.scope_in, self.scope_out)
+        } else {
+            (0.0, media_duration)
+        }
+    }
 }
 
 impl MagicJob {
@@ -87,6 +109,11 @@ impl MagicJob {
             .unwrap_or("medium")
             .to_string();
         let anchor_time = num("anchorTime", 0.0).max(0.0);
+        // Clip-scoped work window (frontend stores the clip's in/out source
+        // times). Degenerate ranges fall back to "whole media".
+        let sin = num("scopeIn", 0.0).max(0.0);
+        let sout = num("scopeOut", 0.0).max(0.0);
+        let (scope_in, scope_out) = if sout > sin + 1e-3 { (sin, sout) } else { (0.0, 0.0) };
         Ok(Self {
             source: source.to_path_buf(),
             strokes,
@@ -96,6 +123,8 @@ impl MagicJob {
             expand: num("expand", 0.004).clamp(0.0, 0.02),
             accuracy,
             strength: num("removalStrength", 100.0).clamp(0.0, 100.0) / 100.0,
+            scope_in,
+            scope_out,
         })
     }
 
@@ -124,6 +153,10 @@ impl MagicJob {
         ((self.expand * 4096.0).round() as i64).hash(&mut h);
         self.accuracy.hash(&mut h);
         ((self.strength * 100.0).round() as i64).hash(&mut h);
+        // The scope bounds the rendered window, so it is part of the result
+        // identity: same mask on a different clip range = a different sidecar.
+        ((self.scope_in * 1000.0).round() as i64).hash(&mut h);
+        ((self.scope_out * 1000.0).round() as i64).hash(&mut h);
         h.finish()
     }
 }
@@ -492,11 +525,18 @@ pub fn track_mask(
         30.0
     };
     let total_frames = ((info.duration.max(0.1) * fps).ceil() as i64).max(1);
-    let anchor_idx = ((job.anchor_time * fps).round() as i64).clamp(0, total_frames - 1);
+    // Clip-scoped tracking: only walk frames inside the job's window.
+    let (win_start_t, win_end_t) = job.window(info.duration.max(0.1));
+    let start_idx = ((win_start_t * fps).floor() as i64).clamp(0, total_frames - 1);
+    let end_idx = ((win_end_t * fps).ceil() as i64).clamp(start_idx + 1, total_frames);
+    let anchor_idx = ((job.anchor_time * fps).round() as i64).clamp(start_idx, end_idx - 1);
     let (tw, th) = track_scale(info.width, info.height);
     let (radius, coarse) = search_window(&job.accuracy);
-    // Bound the backward window so memory stays flat on long clips (~45 s).
-    let back_window: i64 = ((45.0 * fps).round() as i64).min(anchor_idx).max(0);
+    // Bound the backward window so memory stays flat on long clips (~45 s)
+    // and never walks before the scoped window start.
+    let back_window: i64 = ((45.0 * fps).round() as i64)
+        .min(anchor_idx - start_idx)
+        .max(0);
 
     let mut reader = FrameReader::spawn(
         &job.source,
@@ -559,8 +599,11 @@ pub fn track_mask(
             since_refresh = 0;
         }
         let done = (idx - anchor_idx) as f64;
-        progress((done / total_frames as f64 * 0.5).min(0.5), "tracking");
-        if idx - anchor_idx > total_frames {
+        progress(
+            (done / (end_idx - anchor_idx).max(1) as f64 * 0.5).min(0.5),
+            "tracking",
+        );
+        if idx - anchor_idx >= end_idx - anchor_idx {
             break;
         }
     }
@@ -646,11 +689,12 @@ pub fn track_mask(
             });
         }
     }
-    // Constant extensions outside the tracked range.
+    // Constant extensions outside the tracked range (the window start, not
+    // necessarily media time 0 for clip-scoped jobs).
     if let Some(first) = sorted.first() {
-        if first.0 > 0 {
+        if first.0 > start_idx {
             kf.push(MagicKeyframe {
-                t: 0.0,
+                t: start_idx as f64 / fps,
                 dx: first.1 .0 as f64 / tw as f64,
                 dy: first.1 .1 as f64 / th as f64,
                 manual: false,
@@ -774,7 +818,11 @@ pub fn render_inpaint(
     } else {
         30.0
     };
-    let total_frames = ((info.duration.max(0.1) * fps).ceil() as usize).max(1);
+    // Clip-scoped render: decode only the job's window; the sidecar's t=0 is
+    // the window start (frontend/export remap clip in/out by `scope_in`).
+    let (win_start_t, win_end_t) = job.window(info.duration.max(0.1));
+    let win_dur = (win_end_t - win_start_t).max(0.1);
+    let total_frames = ((win_dur * fps).ceil() as usize).max(1);
 
     // Precompute the feathered alpha mask (offset 0) once; per-frame masks are
     // integer shifts of it (box blur is shift-invariant away from the border).
@@ -806,7 +854,17 @@ pub fn render_inpaint(
     let frame_bytes = w * h * 3;
     let lookahead = ((50 * 1024 * 1024) / frame_bytes.max(1)).clamp(2, 12) as usize;
 
-    let mut reader = FrameReader::spawn(&job.source, &[], "rgb24", None)?;
+    let scoped = job.is_scoped();
+    let mut input_opts: Vec<String> = Vec::new();
+    if scoped {
+        // A hair of padding on the tail so the last frame always decodes.
+        input_opts.push("-ss".into());
+        input_opts.push(format!("{win_start_t:.3}"));
+        input_opts.push("-t".into());
+        input_opts.push(format!("{:.3}", win_dur + 0.05));
+    }
+    let input_refs: Vec<&str> = input_opts.iter().map(|s| s.as_str()).collect();
+    let mut reader = FrameReader::spawn(&job.source, &input_refs, "rgb24", None)?;
     reader.frame_bytes = frame_bytes;
 
     let mut enc = command_ffmpeg();
@@ -894,7 +952,8 @@ pub fn render_inpaint(
             filled_lookahead += 1;
         }
 
-        let (fdx, fdy) = offset_at(&job.keyframes, fi as f64 / fps);
+        // Frame index is sidecar-relative; keyframes are source-absolute.
+        let (fdx, fdy) = offset_at(&job.keyframes, win_start_t + fi as f64 / fps);
         let sx = (fdx * w as f64).round() as i64;
         let sy = (fdy * h as f64).round() as i64;
         let shifted_binary: Option<Vec<bool>>;
@@ -1134,6 +1193,8 @@ mod tests {
             expand: 0.004,
             accuracy: "medium".into(),
             strength: 1.0,
+            scope_in: 0.0,
+            scope_out: 0.0,
         };
         let mut moved = base.clone();
         moved.strokes[0].points[0][0] += 0.01;
@@ -1159,5 +1220,143 @@ mod tests {
         assert_eq!(job.accuracy, "high");
         assert!((job.strength - 0.8).abs() < 1e-9);
         assert!(MagicJob::from_params(Path::new("v.mp4"), &serde_json::json!({}), vec![]).is_err());
+    }
+
+    #[test]
+    fn scope_parses_and_degenerates_to_full_media() {
+        let base = serde_json::json!({
+            "strokes": [{ "points": [[0.5, 0.5]], "radius": 0.05, "erase": false }],
+        });
+        let unscoped = MagicJob::from_params(Path::new("v.mp4"), &base, vec![]).unwrap();
+        assert!(!unscoped.is_scoped());
+        let (s, e) = unscoped.window(120.0);
+        assert_eq!((s, e), (0.0, 120.0));
+
+        let scoped_params = serde_json::json!({
+            "strokes": [{ "points": [[0.5, 0.5]], "radius": 0.05, "erase": false }],
+            "scopeIn": 10.0,
+            "scopeOut": 15.5
+        });
+        let scoped = MagicJob::from_params(Path::new("v.mp4"), &scoped_params, vec![]).unwrap();
+        assert!(scoped.is_scoped());
+        assert!((scoped.scope_in - 10.0).abs() < 1e-9);
+        assert!((scoped.scope_out - 15.5).abs() < 1e-9);
+        let (s, e) = scoped.window(120.0);
+        assert!((s - 10.0).abs() < 1e-9 && (e - 15.5).abs() < 1e-9);
+
+        // Inverted / degenerate ranges must not trip is_scoped.
+        let inverted = MagicJob::from_params(
+            Path::new("v.mp4"),
+            &serde_json::json!({
+                "strokes": [{ "points": [[0.5, 0.5]], "radius": 0.05, "erase": false }],
+                "scopeIn": 9.0,
+                "scopeOut": 9.0
+            }),
+            vec![],
+        )
+        .unwrap();
+        assert!(!inverted.is_scoped());
+    }
+
+    #[test]
+    fn cache_hash_changes_with_scope() {
+        let base = MagicJob {
+            source: PathBuf::from("a.mp4"),
+            strokes: vec![MagicStroke { points: vec![[0.1, 0.1]], radius: 0.02, erase: false }],
+            keyframes: vec![],
+            anchor_time: 1.0,
+            feather: 0.008,
+            expand: 0.004,
+            accuracy: "medium".into(),
+            strength: 1.0,
+            scope_in: 0.0,
+            scope_out: 0.0,
+        };
+        let mut scoped = base.clone();
+        scoped.scope_in = 10.0;
+        scoped.scope_out = 15.0;
+        assert_ne!(base.cache_hash(true), scoped.cache_hash(true));
+        // Same scope twice = stable key (cache hit across identical clips).
+        assert_eq!(scoped.cache_hash(true), scoped.clone().cache_hash(true));
+    }
+
+    /// End-to-end proof that a scoped job only touches its window: generate a
+    /// 10 s test clip, track+render with scope [2 s, 4 s], and measure the
+    /// sidecar. Needs a reachable ffmpeg (e.g. the bundled one on PATH):
+    /// `PATH="apps/desktop/src-tauri/bin:$PATH" cargo test -p yx-media \
+    ///  scoped_job_renders_only_its_window -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn scoped_job_renders_only_its_window() {
+        let dir = std::env::temp_dir().join(format!("yx_magic_scope_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src10s.mp4");
+        let mut gen = command_ffmpeg();
+        gen.args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=duration=10:size=320x240:rate=30",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+        ])
+        .arg(&src);
+        assert!(gen.status().expect("ffmpeg spawn").success(), "test media generation failed");
+
+        let mut job = MagicJob {
+            source: src.clone(),
+            strokes: vec![MagicStroke { points: vec![[0.5, 0.5]], radius: 0.08, erase: false }],
+            keyframes: vec![],
+            anchor_time: 2.5,
+            feather: 0.008,
+            expand: 0.004,
+            accuracy: "low".into(),
+            strength: 1.0,
+            scope_in: 2.0,
+            scope_out: 4.0,
+        };
+
+        // Tracking stays inside the window (keyframe times are source-absolute).
+        let kf = track_mask(&job, None, &|_, _| {}).unwrap();
+        assert!(!kf.is_empty());
+        let tmin = kf.iter().map(|k| k.t).fold(f64::INFINITY, f64::min);
+        let tmax = kf.iter().map(|k| k.t).fold(f64::NEG_INFINITY, f64::max);
+        assert!(tmin >= 2.0 - 1e-3, "tracked before window start: {tmin}");
+        assert!(tmax <= 4.0 + 0.2, "tracked past window end: {tmax}");
+
+        // The scoped sidecar covers only the ~2 s window, not the 10 s source.
+        let out = dir.join("scoped.mp4");
+        render_inpaint(&job, &out, None, &|_, _| {}).unwrap();
+        let info = probe_media(&out)
+            .map_err(|e| e.to_string())
+            .expect("probe scoped sidecar");
+        assert!(
+            info.duration > 1.2 && info.duration < 3.2,
+            "scoped sidecar should cover only the ~2 s window, got {:.2}s",
+            info.duration
+        );
+
+        // Unscoped sanity: the same job without a scope covers the whole media.
+        job.scope_in = 0.0;
+        job.scope_out = 0.0;
+        let full = dir.join("full.mp4");
+        render_inpaint(&job, &full, None, &|_, _| {}).unwrap();
+        let finfo = probe_media(&full)
+            .map_err(|e| e.to_string())
+            .expect("probe unscoped sidecar");
+        assert!(
+            finfo.duration > 8.5,
+            "unscoped render should cover the full media, got {:.2}s",
+            finfo.duration
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&full);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

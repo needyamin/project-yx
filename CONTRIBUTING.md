@@ -46,7 +46,7 @@ Windows: WebView2 + VS C++ Build Tools. FFmpeg: on PATH or `npm run prepare:bin`
 - Effects must stay roughly **WYSIWYG**: preview (CSS) and export (FFmpeg filters) read the same params.
 - "Best" export = source size, max quality — no forced downscale.
 - Weak CPUs come first: proxies and thread caps over raw power assumptions.
-- Version bumps must update **all four**: root `Cargo.toml`, `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, root `package.json`.
+- Version bumps: edit **root `package.json` only** — build scripts sync `Cargo.toml`, `apps/desktop/package.json` and `tauri.conf.json` automatically (or run `npm run version:sync`).
 
 ## Git workflow
 

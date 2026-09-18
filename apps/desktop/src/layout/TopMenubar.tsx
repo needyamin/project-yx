@@ -19,6 +19,8 @@ type Props = {
   onImport: () => void;
   onExport: () => void;
   onNewProject: () => void;
+  onOpenProject: () => void;
+  onSaveProject: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onDelete: () => void;
@@ -53,6 +55,8 @@ export function TopMenubar({
   onImport,
   onExport,
   onNewProject,
+  onOpenProject,
+  onSaveProject,
   onUndo,
   onRedo,
   onDelete,
@@ -151,6 +155,12 @@ export function TopMenubar({
         <Menu label="File" id="file" open={open} onToggle={toggle}>
           <button type="button" role="menuitem" disabled={busy} onClick={item(onNewProject)}>
             New Project
+          </button>
+          <button type="button" role="menuitem" disabled={busy} onClick={item(onOpenProject)}>
+            Open Project…
+          </button>
+          <button type="button" role="menuitem" disabled={busy} onClick={item(onSaveProject)}>
+            Save Project…
           </button>
           <button type="button" role="menuitem" disabled={busy} onClick={item(onImport)}>
             Import…

@@ -21,6 +21,7 @@ import {
   findMagicRemove,
   magicRenderKey,
   magicResultReady,
+  magicScopeShift,
   previewPitchRate,
   previewVideoStyle,
   previewVolumeGain,
@@ -40,6 +41,13 @@ import "./monitors/ProjectMonitor.css";
 import { MagicProgressDialog } from "./monitors/MagicProgressDialog";
 import { TimelinePanel } from "./timeline/TimelinePanel";
 import { reconcileTimeline } from "./timeline/reconcile";
+import {
+  engineEdit,
+  invalidatePending,
+  isCurrent,
+  nextSeq,
+  recordEngine,
+} from "./timeline/engineSync";
 import { playbackClock } from "./playback/playbackClock";
 import {
   clipAtPlayhead,
@@ -226,6 +234,10 @@ function App() {
   /** Panel values before the filter exists (first stroke creates it). */
   const [magicDraft, setMagicDraft] = useState<Record<string, unknown> | null>(null);
   const magicDraftRef = useRef<Record<string, unknown> | null>(null);
+  /** Serializes magicremove filter commits: two rapid stroke commits used to
+   * both see "no filter yet" and create DUPLICATE filters — downstream reads
+   * only the first one, so extra brushed regions were silently not removed. */
+  const magicCommitChainRef = useRef<Promise<unknown>>(Promise.resolve());
   const magicStatusTickRef = useRef(0);
   /** When the current Magic Remove job started (epoch ms). */
   const [magicStartedAt, setMagicStartedAt] = useState(0);
@@ -290,20 +302,19 @@ function App() {
     if (targets.length === 0) return;
     void (async () => {
       for (const clipId of targets) {
-        try {
-          const updated = normalizeTimeline(
-            await invoke<Timeline>("add_filter", {
-              clipId,
-              kind: "transform",
-              params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
-            }),
-          );
-          autoPipDoneRef.current.add(clipId);
-          setTimeline(updated);
-          setStatus("Overlay image sized to fit — drag it in the monitor to position");
-        } catch (e) {
-          setStatus(String(e));
-        }
+        const updated = await engineEdit<Timeline>(
+          "add_filter",
+          {
+            clipId,
+            kind: "transform",
+            params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+        if (!updated) continue;
+        autoPipDoneRef.current.add(clipId);
+        setTimeline(normalizeTimeline(updated));
+        setStatus("Overlay image sized to fit — drag it in the monitor to position");
       }
     })();
   }, [timeline]);
@@ -321,13 +332,56 @@ function App() {
   const refreshBoot = useCallback(async () => {
     const info = await invoke<BootInfo>("get_boot_info");
     setBoot(info);
-    setTimeline(normalizeTimeline(info.timeline));
-    setStatus(`Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`);
+    // Crash recovery: adopt the last session's autosave INTO THE ENGINE
+    // (adopt_autosave replaces engine state, so recovered clip ids stay
+    // valid for edits). Missing/corrupt/empty autosave → fresh boot.
+    let restored = false;
+    try {
+      const saved = await invoke<Timeline | null>("adopt_autosave");
+      if (saved) {
+        const next = normalizeTimeline(saved);
+        recordEngine(next);
+        setTimeline(next);
+        restored = true;
+      }
+    } catch {
+      /* recovery is best-effort — never block boot */
+    }
+    if (!restored) {
+      const next = normalizeTimeline(info.timeline);
+      recordEngine(next);
+      setTimeline(next);
+    }
+    setStatus(
+      restored
+        ? `Recovered unsaved changes from last session · ${info.policy.tier} tier`
+        : `Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`,
+    );
   }, []);
 
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
+
+  /** Autosave: debounced (3 s), engine-authoritative write. Rust serializes
+   * the ENGINE timeline — a UI/state divergence can never be persisted.
+   * Always saved, even when empty, so "deleted everything" is a real state
+   * that must not resurrect an older session after a crash. */
+  const autosaveTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!timeline) return;
+    if (autosaveTimerRef.current != null) window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = null;
+      void invoke("save_autosave").catch(() => {});
+    }, 3000);
+    return () => {
+      if (autosaveTimerRef.current != null) {
+        window.clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
+  }, [timeline]);
 
   // Magic Remove pipeline progress (tracking / background reconstruction).
   useEffect(() => {
@@ -374,12 +428,12 @@ function App() {
     let unlisten: (() => void) | undefined;
     void listen<{ sourcePath: string; proxyPath: string }>("proxy-ready", (event) => {
       const { sourcePath, proxyPath } = event.payload;
-      void invoke<Timeline>("swap_timeline_media", { sourcePath, proxyPath })
-        .then((next) => {
+      void engineEdit<Timeline>("swap_timeline_media", { sourcePath, proxyPath }).then((next) => {
+        if (next) {
           setTimeline(normalizeTimeline(next));
           setStatus("Proxy ready — preview now plays the proxy file");
-        })
-        .catch(() => undefined);
+        }
+      });
     }).then((fn) => {
       unlisten = fn;
     });
@@ -476,6 +530,7 @@ function App() {
         if (!magicTool) {
           const rp = magicResultReady(
             (findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null,
+            clip,
           );
           if (rp) return rp;
         }
@@ -499,17 +554,24 @@ function App() {
     const out: { clip: Clip; src: string; isImage: boolean }[] = [];
     for (const { clip } of videoStack.slice(1)) {
       // Magic Remove overlay layers preview through their sidecar too.
-      const rp = magicResultReady(
-        (findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null,
-      );
+      const params = (findMagicRemove(clip.filters)?.params ??
+        null) as Record<string, unknown> | null;
+      const rp = magicResultReady(params, clip);
       const path = rp ?? clip.media_path;
+      // Scoped sidecar: remap the layer's in/out into sidecar time so the
+      // layer's element-time mapping (mediaTimeForClip) lines up.
+      const shift = rp ? magicScopeShift(params) : 0;
+      const view =
+        shift > 0
+          ? { ...clip, in_point: clip.in_point - shift, out_point: clip.out_point - shift }
+          : clip;
       let src: string | null = null;
       try {
         src = convertFileSrc(path);
       } catch {
         src = null;
       }
-      if (src) out.push({ clip, src, isImage: isImagePath(path) });
+      if (src) out.push({ clip: view, src, isImage: isImagePath(path) });
     }
     return out;
   }, [timeline, videoStack]);
@@ -646,7 +708,9 @@ function App() {
         const tl = timelineRef.current;
         const hit = tl ? clipAtPlayhead(tl, ph, "video") : videoUnderRef.current;
         if (hit) {
-          video.currentTime = mediaTimeForClip(hit.clip, ph);
+          const target = previewTarget(hit.clip);
+          video.currentTime =
+            mediaTimeForClip(hit.clip, ph) - (target.path === previewPath ? target.shift : 0);
         }
         syncAudioLocal();
         syncAudio2();
@@ -671,7 +735,9 @@ function App() {
         const tl = timelineRef.current;
         const hit = tl ? clipAtPlayhead(tl, ph, "video") : videoUnderRef.current;
         if (hit) {
-          const want = mediaTimeForClip(hit.clip, ph);
+          const target = previewTarget(hit.clip);
+          const want =
+            mediaTimeForClip(hit.clip, ph) - (target.path === previewPath ? target.shift : 0);
           if (Math.abs(video.currentTime - want) > 0.05) {
             video.currentTime = want;
           }
@@ -711,7 +777,7 @@ function App() {
       audio.addEventListener("loadedmetadata", onMeta, { once: true });
       return () => audio.removeEventListener("loadedmetadata", onMeta);
     }
-  }, [previewSrc, timelineAudioSrc, timelineAudio2Src, previewMode, audioUnderPlayhead2]);
+  }, [previewSrc, previewPath, timelineAudioSrc, timelineAudio2Src, previewMode, audioUnderPlayhead2]);
 
   /** Re-detect which clips cover the playhead. Runs on every seek frame and
    * playback tick, but only touches React state when the covering set actually
@@ -814,10 +880,20 @@ function App() {
       if (mode === "video" && isImagePath(hit.clip.media_path)) return;
 
       const speed = clipSpeed(hit.clip);
+      // Clip-scoped sidecar: element time runs in sidecar time (t=0 is
+      // scopeIn); convert to source media time before mapping to the timeline.
+      // The shift only applies once the element actually plays the sidecar —
+      // between a render finishing and the source swap landing, the element
+      // still holds the original, whose time needs no shift.
+      const target = previewTarget(hit.clip);
+      const elSrc = active.getAttribute("src");
+      const shift =
+        elSrc && convertFileSrcSafe(target.path) === elSrc ? target.shift : 0;
+      const srcMedia = mediaTime + shift;
       const reversed = mode === "video" && !!hit.clip.reverse;
       const localMedia = reversed
-        ? hit.clip.out_point - mediaTime
-        : mediaTime - hit.clip.in_point;
+        ? hit.clip.out_point - srcMedia
+        : srcMedia - hit.clip.in_point;
       const timelineTime = hit.clip.start + localMedia / speed;
       commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
 
@@ -860,13 +936,17 @@ function App() {
       const clipEnd = hit.clip.start + clipTimelineDuration(hit.clip);
       if (
         timelineTime >= clipEnd - 0.02 ||
-        active.currentTime >= hit.clip.out_point - 0.02
+        active.currentTime >= hit.clip.out_point - shift - 0.02
       ) {
         const next = tl
           ? nextClipAfter(tl, clipEnd, mode === "video" ? "video" : "audio")
           : null;
         if (next && next.clip.id !== hit.clip.id) {
-          const isSameMedia = next.clip.media_path === hit.clip.media_path;
+          const nextTarget = previewTarget(next.clip);
+          // "Same media" means the same PLAYING file: two adjacent instances
+          // of one source can carry different scoped sidecars, and those must
+          // take the cut path (source swap) instead of an in-file seek.
+          const isSameMedia = nextTarget.path === target.path;
           const isContiguousTimeline = next.clip.start <= clipEnd + 0.04;
           const isContinuousMedia =
             Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
@@ -877,7 +957,7 @@ function App() {
             return;
           } else if (isSameMedia && isContiguousTimeline) {
             // Same media, in_point jumped: seek within the loaded file.
-            active.currentTime = next.clip.in_point;
+            active.currentTime = next.clip.in_point - nextTarget.shift;
             commitPlayhead(next.clip.start, false);
             return;
           } else if (isContiguousTimeline) {
@@ -1206,43 +1286,39 @@ function App() {
     const overVideo = hasVideoAtPlayhead();
     let cursor = playheadRef.current;
     for (const path of paths) {
-      try {
-        const next = await invoke<Timeline>("add_media_to_timeline", {
+      const next = await engineEdit<Timeline>(
+        "add_media_to_timeline",
+        {
           mediaPath: path,
           start: cursor,
-        });
-        const tl = normalizeTimeline(next);
-        setTimeline(tl);
-        const placed = tl.tracks
-          .flatMap((t) => t.clips)
-          .filter((c) => c.media_path === path)
-          .sort((a, b) => a.start - b.start)[0];
-        if (placed) {
-          cursor = placed.start + clipTimelineDuration(placed);
-          setSelectedClipId(placed.id);
-          if (overVideo && !(placed.filters ?? []).some((f) => f.kind === "transform")) {
-            try {
-              const withTf = normalizeTimeline(
-                await invoke<Timeline>("add_filter", {
-                  clipId: placed.id,
-                  kind: "transform",
-                  params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
-                }),
-              );
-              setTimeline(withTf);
-            } catch {
-              /* overlay still works full-frame without the default size */
-            }
-          }
+        },
+        { onError: (e) => setStatus(String(e)) },
+      );
+      if (!next) continue;
+      const tl = normalizeTimeline(next);
+      setTimeline(tl);
+      const placed = tl.tracks
+        .flatMap((t) => t.clips)
+        .filter((c) => c.media_path === path)
+        .sort((a, b) => a.start - b.start)[0];
+      if (placed) {
+        cursor = placed.start + clipTimelineDuration(placed);
+        setSelectedClipId(placed.id);
+        if (overVideo && !(placed.filters ?? []).some((f) => f.kind === "transform")) {
+          const withTf = await engineEdit<Timeline>("add_filter", {
+            clipId: placed.id,
+            kind: "transform",
+            params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+          });
+          if (withTf) setTimeline(normalizeTimeline(withTf));
+          /* overlay still works full-frame without the default size */
         }
-        setStatus(
-          overVideo
-            ? `Placed ${fileName(path)} over the video — drag it in the monitor to position it`
-            : `Placed ${fileName(path)} on the timeline`,
-        );
-      } catch (e) {
-        setStatus(String(e));
       }
+      setStatus(
+        overVideo
+          ? `Placed ${fileName(path)} over the video — drag it in the monitor to position it`
+          : `Placed ${fileName(path)} on the timeline`,
+      );
     }
   }
 
@@ -1279,24 +1355,29 @@ function App() {
       ...prevParams,
       text: clipped,
     };
-    try {
-      const updated = existing
-        ? await invoke<Timeline>("update_filter", {
-          clipId: clip.id,
-          filterId: existing.id,
-          params,
-        })
-        : await invoke<Timeline>("add_filter", {
-          clipId: clip.id,
-          kind: "text",
-          params,
-        });
-      setTimeline(normalizeTimeline(updated));
-      setSelectedClipId(clip.id);
-      setStatus(existing ? `Title updated from ${fileName(path)}` : `Added title from ${fileName(path)}`);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const updated = existing
+      ? await engineEdit<Timeline>(
+          "update_filter",
+          {
+            clipId: clip.id,
+            filterId: existing.id,
+            params,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        )
+      : await engineEdit<Timeline>(
+          "add_filter",
+          {
+            clipId: clip.id,
+            kind: "text",
+            params,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+    if (!updated) return;
+    setTimeline(normalizeTimeline(updated));
+    setSelectedClipId(clip.id);
+    setStatus(existing ? `Title updated from ${fileName(path)}` : `Added title from ${fileName(path)}`);
   }
 
   /** Images from the project bin for the monitor's image picker — deduped
@@ -1505,10 +1586,15 @@ function App() {
     const targetStart = start ?? playheadRef.current;
     try {
       setBusy(true);
-      const next = await invoke<Timeline>("add_media_to_timeline", {
-        mediaPath: media.path,
-        start: targetStart,
-      });
+      const next = await engineEdit<Timeline>(
+        "add_media_to_timeline",
+        {
+          mediaPath: media.path,
+          start: targetStart,
+        },
+        { onError: (e) => setStatus(String(e)) },
+      );
+      if (!next) return;
       let tlUpdated = normalizeTimeline(next);
       // Select the clip that was actually placed (Rust stores the playback
       // path, so match on the original source_path).
@@ -1529,18 +1615,19 @@ function App() {
           isImagePath(media.path) &&
           !(placed.filters ?? []).some((f) => f.kind === "transform")
         ) {
-          try {
-            tlUpdated = normalizeTimeline(
-              await invoke<Timeline>("add_filter", {
-                clipId: placed.id,
-                kind: "transform",
-                params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
-              }),
-            );
+          const withTf = await engineEdit<Timeline>(
+            "add_filter",
+            {
+              clipId: placed.id,
+              kind: "transform",
+              params: { x: 0, y: 0, scale: 0.5, rotation: 0, opacity: 1 },
+            },
+          );
+          if (withTf) {
+            tlUpdated = normalizeTimeline(withTf);
             setTimeline(tlUpdated);
-          } catch {
-            /* overlay still works full-frame without the default size */
           }
+          /* overlay still works full-frame without the default size */
         }
         seekTimeline(placed.start);
       }
@@ -1552,16 +1639,18 @@ function App() {
             ? "video"
             : "audio";
       setStatus(`Added ${media.name} as ${kind} at ${formatTime(placed ? placed.start : targetStart)}`);
-    } catch (e) {
-      setStatus(String(e));
     } finally {
       setBusy(false);
     }
   }
 
   async function onUndo() {
+    const seq = nextSeq();
     try {
-      setTimeline(normalizeTimeline(await invoke<Timeline>("undo")));
+      const next = normalizeTimeline(await invoke<Timeline>("undo"));
+      if (!isCurrent(seq)) return; // a newer edit superseded this undo
+      recordEngine(next);
+      setTimeline(next);
       setStatus("Undo");
     } catch (e) {
       setStatus(String(e));
@@ -1569,8 +1658,12 @@ function App() {
   }
 
   async function onRedo() {
+    const seq = nextSeq();
     try {
-      setTimeline(normalizeTimeline(await invoke<Timeline>("redo")));
+      const next = normalizeTimeline(await invoke<Timeline>("redo"));
+      if (!isCurrent(seq)) return; // a newer edit superseded this redo
+      recordEngine(next);
+      setTimeline(next);
       setStatus("Redo");
     } catch (e) {
       setStatus(String(e));
@@ -1579,67 +1672,65 @@ function App() {
 
   async function onRemove() {
     if (!selectedClipId) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("remove_clip", {
-            clipId: selectedClipId,
-            removeLinked: true,
-          }),
-        ),
-      );
-      setSelectedClipId(null);
-      setStatus("Clip deleted");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "remove_clip",
+      {
+        clipId: selectedClipId,
+        removeLinked: true,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setSelectedClipId(null);
+    setStatus("Clip deleted");
   }
 
   async function onRippleDelete() {
     if (!selectedClipId) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("ripple_delete", {
-            clipId: selectedClipId,
-            removeLinked: true,
-          }),
-        ),
-      );
-      setSelectedClipId(null);
-      setStatus("Ripple delete");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "ripple_delete",
+      {
+        clipId: selectedClipId,
+        removeLinked: true,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setSelectedClipId(null);
+    setStatus("Ripple delete");
   }
 
   async function onToggleLink() {
     if (!selectedClipId || !selectedClip || !timeline) return;
-    try {
-      if (selectedClip.clip.linked_clip_id) {
-        setTimeline(
-          normalizeTimeline(await invoke<Timeline>("unlink_clip", { clipId: selectedClipId })),
-        );
-        setStatus("Unlinked");
-        return;
-      }
-      const partner = findLinkPartner(timeline, selectedClip.clip, playheadRef.current);
-      if (!partner) {
-        setStatus("No audio/video partner found to link");
-        return;
-      }
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("link_clips", {
-            clipA: selectedClip.clip.id,
-            clipB: partner.id,
-          }),
-        ),
+    if (selectedClip.clip.linked_clip_id) {
+      const next = await engineEdit<Timeline>(
+        "unlink_clip",
+        { clipId: selectedClipId },
+        { onError: (e) => setStatus(String(e)) },
       );
-      setStatus("Linked A/V");
-    } catch (e) {
-      setStatus(String(e));
+      if (!next) return;
+      setTimeline(normalizeTimeline(next));
+      setStatus("Unlinked");
+      return;
     }
+    const partner = findLinkPartner(timeline, selectedClip.clip, playheadRef.current);
+    if (!partner) {
+      setStatus("No audio/video partner found to link");
+      return;
+    }
+    const next = await engineEdit<Timeline>(
+      "link_clips",
+      {
+        clipA: selectedClip.clip.id,
+        clipB: partner.id,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Linked A/V");
   }
 
   async function onFilter(kind: string) {
@@ -1675,144 +1766,148 @@ function App() {
     if (!hit) {
       return null;
     }
-    try {
-      if (kind === "volume") {
-        const gain =
-          typeof params?.gain === "number" ? (params.gain as number) : 1;
-        let vol = hit.clip.filters?.find((f) => f.kind === "volume");
-        let next: Timeline;
-        if (!vol) {
-          next = normalizeTimeline(
-            await invoke<Timeline>("add_filter", {
-              clipId,
-              kind: "volume",
-              params: { gain },
-            }),
-          );
-          vol = next.tracks
-            .flatMap((t) => t.clips)
-            .find((c) => c.id === clipId)
-            ?.filters?.find((f) => f.kind === "volume");
-        } else {
-          next = normalizeTimeline(
-            await invoke<Timeline>("update_filter", {
-              clipId,
-              filterId: vol.id,
-              params: { gain },
-            }),
-          );
-        }
+    const onError = (e: unknown) => setStatus(String(e));
+    if (kind === "volume") {
+      const gain =
+        typeof params?.gain === "number" ? (params.gain as number) : 1;
+      let vol = hit.clip.filters?.find((f) => f.kind === "volume");
+      let next: Timeline | null;
+      if (!vol) {
+        next = await engineEdit<Timeline>(
+          "add_filter",
+          {
+            clipId,
+            kind: "volume",
+            params: { gain },
+          },
+          { onError },
+        );
+        if (!next) return null;
+        next = normalizeTimeline(next);
+        vol = next.tracks
+          .flatMap((t) => t.clips)
+          .find((c) => c.id === clipId)
+          ?.filters?.find((f) => f.kind === "volume");
+      } else {
+        next = await engineEdit<Timeline>(
+          "update_filter",
+          {
+            clipId,
+            filterId: vol.id,
+            params: { gain },
+          },
+          { onError },
+        );
+        if (!next) return null;
+        next = normalizeTimeline(next);
+      }
+      setTimeline(next);
+      setSelectedClipId(clipId);
+      setFocusFilterId(vol?.id ?? null);
+      setBinFilter("applied");
+      setStatus("Volume on clip — adjust under Applied");
+      return vol?.id ?? null;
+    }
+
+    if (UPSERT_FILTER_KINDS.has(kind)) {
+      const existing = hit.clip.filters?.find((f) => f.kind === kind);
+      if (existing) {
+        const nextParams = {
+          ...((existing.params ?? {}) as Record<string, unknown>),
+          ...(params ?? {}),
+        };
+        const resp = await engineEdit<Timeline>(
+          "update_filter",
+          {
+            clipId,
+            filterId: existing.id,
+            params: nextParams,
+          },
+          { onError },
+        );
+        if (!resp) return null;
+        const next = normalizeTimeline(resp);
         setTimeline(next);
         setSelectedClipId(clipId);
-        setFocusFilterId(vol?.id ?? null);
+        setFocusFilterId(existing.id);
         setBinFilter("applied");
-        setStatus("Volume on clip — adjust under Applied");
-        return vol?.id ?? null;
+        const label = effectLabel(kind);
+        setStatus(
+          kind === "denoise"
+            ? "Noise remove on clip — see Applied (heard on export)"
+            : `${label} updated — adjust under Applied (heard on export)`,
+        );
+        return existing.id;
       }
-
-      if (UPSERT_FILTER_KINDS.has(kind)) {
-        const existing = hit.clip.filters?.find((f) => f.kind === kind);
-        if (existing) {
-          const nextParams = {
-            ...((existing.params ?? {}) as Record<string, unknown>),
-            ...(params ?? {}),
-          };
-          const next = normalizeTimeline(
-            await invoke<Timeline>("update_filter", {
-              clipId,
-              filterId: existing.id,
-              params: nextParams,
-            }),
-          );
-          setTimeline(next);
-          setSelectedClipId(clipId);
-          setFocusFilterId(existing.id);
-          setBinFilter("applied");
-          const label = effectLabel(kind);
-          setStatus(
-            kind === "denoise"
-              ? "Noise remove on clip — see Applied (heard on export)"
-              : `${label} updated — adjust under Applied (heard on export)`,
-          );
-          return existing.id;
-        }
-      }
-
-      const next = normalizeTimeline(
-        await invoke<Timeline>("add_filter", {
-          clipId,
-          kind,
-          params: { ...defaultParams(kind), ...(params ?? {}) },
-        }),
-      );
-      setTimeline(next);
-      const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
-      const added = [...(clip?.filters ?? [])].reverse().find((f) => f.kind === kind);
-      setSelectedClipId(clipId);
-      setFocusFilterId(added?.id ?? null);
-      setBinFilter("applied");
-      const label = effectLabel(kind);
-      setStatus(
-        kind === "denoise"
-          ? "Noise remove on clip — see Applied (heard on export)"
-          : `${label} on clip — adjust under Applied (heard on export)`,
-      );
-      return added?.id ?? null;
-    } catch (e) {
-      setStatus(String(e));
-      return null;
     }
+
+    const resp = await engineEdit<Timeline>(
+      "add_filter",
+      {
+        clipId,
+        kind,
+        params: { ...defaultParams(kind), ...(params ?? {}) },
+      },
+      { onError },
+    );
+    if (!resp) return null;
+    const next = normalizeTimeline(resp);
+    setTimeline(next);
+    const clip = next.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+    const added = [...(clip?.filters ?? [])].reverse().find((f) => f.kind === kind);
+    setSelectedClipId(clipId);
+    setFocusFilterId(added?.id ?? null);
+    setBinFilter("applied");
+    const label = effectLabel(kind);
+    setStatus(
+      kind === "denoise"
+        ? "Noise remove on clip — see Applied (heard on export)"
+        : `${label} on clip — adjust under Applied (heard on export)`,
+    );
+    return added?.id ?? null;
   }
 
   async function updateFilterParams(filterId: string, params: Record<string, unknown>) {
     if (!selectedClipId) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("update_filter", {
-            clipId: selectedClipId,
-            filterId,
-            params,
-          }),
-        ),
-      );
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "update_filter",
+      {
+        clipId: selectedClipId,
+        filterId,
+        params,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (next) setTimeline(normalizeTimeline(next));
   }
 
   async function toggleFilter(filterId: string, enabled: boolean) {
     if (!selectedClipId) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_filter_enabled", {
-            clipId: selectedClipId,
-            filterId,
-            enabled,
-          }),
-        ),
-      );
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_filter_enabled",
+      {
+        clipId: selectedClipId,
+        filterId,
+        enabled,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (next) setTimeline(normalizeTimeline(next));
   }
 
   async function removeFilter(filterId: string) {
     if (!selectedClipId) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("remove_filter", {
-            clipId: selectedClipId,
-            filterId,
-          }),
-        ),
-      );
-      setStatus("Effect removed");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "remove_filter",
+      {
+        clipId: selectedClipId,
+        filterId,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Effect removed");
   }
 
   function findClipById(clipId: string) {
@@ -1847,6 +1942,30 @@ function App() {
     return null;
   }
 
+  /** Preview source for a clip: the ready Magic Remove sidecar (WYSIWYG) or
+   * the original media, plus the additive element→source time shift for
+   * clip-scoped sidecars (sidecar t=0 == scopeIn). Single source of truth for
+   * every monitor source swap and element-time mapping — the playback clock,
+   * seeks and reverse stepping all go through this, so a scoped sidecar is
+   * time-aligned exactly like the original file would be. */
+  function previewTarget(clip: Clip): { path: string; shift: number } {
+    if (magicToolRef.current) return { path: clip.media_path, shift: 0 };
+    const params = (findMagicRemove(clip.filters)?.params ??
+      null) as Record<string, unknown> | null;
+    const rp = magicResultReady(params, clip);
+    if (!rp) return { path: clip.media_path, shift: 0 };
+    return { path: rp, shift: magicScopeShift(params) };
+  }
+
+  /** Element-src comparison for the sidecar-shift guard (never throws). */
+  function convertFileSrcSafe(path: string): string {
+    try {
+      return convertFileSrc(path);
+    } catch {
+      return "";
+    }
+  }
+
   /** Clip-scoped filter param update (updateFilterParams is bound to the
    * selected clip, which may differ from the clip under the playhead).
    * Returns the fresh Timeline so callers can read back the saved filter
@@ -1856,10 +1975,16 @@ function App() {
     filterId: string,
     params: Record<string, unknown>,
   ): Promise<Timeline | null> {
+    // Central path for transform/text-overlay drags, effect sliders and
+    // magic commits — rapid-fire update_filter invokes whose responses can
+    // complete out of order. Latest-wins: older responses are dropped.
+    const seq = nextSeq();
     try {
       const next = normalizeTimeline(
         await invoke<Timeline>("update_filter", { clipId, filterId, params }),
       );
+      if (!isCurrent(seq)) return null; // superseded by a newer commit
+      recordEngine(next);
       setTimeline(next);
       return next;
     } catch (e) {
@@ -1887,12 +2012,59 @@ function App() {
       .slice(0, 200);
   }
 
+  /** Run a magic commit after every previously queued one has settled, so
+   * timelineRef is up to date when the "existing filter?" check runs. */
+  function queueMagic<T>(fn: () => Promise<T>): Promise<T> {
+    const chained = magicCommitChainRef.current.then(fn, fn);
+    magicCommitChainRef.current = chained.catch(() => {});
+    return chained;
+  }
+
+  /** Merge every magicremove filter on a clip into the FIRST one (union of
+   * strokes) and remove the rest. Earlier builds could stack duplicates via
+   * the commit race; render/export read only the first filter, so the extra
+   * filters' regions were never removed. */
+  async function consolidateMagicFilters(clipId: string): Promise<string | null> {
+    const clip =
+      timelineRef.current?.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId) ??
+      null;
+    const dups = (clip?.filters ?? []).filter((f) => f.kind === "magicremove");
+    if (dups.length <= 1) return dups[0]?.id ?? null;
+    const [first, ...rest] = dups;
+    const mergedStrokes = dups.flatMap((f) => {
+      const s = (f.params as Record<string, unknown> | undefined)?.strokes;
+      return Array.isArray(s) ? s : [];
+    });
+    await updateFilterParamsOnClip(clipId, first.id, {
+      ...((first.params ?? {}) as Record<string, unknown>),
+      strokes: mergedStrokes,
+    });
+    for (const dup of rest) {
+      const next = await engineEdit<Timeline>("remove_filter", {
+        clipId,
+        filterId: dup.id,
+      });
+      /* already gone */
+      if (next) setTimeline(normalizeTimeline(next));
+    }
+    setStatus(`✨ Magic Remove: merged ${dups.length} masks into one`);
+    return first.id;
+  }
+
   /** Add or update the magicremove filter and return the SAVED filter read
    * from the invoke response — immune to stale timeline state. */
   async function commitMagicFilter(
     clipId: string,
     patch: Record<string, unknown>,
   ): Promise<{ filterId: string; params: Record<string, unknown> } | null> {
+    return queueMagic(() => commitMagicFilterNow(clipId, patch));
+  }
+
+  async function commitMagicFilterNow(
+    clipId: string,
+    patch: Record<string, unknown>,
+  ): Promise<{ filterId: string; params: Record<string, unknown> } | null> {
+    await consolidateMagicFilters(clipId);
     const tl = timelineRef.current;
     const clip = tl?.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
     const existing = clip?.filters?.find((x) => x.kind === "magicremove");
@@ -1905,22 +2077,21 @@ function App() {
     }
     const hasStrokes = Array.isArray(patch.strokes) && patch.strokes.length > 0;
     if (!hasStrokes) return null; // nothing durable to persist yet
-    try {
-      const next = normalizeTimeline(
-        await invoke<Timeline>("add_filter", {
-          clipId,
-          kind: "magicremove",
-          params: { ...defaultParams("magicremove"), ...magicDraftRef.current, ...patch },
-        }),
-      );
-      setTimeline(next);
-      setMagicDraft(null);
-      magicDraftRef.current = null;
-      return findMagicIn(next, clipId);
-    } catch (e) {
-      setStatus(String(e));
-      return null;
-    }
+    const resp = await engineEdit<Timeline>(
+      "add_filter",
+      {
+        clipId,
+        kind: "magicremove",
+        params: { ...defaultParams("magicremove"), ...magicDraftRef.current, ...patch },
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!resp) return null;
+    const next = normalizeTimeline(resp);
+    setTimeline(next);
+    setMagicDraft(null);
+    magicDraftRef.current = null;
+    return findMagicIn(next, clipId);
   }
 
   /** Find the magicremove filter on a clip object. */
@@ -1932,12 +2103,20 @@ function App() {
    * created ONLY on the first stroke commit (a single invoke, no race) —
    * slider tweaks before that live in the local draft. */
   async function upsertMagicParams(patch: Record<string, unknown>) {
+    return queueMagic(() => upsertMagicParamsNow(patch));
+  }
+
+  async function upsertMagicParamsNow(patch: Record<string, unknown>) {
     const target = resolveMagicTarget();
     if (!target) {
       setStatus("No video clip under the playhead");
       return;
     }
-    const existing = magicFilterOf(target);
+    await consolidateMagicFilters(target.id);
+    const existing = magicFilterOf(
+      timelineRef.current?.tracks.flatMap((t) => t.clips).find((c) => c.id === target.id) ??
+        null,
+    );
     if (existing) {
       await updateFilterParamsOnClip(target.id, existing.id, {
         ...((existing.params ?? {}) as Record<string, unknown>),
@@ -1960,22 +2139,22 @@ function App() {
     };
     setMagicDraft(null);
     magicDraftRef.current = null;
-    try {
-      const next = normalizeTimeline(
-        await invoke<Timeline>("add_filter", {
-          clipId: target.id,
-          kind: "magicremove",
-          params,
-        }),
-      );
-      setTimeline(next);
-      const added = magicFilterOf(
-        next.tracks.flatMap((t) => t.clips).find((c) => c.id === target.id) ?? null,
-      );
-      if (added) setFocusFilterId(added.id);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const resp = await engineEdit<Timeline>(
+      "add_filter",
+      {
+        clipId: target.id,
+        kind: "magicremove",
+        params,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!resp) return;
+    const next = normalizeTimeline(resp);
+    setTimeline(next);
+    const added = magicFilterOf(
+      next.tracks.flatMap((t) => t.clips).find((c) => c.id === target.id) ?? null,
+    );
+    if (added) setFocusFilterId(added.id);
   }
 
   function toggleMagicTool(on: boolean) {
@@ -1993,27 +2172,11 @@ function App() {
         setPlaying(false);
       }
       if (selectedClipId !== target.id) setSelectedClipId(target.id);
-      // Heal duplicates: earlier sessions could stack several magicremove
-      // filters on a clip (each brush stroke used to re-add one). Keep the
-      // first — it holds the mask — and drop the rest.
-      const dups = (target.filters ?? []).filter((f) => f.kind === "magicremove");
-      if (dups.length > 1) {
-        void (async () => {
-          for (const dup of dups.slice(1)) {
-            try {
-              setTimeline(
-                normalizeTimeline(
-                  await invoke<Timeline>("remove_filter", {
-                    clipId: target.id,
-                    filterId: dup.id,
-                  }),
-                ),
-              );
-            } catch {
-              /* already gone */
-            }
-          }
-        })();
+      // Heal duplicates: earlier builds could stack several magicremove
+      // filters on a clip (commit race). Merge their strokes into the first
+      // and drop the rest — only the first filter is ever rendered.
+      if ((target.filters ?? []).filter((f) => f.kind === "magicremove").length > 1) {
+        void queueMagic(() => consolidateMagicFilters(target.id));
       }
     }
     setMagicTool(on);
@@ -2064,12 +2227,17 @@ function App() {
         if (!f) throw new Error("Could not save the mask — brush again and retry");
       }
       const p = f.params;
+      // Clip-scoped work window: track (and later render) only the source
+      // range this clip instance actually uses — keyframe times stay
+      // source-absolute so the Adjust tool and overlay need no remapping.
+      const scope = { scopeIn: clip.in_point, scopeOut: clip.out_point };
       const res = await invoke<{ keyframes: MagicKeyframe[] }>("magic_remove_track", {
         source: clip.media_path,
-        params: { ...p },
+        params: { ...p, ...scope },
       });
       await updateFilterParamsOnClip(clip.id, f.filterId, {
         ...p,
+        ...scope,
         keyframes: res.keyframes ?? [],
         status: "tracked",
         resultPath: "",
@@ -2112,17 +2280,19 @@ function App() {
         if (!f) throw new Error("Could not save the mask — brush again and retry");
       }
       const p = f.params;
-      const srcDur = library.find((m) => m.path === clip.media_path)?.duration ?? 0;
+      const scope = { scopeIn: clip.in_point, scopeOut: clip.out_point };
+      const clipLen = clipTimelineDuration(clip);
       setStatus(
-        `✨ Magic Remove: rebuilding the background across ${fmtLen(srcDur)} of video — longer clips take longer. Keep editing; progress shows on the monitor.`,
+        `✨ Magic Remove: rebuilding the background across ${fmtLen(clipLen)} of this clip — longer clips take longer. Keep editing; progress shows on the monitor.`,
       );
       const path = await invoke<string>("magic_remove_render", {
         source: clip.media_path,
-        params: { ...p },
+        params: { ...p, ...scope },
         keyframes: Array.isArray(p.keyframes) ? p.keyframes : [],
       });
       const saved = await updateFilterParamsOnClip(clip.id, f.filterId, {
         ...p,
+        ...scope,
         resultPath: path,
         renderKey: magicRenderKey(p),
         status: "ready",
@@ -2255,96 +2425,88 @@ function App() {
     if (!hit) return;
     const filters = (hit.clip.filters ?? []).filter((f) => f.kind === kind);
     if (filters.length === 0) return;
-    try {
-      let next: Timeline | null = null;
-      for (const f of filters) {
-        next = normalizeTimeline(
-          await invoke<Timeline>("remove_filter", {
-            clipId,
-            filterId: f.id,
-          }),
-        );
-      }
-      if (next) setTimeline(next);
-      setStatus(`${effectLabel(kind)} removed`);
-    } catch (e) {
-      setStatus(String(e));
+    let next: Timeline | null = null;
+    for (const f of filters) {
+      const removed = await engineEdit<Timeline>(
+        "remove_filter",
+        {
+          clipId,
+          filterId: f.id,
+        },
+        { onError: (e) => setStatus(String(e)) },
+      );
+      if (!removed) return;
+      next = normalizeTimeline(removed);
     }
+    if (next) setTimeline(next);
+    setStatus(`${effectLabel(kind)} removed`);
   }
 
   async function ensureVolumeGain(clipId: string, gain: number) {
     const hit = findClipById(clipId);
     if (!hit) return;
-    try {
-      let filters = hit.clip.filters ?? [];
-      let vol = filters.find((f) => f.kind === "volume");
-      if (!vol) {
-        const next = normalizeTimeline(
-          await invoke<Timeline>("add_filter", { clipId, kind: "volume" }),
-        );
-        setTimeline(next);
-        const again = next.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
-        vol = again?.filters?.find((f) => f.kind === "volume");
-      }
-      if (!vol) return;
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("update_filter", {
-            clipId,
-            filterId: vol.id,
-            params: { gain },
-          }),
-        ),
+    let filters = hit.clip.filters ?? [];
+    let vol = filters.find((f) => f.kind === "volume");
+    if (!vol) {
+      const resp = await engineEdit<Timeline>(
+        "add_filter",
+        { clipId, kind: "volume" },
+        { onError: (e) => setStatus(String(e)) },
       );
-    } catch (e) {
-      setStatus(String(e));
+      if (!resp) return;
+      const next = normalizeTimeline(resp);
+      setTimeline(next);
+      const again = next.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+      vol = again?.filters?.find((f) => f.kind === "volume");
     }
+    if (!vol) return;
+    const updated = await engineEdit<Timeline>(
+      "update_filter",
+      {
+        clipId,
+        filterId: vol.id,
+        params: { gain },
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (updated) setTimeline(normalizeTimeline(updated));
   }
 
   async function setAudioFades(clipId: string, fadeIn: number, fadeOut: number) {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_clip_fades", {
-            clipId,
-            fadeIn,
-            fadeOut,
-          }),
-        ),
-      );
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_clip_fades",
+      {
+        clipId,
+        fadeIn,
+        fadeOut,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (next) setTimeline(normalizeTimeline(next));
   }
 
   async function setClipReverse(clipId: string, reverse: boolean) {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_clip_reverse", {
-            clipId,
-            reverse,
-          }),
-        ),
-      );
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_clip_reverse",
+      {
+        clipId,
+        reverse,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (next) setTimeline(normalizeTimeline(next));
   }
 
   async function setClipSpeed(clipId: string, speed: number) {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_clip_speed", {
-            clipId,
-            speed,
-          }),
-        ),
-      );
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_clip_speed",
+      {
+        clipId,
+        speed,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (next) setTimeline(normalizeTimeline(next));
   }
 
   function openAdvancedVideoForClip(clipId: string) {
@@ -2464,48 +2626,56 @@ function App() {
       setStatus("Selection too small");
       return;
     }
-    try {
-      // Split at end, then at start, then remove middle piece.
-      let tl = normalizeTimeline(
-        await invoke<Timeline>("split_clip_at", {
-          clipId,
-          at: absB,
-          syncLinked,
-        }),
+    // Split at end, then at start, then remove middle piece.
+    const first = await engineEdit<Timeline>(
+      "split_clip_at",
+      {
+        clipId,
+        at: absB,
+        syncLinked,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!first) return;
+    let tl = normalizeTimeline(first);
+    setTimeline(tl);
+    const second = await engineEdit<Timeline>(
+      "split_clip_at",
+      {
+        clipId,
+        at: absA,
+        syncLinked,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!second) return;
+    tl = normalizeTimeline(second);
+    setTimeline(tl);
+    const mid = tl.tracks
+      .flatMap((t) => t.clips)
+      .find(
+        (c) =>
+          c.media_path === clip.media_path &&
+          Math.abs(c.start - absA) < 0.04 &&
+          Math.abs(c.start + (c.out_point - c.in_point) - absB) < 0.08,
       );
-      setTimeline(tl);
-      tl = normalizeTimeline(
-        await invoke<Timeline>("split_clip_at", {
-          clipId,
-          at: absA,
-          syncLinked,
-        }),
+    if (mid) {
+      const third = await engineEdit<Timeline>(
+        "ripple_delete",
+        {
+          clipId: mid.id,
+          removeLinked: syncLinked,
+        },
+        { onError: (e) => setStatus(String(e)) },
       );
+      if (!third) return;
+      tl = normalizeTimeline(third);
       setTimeline(tl);
-      const mid = tl.tracks
-        .flatMap((t) => t.clips)
-        .find(
-          (c) =>
-            c.media_path === clip.media_path &&
-            Math.abs(c.start - absA) < 0.04 &&
-            Math.abs(c.start + (c.out_point - c.in_point) - absB) < 0.08,
-        );
-      if (mid) {
-        tl = normalizeTimeline(
-          await invoke<Timeline>("ripple_delete", {
-            clipId: mid.id,
-            removeLinked: syncLinked,
-          }),
-        );
-        setTimeline(tl);
-        setSelectedClipId(null);
-        setAdvancedAudio(null);
-        setStatus("Selection cut");
-      } else {
-        setStatus("Cut splits done — select middle clip to delete if needed");
-      }
-    } catch (e) {
-      setStatus(String(e));
+      setSelectedClipId(null);
+      setAdvancedAudio(null);
+      setStatus("Selection cut");
+    } else {
+      setStatus("Cut splits done — select middle clip to delete if needed");
     }
   }
 
@@ -2535,42 +2705,46 @@ function App() {
         setStatus("No video under playhead to crop");
         return;
       }
-      try {
-        const filters = targetClip.filters ?? [];
-        const cropFilter = filters.find((f) => f.kind === "crop");
-        const isZero =
-          crop.left <= 0.001 &&
-          crop.top <= 0.001 &&
-          crop.right <= 0.001 &&
-          crop.bottom <= 0.001;
+      const filters = targetClip.filters ?? [];
+      const cropFilter = filters.find((f) => f.kind === "crop");
+      const isZero =
+        crop.left <= 0.001 &&
+        crop.top <= 0.001 &&
+        crop.right <= 0.001 &&
+        crop.bottom <= 0.001;
 
-        let updated: Timeline;
-        if (!cropFilter) {
-          if (isZero) return;
-          updated = normalizeTimeline(
-            await invoke<Timeline>("add_filter", {
-              clipId: targetClip.id,
-              kind: "crop",
-              params: crop,
-            }),
-          );
-        } else {
-          updated = normalizeTimeline(
-            await invoke<Timeline>("update_filter", {
-              clipId: targetClip.id,
-              filterId: cropFilter.id,
-              params: crop,
-            }),
-          );
-        }
-        setTimeline(updated);
-        if (selectedClipId !== targetClip.id) {
-          setSelectedClipId(targetClip.id);
-        }
-        setStatus("Crop updated");
-      } catch (e) {
-        setStatus(String(e));
+      let updated: Timeline | null;
+      if (!cropFilter) {
+        if (isZero) return;
+        updated = await engineEdit<Timeline>(
+          "add_filter",
+          {
+            clipId: targetClip.id,
+            kind: "crop",
+            params: crop,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+        if (!updated) return;
+        updated = normalizeTimeline(updated);
+      } else {
+        updated = await engineEdit<Timeline>(
+          "update_filter",
+          {
+            clipId: targetClip.id,
+            filterId: cropFilter.id,
+            params: crop,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+        if (!updated) return;
+        updated = normalizeTimeline(updated);
       }
+      if (updated) setTimeline(updated);
+      if (selectedClipId !== targetClip.id) {
+        setSelectedClipId(targetClip.id);
+      }
+      setStatus("Crop updated");
     };
     cropCommitChain.current = cropCommitChain.current
       .then(run)
@@ -2676,10 +2850,18 @@ function App() {
       const path = Array.isArray(picked) ? picked[0] : picked;
       if (!path) return;
       stopPlayback();
+      // The project is being replaced: responses from edits of the previous
+      // project must never land on the new state.
+      invalidatePending();
       const tl = await invoke<Timeline>("load_project", { path });
-      setTimeline(normalizeTimeline(tl));
+      const next = normalizeTimeline(tl);
+      recordEngine(next);
+      setTimeline(next);
       setSelectedClipId(null);
       seekTimeline(0);
+      // The opened file is now authoritative — a stale autosave must never
+      // resurrect the previous session on the next boot.
+      void invoke("clear_autosave").catch(() => {});
       setStatus(`Opened ${fileName(path)}`);
     } catch (e) {
       setStatus(String(e));
@@ -2712,10 +2894,14 @@ function App() {
     }
     try {
       stopPlayback();
+      invalidatePending();
       const tl = await invoke<Timeline>("new_project");
-      setTimeline(normalizeTimeline(tl));
+      const next = normalizeTimeline(tl);
+      recordEngine(next);
+      setTimeline(next);
       setSelectedClipId(null);
       seekTimeline(0);
+      void invoke("clear_autosave").catch(() => {});
       setStatus("New project");
     } catch (e) {
       setStatus(String(e));
@@ -2788,7 +2974,10 @@ function App() {
         unlisten();
       }
     } catch (e) {
-      setStatus(String(e));
+      // "cancelled" comes from the Rust MediaError::Cancelled display when
+      // the user aborts the encode — not an error to alarm about.
+      const msg = String(e);
+      setStatus(/^cancel/i.test(msg) ? "Export cancelled — partial output discarded" : msg);
     } finally {
       setBusy(false);
       setExportProgress(0);
@@ -2796,80 +2985,80 @@ function App() {
   }
 
   async function setEditMode(mode: EditMode) {
-    try {
-      setTimeline(normalizeTimeline(await invoke<Timeline>("set_edit_mode", { mode })));
-      setStatus(`Edit mode: ${mode}`);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_edit_mode",
+      { mode },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus(`Edit mode: ${mode}`);
   }
 
   async function addMarkerAtPlayhead() {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("add_marker", {
-            time: playheadRef.current,
-            label: `M${(timeline?.markers?.length ?? 0) + 1}`,
-          }),
-        ),
-      );
-      setStatus("Marker added");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "add_marker",
+      {
+        time: playheadRef.current,
+        label: `M${(timeline?.markers?.length ?? 0) + 1}`,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Marker added");
   }
 
   async function setZoneIn() {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_zone", {
-            zoneIn: playheadRef.current,
-            zoneOut: timeline?.zone_out ?? null,
-          }),
-        ),
-      );
-      setStatus(`Zone in ${playheadRef.current.toFixed(2)}s`);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_zone",
+      {
+        zoneIn: playheadRef.current,
+        zoneOut: timeline?.zone_out ?? null,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus(`Zone in ${playheadRef.current.toFixed(2)}s`);
   }
 
   async function setZoneOut() {
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("set_zone", {
-            zoneIn: timeline?.zone_in ?? null,
-            zoneOut: playheadRef.current,
-          }),
-        ),
-      );
-      setStatus(`Zone out ${playheadRef.current.toFixed(2)}s`);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "set_zone",
+      {
+        zoneIn: timeline?.zone_in ?? null,
+        zoneOut: playheadRef.current,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus(`Zone out ${playheadRef.current.toFixed(2)}s`);
   }
 
   async function liftZone() {
-    try {
-      setTimeline(normalizeTimeline(await invoke<Timeline>("lift_zone")));
-      setStatus("Lift zone");
-    } catch (e) {
-      const msg = String(e);
-      setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
-    }
+    const next = await engineEdit<Timeline>("lift_zone", undefined, {
+      onError: (e) => {
+        const msg = String(e);
+        setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
+      },
+    });
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Lift zone");
   }
 
   async function extractZone() {
-    try {
-      setTimeline(normalizeTimeline(await invoke<Timeline>("extract_zone")));
-      setStatus("Extract zone");
-    } catch (e) {
-      const msg = String(e);
-      setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
-    }
+    const next = await engineEdit<Timeline>("extract_zone", undefined, {
+      onError: (e) => {
+        const msg = String(e);
+        setStatus(/no zone/i.test(msg) ? "No zone set" : msg);
+      },
+    });
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Extract zone");
   }
 
   async function splitAtPlayhead() {
@@ -2891,20 +3080,18 @@ function App() {
       setStatus("Playhead must be inside a clip");
       return;
     }
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("split_clip_at", {
-            clipId: clip.id,
-            at: ph,
-            syncLinked: true,
-          }),
-        ),
-      );
-      setStatus(`Split at ${ph.toFixed(2)}s`);
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "split_clip_at",
+      {
+        clipId: clip.id,
+        at: ph,
+        syncLinked: true,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus(`Split at ${ph.toFixed(2)}s`);
   }
 
   /** Enabled Text filter on the clip under the playhead — monitor overlay. */
@@ -3020,60 +3207,68 @@ function App() {
       const num = (v: unknown, d: number) =>
         typeof v === "number" && Number.isFinite(v) ? v : d;
       const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-      try {
-        const clip = timelineRef.current?.tracks
-          .flatMap((t) => t.clips)
-          .find((c) => c.id === clipId);
-        if (!clip) return;
-        const tf = (clip.filters ?? []).find((f) => f.kind === "transform");
-        let updated: Timeline;
-        if (tf) {
-          const prev = (tf.params ?? {}) as Record<string, unknown>;
-          const params = {
-            x: clamp(patch.x ?? num(prev.x, 0), -1, 1),
-            y: clamp(patch.y ?? num(prev.y, 0), -1, 1),
-            scale: clamp(patch.scale ?? num(prev.scale, 1), 0.05, 8),
-            rotation: num(prev.rotation, 0),
-            opacity: clamp(patch.opacity ?? num(prev.opacity, 1), 0, 1),
-          };
-          updated = normalizeTimeline(
-            await invoke<Timeline>("update_filter", {
+      const clip = timelineRef.current?.tracks
+        .flatMap((t) => t.clips)
+        .find((c) => c.id === clipId);
+      if (!clip) return;
+      const tf = (clip.filters ?? []).find((f) => f.kind === "transform");
+      let updated: Timeline | null;
+      if (tf) {
+        const prev = (tf.params ?? {}) as Record<string, unknown>;
+        const params = {
+          x: clamp(patch.x ?? num(prev.x, 0), -1, 1),
+          y: clamp(patch.y ?? num(prev.y, 0), -1, 1),
+          scale: clamp(patch.scale ?? num(prev.scale, 1), 0.05, 8),
+          rotation: num(prev.rotation, 0),
+          opacity: clamp(patch.opacity ?? num(prev.opacity, 1), 0, 1),
+        };
+        updated = await engineEdit<Timeline>(
+          "update_filter",
+          {
+            clipId,
+            filterId: tf.id,
+            params,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+        if (!updated) return;
+        updated = normalizeTimeline(updated);
+        if (!tf.enabled) {
+          updated = await engineEdit<Timeline>(
+            "set_filter_enabled",
+            {
               clipId,
               filterId: tf.id,
-              params,
-            }),
+              enabled: true,
+            },
+            { onError: (e) => setStatus(String(e)) },
           );
-          if (!tf.enabled) {
-            updated = normalizeTimeline(
-              await invoke<Timeline>("set_filter_enabled", {
-                clipId,
-                filterId: tf.id,
-                enabled: true,
-              }),
-            );
-          }
-        } else {
-          const params = {
-            x: clamp(patch.x ?? 0, -1, 1),
-            y: clamp(patch.y ?? 0, -1, 1),
-            scale: clamp(patch.scale ?? 1, 0.05, 8),
-            rotation: 0,
-            opacity: 1,
-          };
-          updated = normalizeTimeline(
-            await invoke<Timeline>("add_filter", {
-              clipId,
-              kind: "transform",
-              params,
-            }),
-          );
+          if (!updated) return;
+          updated = normalizeTimeline(updated);
         }
-        setTimeline(updated);
-        if (selectedClipId !== clipId) {
-          setSelectedClipId(clipId);
-        }
-      } catch (e) {
-        setStatus(String(e));
+      } else {
+        const params = {
+          x: clamp(patch.x ?? 0, -1, 1),
+          y: clamp(patch.y ?? 0, -1, 1),
+          scale: clamp(patch.scale ?? 1, 0.05, 8),
+          rotation: 0,
+          opacity: 1,
+        };
+        updated = await engineEdit<Timeline>(
+          "add_filter",
+          {
+            clipId,
+            kind: "transform",
+            params,
+          },
+          { onError: (e) => setStatus(String(e)) },
+        );
+        if (!updated) return;
+        updated = normalizeTimeline(updated);
+      }
+      if (updated) setTimeline(updated);
+      if (selectedClipId !== clipId) {
+        setSelectedClipId(clipId);
       }
     },
     [selectedClipId],
@@ -3116,36 +3311,45 @@ function App() {
         : {}),
       shadow: style.shadow !== false,
     };
-    try {
-      const existing = (clip.filters ?? []).find((f) => f.kind === "text");
-      let updated = normalizeTimeline(
-        existing
-          ? await invoke<Timeline>("update_filter", {
+    const existing = (clip.filters ?? []).find((f) => f.kind === "text");
+    const onError = (e: unknown) => setStatus(String(e));
+    let updated = existing
+      ? await engineEdit<Timeline>(
+          "update_filter",
+          {
             clipId: clip.id,
             filterId: existing.id,
             params,
-          })
-          : await invoke<Timeline>("add_filter", {
+          },
+          { onError },
+        )
+      : await engineEdit<Timeline>(
+          "add_filter",
+          {
             clipId: clip.id,
             kind: "text",
             params,
-          }),
-      );
-      if (existing && !existing.enabled) {
-        updated = normalizeTimeline(
-          await invoke<Timeline>("set_filter_enabled", {
-            clipId: clip.id,
-            filterId: existing.id,
-            enabled: true,
-          }),
+          },
+          { onError },
         );
-      }
-      setTimeline(updated);
-      setSelectedClipId(clip.id);
-      setStatus(existing ? "Title updated — drag to move, corner handles to resize" : "Title added — drag to move, corner handles to resize");
-    } catch (e) {
-      setStatus(String(e));
+    if (!updated) return;
+    updated = normalizeTimeline(updated);
+    if (existing && !existing.enabled) {
+      updated = await engineEdit<Timeline>(
+        "set_filter_enabled",
+        {
+          clipId: clip.id,
+          filterId: existing.id,
+          enabled: true,
+        },
+        { onError },
+      );
+      if (!updated) return;
+      updated = normalizeTimeline(updated);
     }
+    setTimeline(updated);
+    setSelectedClipId(clip.id);
+    setStatus(existing ? "Title updated — drag to move, corner handles to resize" : "Title added — drag to move, corner handles to resize");
   }, []);
 
   /** Commit monitor text-overlay gestures (drag position / handle resize /
@@ -3167,19 +3371,16 @@ function App() {
         ...(t.borderw > 0 ? { borderw: t.borderw, bordercolor: t.bordercolor } : {}),
         shadow: t.shadow,
       };
-      try {
-        setTimeline(
-          normalizeTimeline(
-            await invoke<Timeline>("update_filter", {
-              clipId: t.clipId,
-              filterId: t.filterId,
-              params,
-            }),
-          ),
-        );
-      } catch (e) {
-        setStatus(String(e));
-      }
+      const next = await engineEdit<Timeline>(
+        "update_filter",
+        {
+          clipId: t.clipId,
+          filterId: t.filterId,
+          params,
+        },
+        { onError: (e) => setStatus(String(e)) },
+      );
+      if (next) setTimeline(normalizeTimeline(next));
     },
     [monitorText],
   );
@@ -3189,22 +3390,20 @@ function App() {
   const removeTargetClip = useCallback(async () => {
     const target = monitorTargetClip;
     if (!target) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("remove_clip", {
-            clipId: target.id,
-            removeLinked: true,
-          }),
-        ),
-      );
-      if (selectedClipId === target.id) {
-        setSelectedClipId(null);
-      }
-      setStatus("Clip deleted");
-    } catch (e) {
-      setStatus(String(e));
+    const next = await engineEdit<Timeline>(
+      "remove_clip",
+      {
+        clipId: target.id,
+        removeLinked: true,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    if (selectedClipId === target.id) {
+      setSelectedClipId(null);
     }
+    setStatus("Clip deleted");
   }, [monitorTargetClip, selectedClipId]);
 
   /** Monitor context menu: remove the Text (title) filter from the
@@ -3215,38 +3414,37 @@ function App() {
     if (!clip) return;
     const f = (clip.filters ?? []).find((x) => x.kind === "text");
     if (!f) return;
-    try {
-      setTimeline(
-        normalizeTimeline(
-          await invoke<Timeline>("remove_filter", {
-            clipId: clip.id,
-            filterId: f.id,
-          }),
-        ),
-      );
-      setStatus("Title removed");
-    } catch (e) {
-      setStatus(String(e));
-    }
+    const next = await engineEdit<Timeline>(
+      "remove_filter",
+      {
+        clipId: clip.id,
+        filterId: f.id,
+      },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setStatus("Title removed");
   }, []);
 
   /** Place any file path (e.g. a saved voiceover) on the timeline. */
   const addMediaPathToTimeline = useCallback(
     async (path: string, start: number, label: string) => {
-      try {
-        const next = await invoke<Timeline>("add_media_to_timeline", {
+      const next = await engineEdit<Timeline>(
+        "add_media_to_timeline",
+        {
           mediaPath: path,
           start,
-        });
-        setTimeline(normalizeTimeline(next));
-        const first = next.tracks
-          .flatMap((tr) => tr.clips)
-          .sort((a, b) => b.start - a.start)[0];
-        if (first) setSelectedClipId(first.id);
-        setStatus(label);
-      } catch (e) {
-        setStatus(String(e));
-      }
+        },
+        { onError: (e) => setStatus(String(e)) },
+      );
+      if (!next) return;
+      setTimeline(normalizeTimeline(next));
+      const first = next.tracks
+        .flatMap((tr) => tr.clips)
+        .sort((a, b) => b.start - a.start)[0];
+      if (first) setSelectedClipId(first.id);
+      setStatus(label);
     },
     [],
   );
@@ -3402,17 +3600,14 @@ function App() {
 
     if (hit && video && !isImagePath(hit.clip.media_path)) {
       video.muted = true;
-      const targetPath =
-        (!magicToolRef.current &&
-          magicResultReady((findMagicRemove(hit.clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
-        hit.clip.media_path;
-      const wantSrc = convertFileSrc(targetPath);
+      const target = previewTarget(hit.clip);
+      const wantSrc = convertFileSrc(target.path);
       if (wantSrc && video.getAttribute("src") !== wantSrc) {
         video.src = wantSrc;
         video.load();
       }
       try {
-        const wantTime = mediaTimeForClip(hit.clip, curTime);
+        const wantTime = mediaTimeForClip(hit.clip, curTime) - target.shift;
         if (Math.abs(video.currentTime - wantTime) > 0.05) {
           video.currentTime = wantTime;
         }
@@ -3423,6 +3618,7 @@ function App() {
 
       if (needsStepped) {
         const clip = hit.clip;
+        const shift = target.shift;
         const wall0 = performance.now();
         const ph0 = playheadRef.current;
         const step = () => {
@@ -3440,7 +3636,7 @@ function App() {
             return;
           }
           commitPlayhead(nextPh, false);
-          video.currentTime = mediaTimeForClip(clip, nextPh);
+          video.currentTime = mediaTimeForClip(clip, nextPh) - shift;
           applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
           reverseRafRef.current = requestAnimationFrame(step);
         };
@@ -3554,17 +3750,14 @@ function App() {
       return;
     }
     const clip = hit.clip;
-    const wantSrc = convertFileSrc(
-      (!magicToolRef.current &&
-        magicResultReady((findMagicRemove(clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
-        clip.media_path,
-    );
+    const target = previewTarget(clip);
+    const wantSrc = convertFileSrc(target.path);
     if (wantSrc && video.getAttribute("src") !== wantSrc) {
       video.src = wantSrc;
       video.load();
     }
     try {
-      video.currentTime = mediaTimeForClip(clip, ph);
+      video.currentTime = mediaTimeForClip(clip, ph) - target.shift;
     } catch {
       /* metadata not ready */
     }
@@ -3580,7 +3773,7 @@ function App() {
       const nextPh = Math.max(clip.start, ph0 - elapsed);
       commitPlayhead(nextPh, false);
       try {
-        video.currentTime = mediaTimeForClip(clip, nextPh);
+        video.currentTime = mediaTimeForClip(clip, nextPh) - target.shift;
       } catch {
         /* ignore */
       }
@@ -3626,18 +3819,15 @@ function App() {
       const audioHit = tl ? clipAtPlayhead(tl, next, "audio") : null;
       if (videoHit && videoRef.current && !isImagePath(videoHit.clip.media_path)) {
         const video = videoRef.current;
-        const targetPath =
-          (!magicToolRef.current &&
-            magicResultReady((findMagicRemove(videoHit.clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
-          videoHit.clip.media_path;
-        const wantSrc = convertFileSrc(targetPath);
+        const target = previewTarget(videoHit.clip);
+        const wantSrc = convertFileSrc(target.path);
         if (wantSrc && video.getAttribute("src") !== wantSrc) {
           video.src = wantSrc;
           video.load();
         }
         video.muted = true;
         try {
-          video.currentTime = mediaTimeForClip(videoHit.clip, next);
+          video.currentTime = mediaTimeForClip(videoHit.clip, next) - target.shift;
         } catch {
           /* ignore */
         }
@@ -3746,16 +3936,13 @@ function App() {
     const audio = audioRef.current;
 
     if (vHit && video && !isImagePath(vHit.clip.media_path)) {
-      const targetPath =
-        (!magicToolRef.current &&
-          magicResultReady((findMagicRemove(vHit.clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
-        vHit.clip.media_path;
-      const wantSrc = convertFileSrc(targetPath);
+      const target = previewTarget(vHit.clip);
+      const wantSrc = convertFileSrc(target.path);
       if (wantSrc && video.getAttribute("src") !== wantSrc) {
         video.src = wantSrc;
         video.load();
       }
-      const want = mediaTimeForClip(vHit.clip, ph);
+      const want = mediaTimeForClip(vHit.clip, ph) - target.shift;
       try {
         if (Math.abs(video.currentTime - want) > 0.04) {
           video.currentTime = want;
@@ -3932,6 +4119,8 @@ function App() {
       onImport={() => void onImport()}
       onExport={openExportDialog}
       onNewProject={() => void newProject()}
+      onOpenProject={() => void openProject()}
+      onSaveProject={() => void saveProjectAs()}
       onUndo={() => void onUndo()}
       onRedo={() => void onRedo()}
       onDelete={() => void onRemove()}
@@ -4275,6 +4464,7 @@ function App() {
         open={exportOpen}
         busy={busy}
         progress={exportProgress}
+        onCancelExport={() => void invoke("cancel_export")}
         sourceName={
           hasTimelineClips
             ? "Timeline sequence (with cuts)"

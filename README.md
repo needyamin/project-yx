@@ -71,6 +71,8 @@ npm run dist:win   # build setup.exe + msix
 
 Requirements: Rust stable, Node.js 20+, FFmpeg on PATH (bundled in releases).
 
+**Version bump:** edit the `version` field in the root `package.json` only — the build scripts sync `Cargo.toml`, `apps/desktop/package.json` and `tauri.conf.json` automatically (or run `npm run version:sync`).
+
 **Benchmarks:** the repo ships a repeatable performance harness — a browser
 page that mounts the real app against a mock backend (edit latency, scroll/zoom
 pacing, playback FPS, A/V drift) and a Rust engine benchmark with regression

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { DESKTOP_DIR, BUILD_DIR, TAURI_DIR, ROOT, ensureBuild, releaseDir, bundleDir, isUnreliablePath } from "./paths.js";
-import { getVersion } from "./version.js";
+import { getVersion, syncVersions } from "./version.js";
 
 /** Quote an argv token for cmd.exe when spawnSync(..., { shell: true }). */
 function winShellArg(arg) {
@@ -124,6 +124,9 @@ function npmCmd() {
  * @param {{ bundles?: string[], force?: boolean, updaterSign?: boolean, requireUpdaterSign?: boolean }} opts
  */
 export function ensureTauriBuild(opts = {}) {
+  // Root package.json is the version source — sync mirrors BEFORE cargo runs,
+  // so the built binary/bundles always carry the version being released.
+  syncVersions();
   const bundles = opts.bundles ?? ["nsis"];
   const force = Boolean(opts.force || process.env.YX_FORCE_BUILD === "1");
   const updaterSign = Boolean(
@@ -272,13 +275,24 @@ export function findNsisInstaller() {
   }
   const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".exe"));
   if (!files.length) throw new Error(`No NSIS installer found in ${dir}`);
+  // The bundle dir accumulates installers from previous version bumps (Tauri
+  // never cleans it). Only an installer built for the CURRENT version is
+  // valid — alphabetical order would otherwise ship the oldest one renamed
+  // to the new version's filename.
+  const version = getVersion();
+  const current = files.filter((f) => f.includes(version));
+  if (!current.length) {
+    throw new Error(
+      `No NSIS installer for version ${version} in ${dir}\n  Found: ${files.join(", ")}\n  Re-run: npm run dist:release`,
+    );
+  }
   // Prefer *-setup.exe
-  files.sort((a, b) => {
+  current.sort((a, b) => {
     const as = a.toLowerCase().includes("setup") ? 0 : 1;
     const bs = b.toLowerCase().includes("setup") ? 0 : 1;
     return as - bs;
   });
-  return path.join(dir, files[0]);
+  return path.join(dir, current[0]);
 }
 
 export function findAppImage() {

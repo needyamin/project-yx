@@ -30,6 +30,8 @@ struct AppState {
     /// Magic Remove: one heavy track/render at a time + cooperative cancel.
     magic_busy: Arc<AtomicBool>,
     magic_cancel: Arc<AtomicBool>,
+    /// Export cooperative cancel — polled by the ffmpeg progress loop.
+    export_cancel: Arc<AtomicBool>,
 }
 
 fn cached_probe(state: &AppState, path: &Path) -> Result<MediaInfo, String> {
@@ -118,6 +120,204 @@ fn new_project(state: State<'_, AppState>) -> Timeline {
     editor.timeline().clone()
 }
 
+/// App data dir for derived state (autosave, cache sweeps live beside it):
+/// %LOCALAPPDATA%/ProjectYX (falls back to $HOME/ProjectYX on Linux).
+fn dirs_data() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("ProjectYX")
+}
+
+fn autosave_file() -> PathBuf {
+    dirs_data().join("autosave").join("project.autosave.yxp")
+}
+
+/// Hard caps for derived-media caches, swept LRU-by-mtime at startup.
+/// thumbs: ~1 JPEG per 0.25 s scrub bucket per clip; magic-cache: full
+/// sidecar MP4 renders (hundreds of MB each); audio-previews: WAV
+/// (~10 MB/min). All are derivable from source media — deleting entries is
+/// always safe. proxy-cache is deliberately NOT swept here: proxies are
+/// expensive to regenerate and may be referenced by open projects; pruning
+/// them needs a source-liveness check first.
+const DERIVED_CACHE_CAPS: &[(&str, u64)] = &[
+    ("thumbs", 200 << 20),
+    ("magic-cache", 2 << 30),
+    ("audio-previews", 512 << 20),
+];
+
+fn sweep_cache_dir(dir: &Path, max_bytes: u64, protected: &std::collections::HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        // Liveness: files referenced by the state the next boot will restore
+        // (autosave) must survive the sweep — deleting a magic-cache sidecar
+        // the recovered timeline points at silently downgrades Magic Remove
+        // to the original footage.
+        if protected.contains(&p) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let mtime = meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        total += meta.len();
+        files.push((p, meta.len(), mtime));
+    }
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(_, _, mtime)| *mtime); // oldest first
+    for (path, size, _) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// Paths under the swept cache dirs that derived-cache deletion must never
+/// touch. Source of liveness: the autosave file — at sweep time (startup)
+/// it is exactly the project the session is about to restore. Every string
+/// in its JSON that resolves inside a swept cache dir is protected.
+fn collect_protected_cache_paths() -> std::collections::HashSet<PathBuf> {
+    let mut protected = std::collections::HashSet::new();
+    let Ok(json) = std::fs::read_to_string(autosave_file()) else {
+        return protected;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return protected;
+    };
+    let roots: Vec<PathBuf> = DERIVED_CACHE_CAPS
+        .iter()
+        .map(|(name, _)| dirs_data().join(name))
+        .collect();
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut strings = Vec::new();
+    walk(&value, &mut strings);
+    for s in strings {
+        let p = PathBuf::from(&s);
+        if roots.iter().any(|r| p.starts_with(r)) {
+            protected.insert(p);
+        }
+    }
+    protected
+}
+
+fn sweep_derived_caches(protected: &std::collections::HashSet<PathBuf>) {
+    for (name, cap) in DERIVED_CACHE_CAPS {
+        sweep_cache_dir(&dirs_cache().with_file_name(name), *cap, protected);
+    }
+}
+
+/// Write the ENGINE timeline (source of truth — never a UI guess) to the
+/// autosave file, atomically (tmp + rename). Called by the UI's debounced
+/// autosave timer.
+#[tauri::command]
+async fn save_autosave(state: State<'_, AppState>) -> Result<(), String> {
+    let timeline = state.editor.lock().timeline().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = autosave_file();
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let json = serde_json::to_string(&timeline).map_err(|e| e.to_string())?;
+        let tmp = dir.with_extension("yxp.tmp");
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &dir).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("autosave task failed: {e}"))?
+}
+
+/// Adopt the autosave as the CURRENT ENGINE project (used at boot for crash
+/// recovery). Returns None when there is nothing recoverable. Adopting
+/// replaces the engine state, so recovered clip ids stay valid for edits —
+/// the UI must render exactly this timeline.
+#[tauri::command]
+async fn adopt_autosave(state: State<'_, AppState>) -> Result<Option<Timeline>, String> {
+    let path = autosave_file();
+    let read = tauri::async_runtime::spawn_blocking(move || {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(_) => None,
+        }
+    })
+    .await
+    .map_err(|e| format!("autosave read task failed: {e}"))?;
+    let Some(json) = read else {
+        return Ok(None);
+    };
+    let timeline: Timeline = match serde_json::from_str(&json) {
+        Ok(t) => t,
+        Err(_) => return Ok(None), // corrupt autosave: start fresh, never trap boot
+    };
+    if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        return Ok(None); // empty project: nothing to recover
+    }
+    let mut editor = state.editor.lock();
+    *editor = TimelineEditor::with_timeline(timeline.clone());
+    Ok(Some(timeline))
+}
+
+/// Delete the autosave file — after an explicit new_project/load_project the
+/// loaded state is authoritative; a stale autosave must never resurrect an
+/// older session (the original autosave-resurrection bug).
+#[tauri::command]
+fn clear_autosave() -> Result<(), String> {
+    match std::fs::remove_file(autosave_file()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Exit-time flush (RunEvent::Exit): the UI's debounced autosave timer means
+/// edits made in the last ~3 s before quit would otherwise be lost. Writes
+/// the CURRENT engine timeline atomically, but only when an autosave already
+/// exists — clear_autosave() (open/new project) is respected, so a project
+/// the user explicitly abandoned never resurrects on the next boot.
+fn flush_autosave_on_exit(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let autosave = autosave_file();
+    if !autosave.exists() {
+        return;
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let timeline = state.editor.lock().timeline().clone();
+    let Ok(json) = serde_json::to_string(&timeline) else {
+        return;
+    };
+    let dir = autosave_file();
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = dir.with_extension("yxp.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &dir);
+    }
+}
+
 /// Generate (or fetch from the disk cache) a small preview JPEG for the
 /// timeline. Cache key = canonical path + file mtime + 0.25s time bucket,
 /// so unchanged media never regenerates. Runs on the blocking pool — the
@@ -190,16 +390,20 @@ async fn get_media_thumbnail(
     .map_err(|e| format!("thumbnail task failed: {e}"))?
 }
 
+/// Async: the hardware probe walks the filesystem and spawns an FFmpeg
+/// subprocess (`ffmpeg -hwaccels`) — it must never block the UI thread.
 #[tauri::command]
-fn reprobe_hardware(state: State<'_, AppState>) -> BootInfo {
-    let (profile, policy) = probe_and_policy();
+async fn reprobe_hardware(state: State<'_, AppState>) -> Result<BootInfo, String> {
+    let (profile, policy) = tauri::async_runtime::spawn_blocking(probe_and_policy)
+        .await
+        .map_err(|e| format!("hardware probe task failed: {e}"))?;
     *state.profile.lock() = profile.clone();
     *state.policy.lock() = policy.clone();
-    BootInfo {
+    Ok(BootInfo {
         profile,
         policy,
         timeline: state.editor.lock().timeline().clone(),
-    }
+    })
 }
 
 /// Async so the (cached) ffprobe inside never blocks the UI thread — a
@@ -696,6 +900,11 @@ fn remove_track(track_id: String, state: State<'_, AppState>) -> Result<Timeline
 
 #[tauri::command]
 fn debug_agent_log(line: String) -> Result<(), String> {
+    // Dev-only scaffolding (writes to hardcoded source-tree paths): a no-op
+    // in release builds — this must never ship debug file I/O.
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
     use std::io::Write;
     let mut paths = Vec::new();
     if let Ok(root) = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1043,66 +1252,69 @@ fn list_proxies(state: State<'_, AppState>) -> Vec<ProxyJob> {
 
 /// Render a clip's audio through the FULL export effect chain into a wav
 /// file, so the Advanced Audio Tools dialog can play the true export sound
-/// ("Hear processed result") instead of an approximation.
+/// ("Hear processed result") instead of an approximation. Async: the FFmpeg
+/// audio render can take seconds — it must never block the UI thread.
 #[tauri::command]
-fn render_audio_preview(
+async fn render_audio_preview(
     source: String,
     in_point: f64,
     duration: f64,
     filters: Vec<ExportFilter>,
-    state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let _ = state;
-    let chain = yx_media::build_audio_effect_chain(&ExportSegment {
-        path: PathBuf::from(&source),
-        in_point,
-        out_point: in_point + duration.max(0.2),
-        start: 0.0,
-        fade_in: 0.0,
-        fade_out: 0.0,
-        reverse: false,
-        speed: 1.0,
-        filters,
-        is_image: false,
-    });
-    let dir = dirs_cache().with_file_name("audio-previews");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let chain = yx_media::build_audio_effect_chain(&ExportSegment {
+            path: PathBuf::from(&source),
+            in_point,
+            out_point: in_point + duration.max(0.2),
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false,
+            speed: 1.0,
+            filters,
+            is_image: false,
+        });
+        let dir = dirs_cache().with_file_name("audio-previews");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    format!("{in_point:.3}|{duration:.3}|{chain}").hash(&mut hasher);
-    let out = dir.join(format!("preview_{:016x}.wav", hasher.finish()));
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        format!("{in_point:.3}|{duration:.3}|{chain}").hash(&mut hasher);
+        let out = dir.join(format!("preview_{:016x}.wav", hasher.finish()));
 
-    if !out.exists() {
-        let status = yx_detect::command_ffmpeg()
-            .args([
-                "-ss",
-                &format!("{in_point:.3}"),
-                "-t",
-                &format!("{duration:.3}"),
-                "-i",
-                &source,
-                "-af",
-                &chain,
-                "-ar",
-                "44100",
-                "-ac",
-                "2",
-                "-threads",
-                "1",
-                out.to_str().ok_or("bad output path")?,
-            ])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !status.status.success() {
-            return Err(format!(
-                "audio preview render failed: {}",
-                String::from_utf8_lossy(&status.stderr).trim()
-            ));
+        if !out.exists() {
+            let status = yx_detect::command_ffmpeg()
+                .args([
+                    "-ss",
+                    &format!("{in_point:.3}"),
+                    "-t",
+                    &format!("{duration:.3}"),
+                    "-i",
+                    &source,
+                    "-af",
+                    &chain,
+                    "-ar",
+                    "44100",
+                    "-ac",
+                    "2",
+                    "-threads",
+                    "1",
+                    out.to_str().ok_or("bad output path")?,
+                ])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !status.status.success() {
+                return Err(format!(
+                    "audio preview render failed: {}",
+                    String::from_utf8_lossy(&status.stderr).trim()
+                ));
+            }
         }
-    }
-    Ok(out.display().to_string())
+        Ok(out.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("audio preview task failed: {e}"))?
 }
 
 /// Finalize a MediaRecorder take: write the raw bytes, then stream-copy
@@ -1145,24 +1357,34 @@ fn finalize_media_recording(
 
 /// Persist a screen recording (MediaRecorder webm bytes) and return its path
 /// so the frontend can place it on the timeline as a normal video clip.
+/// Async: writing + remuxing a large recording must not block the UI thread.
 #[tauri::command]
-fn save_screen_recording(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+async fn save_screen_recording(bytes: Vec<u8>, ext: String) -> Result<String, String> {
     let ext = match ext.to_ascii_lowercase().as_str() {
         "webm" | "mkv" | "mp4" => ext.to_ascii_lowercase(),
         _ => "webm".to_string(),
     };
-    finalize_media_recording(&bytes, &ext, "screen").map(|p| p.display().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        finalize_media_recording(&bytes, &ext, "screen").map(|p| p.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("recording task failed: {e}"))?
 }
 
 /// Persist a microphone recording (MediaRecorder bytes) and return its path
 /// so the frontend can place it on the timeline like any imported audio.
+/// Async: writing + remuxing a large recording must not block the UI thread.
 #[tauri::command]
-fn save_voiceover(bytes: Vec<u8>, ext: String) -> Result<String, String> {
+async fn save_voiceover(bytes: Vec<u8>, ext: String) -> Result<String, String> {
     let ext = match ext.to_ascii_lowercase().as_str() {
         "webm" | "wav" | "ogg" | "m4a" | "mp3" => ext.to_ascii_lowercase(),
         _ => "webm".to_string(),
     };
-    finalize_media_recording(&bytes, &ext, "voiceover").map(|p| p.display().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        finalize_media_recording(&bytes, &ext, "voiceover").map(|p| p.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("voiceover task failed: {e}"))?
 }
 
 #[derive(Clone, Serialize)]
@@ -1278,9 +1500,13 @@ fn collect_export_segments(
                 })
                 .collect();
             // Magic Remove: the removal is baked into the pre-rendered sidecar
-            // clip (same timing as the original), so export reads its frames
-            // instead of the original and the filter itself is dropped from
-            // the chain. Falls back to the original when no render exists.
+            // clip, so export reads its frames instead of the original and
+            // the filter itself is dropped from the chain. Falls back to the
+            // original when no render exists. Clip-scoped sidecars cover only
+            // [scopeIn, scopeOut] of the source (sidecar t=0 == scopeIn): the
+            // clip's used range must still be covered (a trim past the
+            // rendered window falls back) and in/out shift into sidecar time.
+            let mut magic_scope_shift = 0.0f64;
             if let Some(mr) = c
                 .filters
                 .iter()
@@ -1288,15 +1514,35 @@ fn collect_export_segments(
             {
                 if let Some(p) = mr.params.get("resultPath").and_then(|v| v.as_str()) {
                     if !p.is_empty() && Path::new(p).is_file() {
-                        source = PathBuf::from(p);
-                        filters.retain(|f| f.kind != "magicremove");
+                        let sin = mr
+                            .params
+                            .get("scopeIn")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                            .max(0.0);
+                        let sout = mr
+                            .params
+                            .get("scopeOut")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                            .max(0.0);
+                        let scoped = sout > sin + 1e-3;
+                        let covered =
+                            !scoped || (c.in_point >= sin - 0.01 && c.out_point <= sout + 0.01);
+                        if covered {
+                            source = PathBuf::from(p);
+                            if scoped {
+                                magic_scope_shift = sin;
+                            }
+                            filters.retain(|f| f.kind != "magicremove");
+                        }
                     }
                 }
             }
             ExportSegment {
                 path: proxies.original_path(source.as_path()),
-                in_point: c.in_point,
-                out_point: c.out_point,
+                in_point: (c.in_point - magic_scope_shift).max(0.0),
+                out_point: (c.out_point - magic_scope_shift).max(0.0),
                 start: c.start.max(0.0),
                 fade_in: c.fade_in.max(0.0),
                 fade_out: c.fade_out.max(0.0),
@@ -1307,6 +1553,13 @@ fn collect_export_segments(
             }
         })
         .collect()
+}
+
+/// Cooperative export cancel: the ffmpeg child is killed on the next
+/// progress line (~sub-second) and the partial output is discarded.
+#[tauri::command]
+fn cancel_export(state: State<'_, AppState>) {
+    state.export_cancel.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -1329,6 +1582,8 @@ async fn export_media(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let policy = state.policy.lock().clone();
+    state.export_cancel.store(false, Ordering::Relaxed);
+    let cancel = Arc::clone(&state.export_cancel);
     let codec = match codec.as_deref().unwrap_or("h264") {
         "h265" | "hevc" => ExportCodec::H265,
         _ => ExportCodec::H264,
@@ -1361,6 +1616,19 @@ async fn export_media(
         },
     );
 
+    // Encode to a sibling tmp file and rename on success: a killed, crashed
+    // or cancelled export must never leave a partial file at the user-chosen
+    // path (a partial .mp4 there looks playable but is corrupt).
+    let final_path = PathBuf::from(&output_path);
+    let tmp_path = final_path.with_extension(format!(
+        "yxtmp.{}",
+        final_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("out")
+    ));
+    let _ = std::fs::remove_file(&tmp_path);
+
     let app_progress = app.clone();
     let result = if use_timeline {
         let seg_end: f64 = video_segs
@@ -1375,7 +1643,7 @@ async fn export_media(
         let req = TimelineExportRequest {
             video: video_segs,
             audio: audio_segs,
-            output_path: PathBuf::from(output_path),
+            output_path: tmp_path.clone(),
             width,
             height,
             fps,
@@ -1390,7 +1658,7 @@ async fn export_media(
         };
 
         tauri::async_runtime::spawn_blocking(move || {
-            export_timeline_with_progress(&req, &policy, duration_secs, |pct| {
+            export_timeline_with_progress(&req, &policy, duration_secs, Some(&cancel), |pct| {
                 let _ = app_progress.emit(
                     "export-progress",
                     ExportProgressPayload {
@@ -1408,7 +1676,7 @@ async fn export_media(
         })?;
         let req = ExportRequest {
             input_path: PathBuf::from(&input_path),
-            output_path: PathBuf::from(output_path),
+            output_path: tmp_path.clone(),
             width,
             height,
             fps,
@@ -1432,7 +1700,7 @@ async fn export_media(
             .unwrap_or(0.0);
 
         tauri::async_runtime::spawn_blocking(move || {
-            export_file_with_progress(&req, &policy, duration_secs, |pct| {
+            export_file_with_progress(&req, &policy, duration_secs, Some(&cancel), |pct| {
                 let _ = app_progress.emit(
                     "export-progress",
                     ExportProgressPayload {
@@ -1448,16 +1716,42 @@ async fn export_media(
 
     match result {
         Ok(()) => {
-            let _ = app.emit(
-                "export-progress",
-                ExportProgressPayload {
-                    percent: 1.0,
-                    phase: "done".into(),
-                },
-            );
-            Ok(())
+            // Promote the finished encode: rename over any previous export.
+            let promote_tmp = tmp_path.clone();
+            let promote = tauri::async_runtime::spawn_blocking(move || {
+                if final_path.exists() {
+                    std::fs::remove_file(&final_path).map_err(|e| e.to_string())?;
+                }
+                std::fs::rename(&promote_tmp, &final_path).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("export promote task failed: {e}"));
+            match promote.and_then(|r| r) {
+                Ok(()) => {
+                    let _ = app.emit(
+                        "export-progress",
+                        ExportProgressPayload {
+                            percent: 1.0,
+                            phase: "done".into(),
+                        },
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = app.emit(
+                        "export-progress",
+                        ExportProgressPayload {
+                            percent: 0.0,
+                            phase: "error".into(),
+                        },
+                    );
+                    Err(e.to_string())
+                }
+            }
         }
         Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
             let _ = app.emit(
                 "export-progress",
                 ExportProgressPayload {
@@ -1654,6 +1948,20 @@ fn set_track_hidden(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Bound derived-cache growth before anything generates new entries.
+    // Protected paths come from the autosave file — the state this boot is
+    // about to restore must not have its derived media swept underneath it.
+    let protected = collect_protected_cache_paths();
+    sweep_derived_caches(&protected);
+    // Long sessions scrub/import for hours; re-run the (cheap) sweep
+    // periodically so caches stay bounded without waiting for a relaunch.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            let protected = collect_protected_cache_paths();
+            sweep_derived_caches(&protected);
+        }
+    });
     let (profile, policy) = probe_and_policy();
     let cache = dirs_cache();
     let state = AppState {
@@ -1664,6 +1972,7 @@ pub fn run() {
         probe_cache: Mutex::new(HashMap::new()),
         magic_busy: Arc::new(AtomicBool::new(false)),
         magic_cancel: Arc::new(AtomicBool::new(false)),
+        export_cancel: Arc::new(AtomicBool::new(false)),
     };
 
     // Notify the UI when background proxy transcodes finish so the timeline
@@ -1789,6 +2098,9 @@ pub fn run() {
             save_project,
             load_project,
             new_project,
+            save_autosave,
+            adopt_autosave,
+            clear_autosave,
             debug_agent_log,
             reprobe_hardware,
             import_media,
@@ -1833,13 +2145,23 @@ pub fn run() {
             save_voiceover,
             save_screen_recording,
             render_audio_preview,
+            cancel_export,
             export_media,
             magic_remove_track,
             magic_remove_render,
             magic_remove_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Project YX");
+        .build(tauri::generate_context!())
+        .expect("error while building Project YX")
+        .run(|app, event| {
+            // Exit-time autosave flush: the debounced UI timer loses the last
+            // ~3 s of edits before quit. RunEvent::Exit still allows sync
+            // work on the main thread; keep this handler cheap (one small
+            // JSON write, only when an autosave already exists).
+            if let tauri::RunEvent::Exit = event {
+                flush_autosave_on_exit(app);
+            }
+        });
 }
 
 fn dirs_cache() -> PathBuf {
@@ -1848,4 +2170,62 @@ fn dirs_cache() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("ProjectYX").join("proxy-cache")
+}
+
+#[cfg(test)]
+mod cache_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_keeps_newest_files_under_cap() {
+        let dir = std::env::temp_dir().join(format!("yx_sweep_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.bin");
+        let new = dir.join("new.bin");
+        std::fs::write(&old, vec![0u8; 100]).unwrap();
+        std::fs::write(&new, vec![0u8; 100]).unwrap();
+        // Force a distinct mtime (same-second writes can tie).
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        sweep_cache_dir(&dir, 150, &std::collections::HashSet::new());
+        assert!(!old.exists(), "oldest file must be evicted first");
+        assert!(new.exists(), "newest file must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_protects_live_files_even_when_over_cap() {
+        let dir = std::env::temp_dir().join(format!("yx_sweep_live_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("sidecar_render.mp4");
+        let stale = dir.join("stale.bin");
+        std::fs::write(&live, vec![0u8; 100]).unwrap();
+        std::fs::write(&stale, vec![0u8; 100]).unwrap();
+        let mut protected = std::collections::HashSet::new();
+        protected.insert(live.clone());
+        sweep_cache_dir(&dir, 50, &protected);
+        assert!(live.exists(), "referenced sidecar must survive the sweep");
+        assert!(!stale.exists(), "unprotected files still evicted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_noop_under_cap_and_missing_dir() {
+        let missing = std::env::temp_dir().join("yx_sweep_missing_dir");
+        sweep_cache_dir(&missing, 1 << 20, &std::collections::HashSet::new()); // must not panic
+        let dir = std::env::temp_dir().join(format!("yx_sweep_ok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 10]).unwrap();
+        sweep_cache_dir(&dir, 1 << 20, &std::collections::HashSet::new());
+        assert!(dir.join("a.bin").exists(), "under-cap sweep must not delete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

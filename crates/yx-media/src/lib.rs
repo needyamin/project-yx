@@ -18,6 +18,8 @@ pub enum MediaError {
     ProbeFailed(String),
     #[error("ffmpeg failed: {0}")]
     FfmpegFailed(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -1134,10 +1136,14 @@ fn inject_progress_flags(args: &mut Vec<String>) {
 }
 
 /// Run FFmpeg as a subprocess and report 0.0..=1.0 progress via `on_progress`.
+/// `cancel` is polled between progress lines — when set, the child is killed
+/// and `MediaError::Cancelled` is returned (never retried with software
+/// fallback). The child is also killed if the handle drops on any error path.
 pub fn export_file_with_progress<F>(
     req: &ExportRequest,
     policy: &PerformancePolicy,
     duration_secs: f64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     mut on_progress: F,
 ) -> Result<(), MediaError>
 where
@@ -1146,8 +1152,9 @@ where
     let mut args = build_export_args(req, policy)?;
     inject_progress_flags(&mut args);
 
-    match run_ffmpeg_progress(&args, duration_secs, &mut on_progress) {
+    match run_ffmpeg_progress(&args, duration_secs, cancel, &mut on_progress) {
         Ok(()) => Ok(()),
+        Err(MediaError::Cancelled) => Err(MediaError::Cancelled),
         Err(err) => {
             let can_retry = matches!(
                 req.encoder,
@@ -1161,7 +1168,7 @@ where
             let mut soft_args = build_export_args(&soft_req, policy)?;
             inject_progress_flags(&mut soft_args);
             on_progress(0.0);
-            run_ffmpeg_progress(&soft_args, duration_secs, &mut on_progress)
+            run_ffmpeg_progress(&soft_args, duration_secs, cancel, &mut on_progress)
         }
     }
 }
@@ -1170,6 +1177,7 @@ pub fn export_timeline_with_progress<F>(
     req: &TimelineExportRequest,
     policy: &PerformancePolicy,
     duration_secs: f64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     mut on_progress: F,
 ) -> Result<(), MediaError>
 where
@@ -1178,8 +1186,9 @@ where
     let mut args = build_timeline_export_args(req, policy)?;
     inject_progress_flags(&mut args);
 
-    match run_ffmpeg_progress(&args, duration_secs, &mut on_progress) {
+    match run_ffmpeg_progress(&args, duration_secs, cancel, &mut on_progress) {
         Ok(()) => Ok(()),
+        Err(MediaError::Cancelled) => Err(MediaError::Cancelled),
         Err(err) => {
             let can_retry = matches!(
                 req.encoder,
@@ -1193,7 +1202,7 @@ where
             let mut soft_args = build_timeline_export_args(&soft_req, policy)?;
             inject_progress_flags(&mut soft_args);
             on_progress(0.0);
-            run_ffmpeg_progress(&soft_args, duration_secs, &mut on_progress)
+            run_ffmpeg_progress(&soft_args, duration_secs, cancel, &mut on_progress)
         }
     }
 }
@@ -1202,12 +1211,35 @@ pub fn export_file(req: &ExportRequest, policy: &PerformancePolicy) -> Result<()
     let duration = probe_media(&req.input_path)
         .map(|i| i.duration)
         .unwrap_or(0.0);
-    export_file_with_progress(req, policy, duration, |_| {})
+    export_file_with_progress(req, policy, duration, None, |_| {})
+}
+
+/// RAII guard that kills the ffmpeg child on drop (same pattern as
+/// magic.rs's FrameReader): error paths and cancellation must never leak a
+/// running encoder process holding the output file open.
+struct KillOnDrop(std::process::Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn run_ffmpeg_progress<F>(
     args: &[String],
     duration_secs: f64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     on_progress: &mut F,
 ) -> Result<(), MediaError>
 where
@@ -1215,15 +1247,19 @@ where
 {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
-    let mut child = command_ffmpeg()
+    // KillOnDrop guard: an early return (read error, cancel) must never leak
+    // a running ffmpeg child holding the output file open. The guard is
+    // disarmed after the explicit wait below.
+    let mut child = KillOnDrop(command_ffmpeg()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| MediaError::FfmpegFailed(e.to_string()))?;
+        .map_err(|e| MediaError::FfmpegFailed(e.to_string()))?);
 
     let stderr = child
         .stderr
@@ -1244,6 +1280,13 @@ where
     let reader = BufReader::new(stdout);
     let mut last_emit = -1.0_f64;
     for line in reader.lines().flatten() {
+        if let Some(flag) = cancel {
+            if flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MediaError::Cancelled);
+            }
+        }
         if let Some(ms) = line.strip_prefix("out_time_ms=") {
             if let Ok(v) = ms.trim().parse::<f64>() {
                 if duration_secs > 0.01 {

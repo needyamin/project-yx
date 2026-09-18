@@ -47,6 +47,8 @@ type Props = {
   previewFrame: string | null;
   onClose: () => void;
   onExport: (settings: ExportSettings) => void;
+  /** Abort the running encode: kills ffmpeg and discards the partial output. */
+  onCancelExport?: () => void;
 };
 
 const PRESETS: {
@@ -173,6 +175,7 @@ export function ExportDialog({
   previewFrame,
   onClose,
   onExport,
+  onCancelExport,
 }: Props) {
   const [settings, setSettings] = useState<ExportSettings>(() =>
     bestDefaults(tier, sourceInfo),
@@ -512,9 +515,19 @@ export function ExportDialog({
             <p className="export-summary">{summary}</p>
           )}
           <div className="export-actions">
-            <button type="button" className="ghost-btn" disabled={busy} onClick={onClose}>
-              Cancel
-            </button>
+            {busy ? (
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => onCancelExport?.()}
+              >
+                Cancel Export
+              </button>
+            ) : (
+              <button type="button" className="ghost-btn" onClick={onClose}>
+                Cancel
+              </button>
+            )}
             <button
               type="button"
               className="primary-btn"
