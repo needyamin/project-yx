@@ -2161,6 +2161,9 @@ function App() {
       }
       setMagicStatus("Removed ✓ — scrub or play to preview; export bakes it in.");
       setStatus("✨ Magic Remove finished — the monitor now previews the cleaned video (original file untouched).");
+      // Auto-apply: leave the tool the moment the render is saved so the
+      // monitor swaps to the cleaned sidecar immediately — no Done click.
+      setMagicTool(false);
     } catch (e) {
       handleMagicError(e, "Removal");
     } finally {
@@ -2967,28 +2970,28 @@ function App() {
     };
   }, [monitorTargetClip]);
 
-  /** Media time of the clip under the playhead — the Magic Remove drawing
-   * anchor. Subscribes to the playback clock only while the tool is open so
-   * the rest of the app never re-renders for it. */
-  const [magicMediaTime, setMagicMediaTime] = useState(0);
+  /** The Magic Remove tool's target: the video clip under the playhead.
+   * Images are excluded — masks are defined against real video frames. */
+  const magicTarget =
+    videoUnderPlayhead && !isImagePath(videoUnderPlayhead.clip.media_path)
+      ? videoUnderPlayhead
+      : null;
+
+  // Tool stays in sync with the monitor: it only exists over a video clip.
+  // Leaving video mode (gap, audio clip, image) closes it so the toolbar
+  // button, frame class and gesture ownership can never go stale.
   useEffect(() => {
-    if (!magicTool) return;
-    const compute = (t: number) => {
-      const hit = videoUnderRef.current;
-      return hit ? mediaTimeForClip(hit.clip, t) : t;
-    };
-    setMagicMediaTime(compute(playbackClock.get()));
-    return playbackClock.subscribe((t) => setMagicMediaTime(compute(t)));
-  }, [magicTool, videoUnderPlayhead]);
+    if (magicTool && !magicTarget) setMagicTool(false);
+  }, [magicTool, magicTarget]);
 
   const magicParams = useMemo(() => {
-    const clip = videoUnderPlayhead?.clip;
+    const clip = magicTarget?.clip;
     const f = magicFilterOf(clip ?? null);
     if (f) return (f.params ?? {}) as Record<string, unknown>;
     // No filter yet — the panel runs on the local draft until the first
     // stroke commit creates it.
     return magicDraft;
-  }, [videoUnderPlayhead, magicDraft]);
+  }, [magicTarget, magicDraft]);
 
   /** Stale-render indicator: a resultPath exists but the mask/settings
    * changed since it was rendered. */
@@ -3792,31 +3795,6 @@ function App() {
     applyPreviewFades(ph, vHit?.clip ?? null, aHit?.clip ?? null);
   }, [timeline, applyPreviewFades]);
 
-  // When Magic Remove tool opens or closes, immediately switch the monitor video source
-  // between the raw media (for drawing/masking) and the inpainted sidecar (for WYSIWYG preview).
-  useEffect(() => {
-    const video = videoRef.current;
-    const tl = timelineRef.current;
-    if (!video || !tl) return;
-    const hit = clipAtPlayhead(tl, playheadRef.current, "video");
-    if (!hit || isImagePath(hit.clip.media_path)) return;
-    const targetPath =
-      (!magicTool &&
-        magicResultReady((findMagicRemove(hit.clip.filters)?.params ?? null) as Record<string, unknown> | null)) ||
-      hit.clip.media_path;
-    const wantSrc = convertFileSrc(targetPath);
-    if (wantSrc && video.getAttribute("src") !== wantSrc) {
-      const cur = video.currentTime;
-      video.src = wantSrc;
-      video.load();
-      try {
-        video.currentTime = cur;
-      } catch {
-        /* ignore */
-      }
-    }
-  }, [magicTool]);
-
   // Keyboard shortcuts (latest handlers via ref — attach once).
   const keyHandlersRef = useRef({
     togglePlay,
@@ -4164,7 +4142,7 @@ function App() {
             magicTool={magicTool}
             onMagicTool={toggleMagicTool}
             magicParams={magicParams}
-            magicMediaTime={magicMediaTime}
+            magicClip={magicTarget?.clip ?? null}
             magicBusy={magicBusy}
             magicStatus={
               magicStatus ?? (magicStale ? "Settings changed — press ✨ Remove to re-render." : null)

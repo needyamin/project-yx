@@ -149,6 +149,44 @@ export function installMockTauri(opts: { clips: number; mediaUrls: string[] }): 
       }
       return respond();
     },
+    add_filter: async (args) => {
+      pushUndo();
+      const hit = findClip(String(args.clipId));
+      if (hit) {
+        hit.clip.filters = [
+          ...(hit.clip.filters ?? []),
+          {
+            id: `f${callbackId++}`,
+            kind: String(args.kind),
+            enabled: true,
+            params: (args.params ?? {}) as Record<string, unknown>,
+          },
+        ];
+      }
+      return respond();
+    },
+    update_filter: async (args) => {
+      pushUndo();
+      const hit = findClip(String(args.clipId));
+      const f = hit?.clip.filters?.find((x) => x.id === String(args.filterId));
+      if (f) f.params = (args.params ?? {}) as Record<string, unknown>;
+      return respond();
+    },
+    remove_filter: async (args) => {
+      pushUndo();
+      const hit = findClip(String(args.clipId));
+      if (hit) hit.clip.filters = (hit.clip.filters ?? []).filter((x) => x.id !== String(args.filterId));
+      return respond();
+    },
+    set_filter_enabled: async (args) => {
+      const hit = findClip(String(args.clipId));
+      const f = hit?.clip.filters?.find((x) => x.id === String(args.filterId));
+      if (f) f.enabled = Boolean(args.enabled);
+      return respond();
+    },
+    // Magic Remove pipeline (instant fakes — enough to drive the UI flow).
+    magic_remove_track: async () => ({ keyframes: [] }),
+    magic_remove_render: async () => opts.mediaUrls[1] ?? opts.mediaUrls[0] ?? "mock://magic.mp4",
     get_media_thumbnail: async (args) => {
       const key = `t${Math.round(Number(args.time) * 4)}`;
       const cacheKey = `${String(args.source)}|${key}`;

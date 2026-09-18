@@ -816,6 +816,24 @@
   color: #ffb3b3;
 }
 
+/* ⚙ toggle for the advanced settings row */
+.magic-btn.gear {
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.magic-btn.gear.active {
+  background: rgba(183, 106, 240, 0.35);
+  border-color: rgba(183, 106, 240, 0.55);
+  color: #fff;
+}
+
+.magic-row.magic-advanced {
+  padding-top: 6px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
 .magic-progress-row {
   display: flex;
   align-items: center;

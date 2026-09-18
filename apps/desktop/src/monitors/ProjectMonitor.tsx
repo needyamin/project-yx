@@ -118,8 +118,10 @@ type Props = {
   magicTool?: boolean;
   onMagicTool?: (on: boolean) => void;
   magicParams?: Record<string, unknown> | null;
-  /** Media time of the clip under the playhead — the drawing anchor. */
-  magicMediaTime?: number;
+  /** The video clip under the playhead — the tool's target. The overlay
+   * derives its drawing time from the playback clock itself and remounts
+   * (keyed by clip id) so mask state never leaks across clips. */
+  magicClip?: Clip | null;
   magicBusy?: { phase: string; percent: number } | null;
   magicStatus?: string | null;
   onMagicCommit?: (patch: {
@@ -326,7 +328,7 @@ export function ProjectMonitor({
   magicTool = false,
   onMagicTool,
   magicParams = null,
-  magicMediaTime = 0,
+  magicClip = null,
   magicBusy = null,
   magicStatus = null,
   onMagicCommit,
@@ -570,8 +572,10 @@ export function ProjectMonitor({
   /** Text resize handles show on hover/interaction and take priority over
    * the media handles so both never clutter the frame at once. */
   const textHandlesActive = textDraggable && !textEditing && (textHover || textDragging || textResizing);
+  // Magic Remove owns the frame while open — the brush overlay is the only
+  // interaction; transform handles + the opacity HUD would just clutter it.
   const handlesVisible =
-    transformEnabled && (manipulableLayer != null || !!effectiveMediaSize) && !textHandlesActive;
+    transformEnabled && (manipulableLayer != null || !!effectiveMediaSize) && !textHandlesActive && !magicTool;
   const currentOpacityPct = Math.round(
     (manipulableLayer
       ? (parseClipTransform(manipulableLayer.clip)?.opacity ?? 1)
@@ -1685,13 +1689,16 @@ export function ProjectMonitor({
               ))}
             </div>
           )}
-          {/* Magic Remove (AI Eraser): brush mask overlay + controls. */}
-          {magicTool && previewMode === "video" && frameSize.w > 2 && (
+          {/* Magic Remove (AI Eraser): brush mask overlay + controls. Keyed
+              by clip id — a fresh panel per clip, so strokes/mask draft state
+              can never bleed across clips. */}
+          {magicTool && magicClip && previewMode === "video" && !previewIsImage && frameSize.w > 2 && (
             <MagicRemoveOverlay
+              key={magicClip.id}
+              clip={magicClip}
               frameSize={frameSize}
               content={content}
               params={magicParams}
-              mediaTime={magicMediaTime}
               busy={magicBusy}
               status={magicStatus}
               onCommit={(patch) => onMagicCommit?.(patch)}

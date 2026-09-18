@@ -158,6 +158,15 @@ async function runBench() {
   const container = document.getElementById("app-under-test") as HTMLDivElement;
   const rvfcSupported = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
+  // Manual GUI-check mode: /bench.html?ui mounts the real App against the
+  // mock backend with a small project and skips the measurement suite —
+  // for driving monitor tools (crop/transform/Magic Remove) by hand.
+  if (new URLSearchParams(location.search).has("ui")) {
+    const ms = await mountApp(container, 3);
+    row("UI MODE", `app mounted (3 clips, ${ms.toFixed(0)} ms)`, "manual GUI verification — benchmarks skipped");
+    return;
+  }
+
   // ---------------- mount + edit latency @ 100 clips ----------------
   let t0 = now();
   const mount100 = await mountApp(container, 100);

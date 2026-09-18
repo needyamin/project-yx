@@ -3,17 +3,23 @@
  *
  * Lives inside the Project Monitor frame (like the crop tool): a canvas over
  * the video where the user brushes the element to remove, plus a compact
- * panel with brush/feather/expand/accuracy/strength controls and the
- * Auto Track → Remove pipeline buttons. The mask is stored as normalized
- * source-frame strokes inside the clip's `magicremove` filter params —
- * nothing destructive ever touches the media.
+ * panel with brush/size controls and the Auto Track → Remove pipeline
+ * buttons (Feather/Expand/Tracking/Strength live behind the ⚙ toggle). The
+ * mask is stored as normalized source-frame strokes inside the clip's
+ * `magicremove` filter params — nothing destructive ever touches the media.
+ *
+ * The panel is mounted per target clip (keyed by clip id in ProjectMonitor)
+ * and subscribes to the playback clock itself for the drawing anchor — App
+ * never re-renders for time while the tool is open.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { usePlayheadTime } from "../playback/playbackClock";
 import {
   magicOffsetAt,
   type MagicKeyframe,
   type MagicStroke,
 } from "../effects/effects";
+import { mediaTimeForClip, type Clip } from "../timeline/types";
 import type { ContentRect } from "./monitorGeometry";
 
 type MagicParams = {
@@ -32,10 +38,11 @@ type Props = {
   frameSize: { w: number; h: number };
   /** Displayed content rect (fractions of the frame) for the source mapping. */
   content: ContentRect;
+  /** The video clip under the playhead — drawing anchor time comes from the
+   * playback clock through this clip's speed/reverse mapping. */
+  clip: Clip | null;
   /** Magic Remove filter params on the target clip (null = none yet). */
   params: MagicParams | null;
-  /** Media time of the clip under the playhead (the drawing anchor). */
-  mediaTime: number;
   busy: { phase: string; percent: number } | null;
   status: string | null;
   onCommit: (patch: {
@@ -66,8 +73,8 @@ function fmtPct(v: number): string {
 export function MagicRemoveOverlay({
   frameSize,
   content,
+  clip,
   params,
-  mediaTime,
   busy,
   status,
   onCommit,
@@ -84,13 +91,44 @@ export function MagicRemoveOverlay({
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const strokesRef = useRef<MagicStroke[]>([]);
   const [mode, setMode] = useState<Mode>("brush");
+  const [advanced, setAdvanced] = useState(false);
   const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number } | null>(null);
   const [cursorOn, setCursorOn] = useState(false);
 
+  // The drawing anchor follows the authoritative clock here, in the leaf —
+  // the mask offset stays glued to the playhead without any parent
+  // re-rendering for time.
+  const playhead = usePlayheadTime();
+  const mediaTime = clip ? mediaTimeForClip(clip, playhead) : playhead;
+
   const strokes = params?.strokes ?? [];
   const keyframes = params?.keyframes ?? [];
-  const brushSize = params?.brushSize ?? 0.025;
-  const accuracy = params?.trackingAccuracy ?? "medium";
+
+  /** Optimistic slider echo: the committed params lag the pointer by one
+   * async IPC round-trip; without the echo the controlled inputs snap back
+   * to the old value and fight the drag. Each echoed key drops out of the
+   * map the moment the saved params confirm it. */
+  const [paramEcho, setParamEcho] = useState<Record<string, number | string>>({});
+  useEffect(() => {
+    setParamEcho((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const next: Record<string, number | string> = {};
+      const p = (params ?? {}) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(prev)) {
+        if (p[k] !== v) next[k] = v;
+      }
+      return next;
+    });
+  }, [params]);
+  const param = <T,>(key: string, fallback: T): T =>
+    key in paramEcho ? (paramEcho[key] as T) : fallback;
+  const setParam = (key: string, value: number | string) => {
+    setParamEcho((prev) => ({ ...prev, [key]: value }));
+    onParamChange({ [key]: value });
+  };
+
+  const brushSize = param("brushSize", params?.brushSize ?? 0.025);
+  const accuracy = param("trackingAccuracy", params?.trackingAccuracy ?? "medium");
 
   /** Optimistic guard: between a stroke commit and the backend round-trip
    * the `strokes` prop still lags behind; ignore it until it matches what we
@@ -106,7 +144,10 @@ export function MagicRemoveOverlay({
     } else {
       strokesRef.current = strokes;
     }
-  } else {
+  } else if (!drawingRef.current) {
+    // Never adopt props mid-stroke: any re-render while drawing (cursor
+    // visibility, parent update) would wipe the in-flight points and the
+    // pointerup commit would silently drop the whole stroke.
     strokesRef.current = strokes;
   }
   const shownStrokes = strokesRef.current;
@@ -367,56 +408,9 @@ export function MagicRemoveOverlay({
                   min={5}
                   max={150}
                   value={Math.round(brushSize * 1000)}
-                  onChange={(e) => onParamChange({ brushSize: Number(e.target.value) / 1000 })}
+                  onChange={(e) => setParam("brushSize", Number(e.target.value) / 1000)}
                 />
                 <span className="magic-val">{fmtPct(brushSize)}</span>
-              </label>
-              <label className="magic-slider" title="Mask edge softness">
-                <span>Feather</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={40}
-                  value={Math.round((params?.feather ?? 0.008) * 1000)}
-                  onChange={(e) => onParamChange({ feather: Number(e.target.value) / 1000 })}
-                />
-                <span className="magic-val">{fmtPct(params?.feather ?? 0.008)}</span>
-              </label>
-              <label className="magic-slider" title="Grow the mask to catch fringes">
-                <span>Expand</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={20}
-                  value={Math.round((params?.expand ?? 0.004) * 1000)}
-                  onChange={(e) => onParamChange({ expand: Number(e.target.value) / 1000 })}
-                />
-                <span className="magic-val">{fmtPct(params?.expand ?? 0.004)}</span>
-              </label>
-            </div>
-            <div className="magic-row">
-              <label className="magic-slider" title="Search window & keyframe density for auto tracking">
-                <span>Tracking</span>
-                <select
-                  value={accuracy}
-                  onChange={(e) => onParamChange({ trackingAccuracy: e.target.value })}
-                >
-                  <option value="low">Fast</option>
-                  <option value="medium">Balanced</option>
-                  <option value="high">Precise</option>
-                </select>
-                <span className="magic-val">{accLabel}</span>
-              </label>
-              <label className="magic-slider" title="Removal strength — blend of the reconstructed background">
-                <span>Strength</span>
-                <input
-                  type="range"
-                  min={10}
-                  max={100}
-                  value={Math.round(params?.removalStrength ?? 100)}
-                  onChange={(e) => onParamChange({ removalStrength: Number(e.target.value) })}
-                />
-                <span className="magic-val">{Math.round(params?.removalStrength ?? 100)}%</span>
               </label>
               <div className="magic-actions">
                 <button
@@ -463,8 +457,66 @@ export function MagicRemoveOverlay({
                 <button type="button" className="magic-btn" onClick={onDone}>
                   Done
                 </button>
+                <button
+                  type="button"
+                  className={`magic-btn gear ${advanced ? "active" : ""}`}
+                  title="Advanced mask settings (feather, expand, tracking, strength)"
+                  aria-expanded={advanced}
+                  onClick={() => setAdvanced((a) => !a)}
+                >
+                  ⚙
+                </button>
               </div>
             </div>
+            {advanced && (
+              <div className="magic-row magic-advanced">
+                <label className="magic-slider" title="Mask edge softness">
+                  <span>Feather</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={40}
+                    value={Math.round(param("feather", params?.feather ?? 0.008) * 1000)}
+                    onChange={(e) => setParam("feather", Number(e.target.value) / 1000)}
+                  />
+                  <span className="magic-val">{fmtPct(param("feather", params?.feather ?? 0.008))}</span>
+                </label>
+                <label className="magic-slider" title="Grow the mask to catch fringes">
+                  <span>Expand</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={20}
+                    value={Math.round(param("expand", params?.expand ?? 0.004) * 1000)}
+                    onChange={(e) => setParam("expand", Number(e.target.value) / 1000)}
+                  />
+                  <span className="magic-val">{fmtPct(param("expand", params?.expand ?? 0.004))}</span>
+                </label>
+                <label className="magic-slider" title="Search window & keyframe density for auto tracking">
+                  <span>Tracking</span>
+                  <select
+                    value={accuracy}
+                    onChange={(e) => setParam("trackingAccuracy", e.target.value)}
+                  >
+                    <option value="low">Fast</option>
+                    <option value="medium">Balanced</option>
+                    <option value="high">Precise</option>
+                  </select>
+                  <span className="magic-val">{accLabel}</span>
+                </label>
+                <label className="magic-slider" title="Removal strength — blend of the reconstructed background">
+                  <span>Strength</span>
+                  <input
+                    type="range"
+                    min={10}
+                    max={100}
+                    value={Math.round(param("removalStrength", params?.removalStrength ?? 100))}
+                    onChange={(e) => setParam("removalStrength", Number(e.target.value))}
+                  />
+                  <span className="magic-val">{Math.round(param("removalStrength", params?.removalStrength ?? 100))}%</span>
+                </label>
+              </div>
+            )}
             {(status || !hasStrokes) && (
               <div className="magic-status">
                 {status ??
