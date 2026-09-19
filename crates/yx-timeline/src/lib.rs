@@ -210,6 +210,17 @@ pub enum FilterKind {
     // alias keeps timelines saved with the old snake_case name loading.
     #[serde(rename = "magicremove", alias = "magic_remove")]
     MagicRemove,
+    /// Region blur (Blur tool): a movable/resizable/rotatable region with a
+    /// shape (rect / rounded / circle / ellipse), blur intensity, feather and
+    /// opacity, optionally animated through keyframes stored in params.
+    #[serde(rename = "blurregion", alias = "blur_region")]
+    BlurRegion,
+    /// Background mask removal (BG Key tool): manual select-area removal with
+    /// rect/ellipse/lasso shapes, feather, invert and add/subtract modes.
+    /// The composited alpha mask is rasterized by the UI into a PNG
+    /// (maskPath) so export and preview always share the exact same mask.
+    #[serde(rename = "bgmask", alias = "bg_mask")]
+    BgMask,
     Dream,
     Magic,
     Shake,
@@ -241,6 +252,8 @@ impl FilterKind {
                 | Self::Stabilize
                 | Self::Lut3d
                 | Self::MagicRemove
+                | Self::BlurRegion
+                | Self::BgMask
         )
     }
 
@@ -327,16 +340,51 @@ impl FilterKind {
                 "renderKey": "",
                 "resultPath": ""
             }),
+            // Region geometry is normalized to the SOURCE frame (center x/y +
+            // full width/height as fractions, rotation in degrees); intensity
+            // 0..1 maps to a gaussian sigma, feather is a fraction of the
+            // region's min dimension. Keyframes store the same fields sampled
+            // at clip-local source times (see build_video_effect_chain).
+            Self::BlurRegion => serde_json::json!({
+                "x": 0.5,
+                "y": 0.5,
+                "w": 0.3,
+                "h": 0.3,
+                "rotation": 0.0,
+                "shape": "rect",
+                "cornerRadius": 0.15,
+                "intensity": 0.5,
+                "feather": 0.08,
+                "opacity": 1.0,
+                "keyframes": []
+            }),
+            Self::BgMask => serde_json::json!({
+                "shapes": [],
+                "feather": 0.01,
+                "invert": false,
+                "maskPath": "",
+                "maskKey": ""
+            }),
             Self::Dream => serde_json::json!({ "intensity": 0.5, "duration": 0.0 }),
             Self::Magic => serde_json::json!({ "intensity": 0.3, "speed": 0.25, "duration": 0.0 }),
-            Self::Shake => serde_json::json!({ "intensity": 0.06, "speed": 8.0, "direction": "both", "duration": 0.0 }),
-            Self::Wiggle => serde_json::json!({ "intensity": 0.03, "speed": 20.0, "duration": 0.0 }),
+            Self::Shake => {
+                serde_json::json!({ "intensity": 0.06, "speed": 8.0, "direction": "both", "duration": 0.0 })
+            }
+            Self::Wiggle => {
+                serde_json::json!({ "intensity": 0.03, "speed": 20.0, "duration": 0.0 })
+            }
             Self::Bounce => serde_json::json!({ "intensity": 0.08, "speed": 2.0, "duration": 0.0 }),
-            Self::Zoompulse => serde_json::json!({ "intensity": 0.15, "speed": 2.0, "duration": 0.0 }),
-            Self::Zoomin => serde_json::json!({ "intensity": 0.3, "duration": 5.0, "direction": "in" }),
+            Self::Zoompulse => {
+                serde_json::json!({ "intensity": 0.15, "speed": 2.0, "duration": 0.0 })
+            }
+            Self::Zoomin => {
+                serde_json::json!({ "intensity": 0.3, "duration": 5.0, "direction": "in" })
+            }
             Self::Spin => serde_json::json!({ "speed": 0.25, "duration": 3.0, "direction": "cw" }),
             Self::Motionblur => serde_json::json!({ "intensity": 2.0, "duration": 0.0 }),
-            Self::Rgbsplit => serde_json::json!({ "intensity": 6.0, "direction": "horizontal", "duration": 0.0 }),
+            Self::Rgbsplit => {
+                serde_json::json!({ "intensity": 6.0, "direction": "horizontal", "duration": 0.0 })
+            }
             Self::Glitch => serde_json::json!({ "intensity": 8.0, "speed": 2.0, "duration": 0.0 }),
             Self::Flash => serde_json::json!({ "intensity": 0.25, "speed": 2.0, "duration": 0.0 }),
             Self::Pulse => serde_json::json!({ "intensity": 0.12, "speed": 2.0, "duration": 0.0 }),
@@ -810,8 +858,11 @@ impl TimelineEditor {
                 if remove_linked {
                     if let Some(link) = linked {
                         if let Ok((ltrack, lidx)) = self.timeline.find_clip(link) {
-                            let (ltid, lstart, ldur) =
-                                (ltrack.id, ltrack.clips[lidx].start, ltrack.clips[lidx].duration());
+                            let (ltid, lstart, ldur) = (
+                                ltrack.id,
+                                ltrack.clips[lidx].start,
+                                ltrack.clips[lidx].duration(),
+                            );
                             let _ = self.remove_clip_inner(link, false);
                             let _ = self.shift_clips_after(ltid, lstart, -ldur);
                         }
@@ -1059,12 +1110,7 @@ impl TimelineEditor {
                     .tracks
                     .iter()
                     .find(|t| t.id == track_id)
-                    .map(|t| {
-                        t.clips
-                            .iter()
-                            .filter_map(|c| c.linked_clip_id)
-                            .collect()
-                    })
+                    .map(|t| t.clips.iter().filter_map(|c| c.linked_clip_id).collect())
                     .unwrap_or_default();
                 self.timeline.tracks.retain(|t| t.id != track_id);
                 for link in removed_links {
@@ -1191,10 +1237,7 @@ impl TimelineEditor {
                     secondary_clip_id: None,
                 })
             }
-            EditCommand::RemoveFilter {
-                clip_id,
-                filter_id,
-            } => {
+            EditCommand::RemoveFilter { clip_id, filter_id } => {
                 let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
                 if track.locked {
                     return Err(TimelineError::TrackLocked);
@@ -1695,12 +1738,7 @@ impl TimelineEditor {
         let placed = match mode {
             EditMode::Normal => {
                 let mut obstacles: Vec<(f64, f64)> = Vec::new();
-                if let Some(track) = self
-                    .timeline
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == dest_track_id)
-                {
+                if let Some(track) = self.timeline.tracks.iter().find(|t| t.id == dest_track_id) {
                     obstacles.extend(track.clips.iter().map(|c| (c.start, c.end())));
                 }
                 if let Some(link) = linked {
@@ -2156,7 +2194,11 @@ impl TimelineEditor {
         Ok(())
     }
 
-    fn split_one(&mut self, clip_id: ClipId, at: f64) -> Result<(ClipId, Option<ClipId>), TimelineError> {
+    fn split_one(
+        &mut self,
+        clip_id: ClipId,
+        at: f64,
+    ) -> Result<(ClipId, Option<ClipId>), TimelineError> {
         let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
         if track.locked {
             return Err(TimelineError::TrackLocked);
@@ -2495,12 +2537,13 @@ mod tests {
 
         // --- Edit mode switching ---
         for mode in [EditMode::Normal, EditMode::Insert, EditMode::Overwrite] {
-            ed.apply(EditCommand::SetEditMode { mode })
-                .unwrap();
+            ed.apply(EditCommand::SetEditMode { mode }).unwrap();
             assert_eq!(ed.timeline.edit_mode, mode);
         }
-        ed.apply(EditCommand::SetEditMode { mode: EditMode::Normal })
-            .unwrap();
+        ed.apply(EditCommand::SetEditMode {
+            mode: EditMode::Normal,
+        })
+        .unwrap();
 
         // --- Zone in / out ---
         ed.apply(EditCommand::SetZone {
@@ -2522,8 +2565,7 @@ mod tests {
         // --- Link / Unlink A/V ---
         let vid = r1.primary_clip_id.unwrap();
         let aud = r1.secondary_clip_id.unwrap();
-        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
-            .unwrap();
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid }).unwrap();
         ed.apply(EditCommand::LinkClips {
             clip_a: vid,
             clip_b: aud,
@@ -2558,12 +2600,7 @@ mod tests {
             remove_linked: true,
         })
         .unwrap();
-        let v1 = ed
-            .timeline
-            .tracks
-            .iter()
-            .find(|t| t.id == v1)
-            .unwrap();
+        let v1 = ed.timeline.tracks.iter().find(|t| t.id == v1).unwrap();
         assert!(
             v1.clips.iter().all(|c| c.id != vid),
             "ripple-deleted clip must be gone"
@@ -2595,7 +2632,10 @@ mod tests {
         let mut ed = TimelineEditor::new();
         let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
         let v2 = ed
-            .apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
+            .apply(EditCommand::AddTrack {
+                kind: TrackKind::Video,
+                name: None,
+            })
             .unwrap();
         let _ = v2;
         let clip_id = ed
@@ -2646,10 +2686,16 @@ mod tests {
         let mut ed = TimelineEditor::new();
         let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
         let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
-        ed.apply(EditCommand::AddTrack { kind: TrackKind::Video, name: None })
-            .unwrap();
-        ed.apply(EditCommand::AddTrack { kind: TrackKind::Audio, name: None })
-            .unwrap();
+        ed.apply(EditCommand::AddTrack {
+            kind: TrackKind::Video,
+            name: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddTrack {
+            kind: TrackKind::Audio,
+            name: None,
+        })
+        .unwrap();
         let res = ed
             .apply(EditCommand::AddAvPair {
                 video_track_id: v1,
@@ -2948,7 +2994,13 @@ mod tests {
             .filter(|t| t.kind == TrackKind::Video)
             .count();
         assert!(v_count >= 2);
-        let v2 = ed.timeline.tracks.iter().find(|t| t.name == "V2").unwrap().id;
+        let v2 = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.name == "V2")
+            .unwrap()
+            .id;
         ed.apply(EditCommand::RemoveTrack { track_id: v2 }).unwrap();
         assert_eq!(
             ed.timeline
@@ -3017,8 +3069,7 @@ mod tests {
             Some("orig.mp4")
         );
 
-        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
-            .unwrap();
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid }).unwrap();
         assert!(ed.timeline.tracks[0].clips[0].linked_clip_id.is_none());
         let audio = ed
             .timeline
@@ -3128,8 +3179,13 @@ mod tests {
             ed.apply(EditCommand::LiftZone).unwrap_err(),
             TimelineError::NoZone
         ));
-        assert_eq!(ed.timeline.tracks[0].clips.len(), before.tracks[0].clips.len());
-        assert!((ed.timeline.tracks[0].clips[0].start - before.tracks[0].clips[0].start).abs() < 1e-9);
+        assert_eq!(
+            ed.timeline.tracks[0].clips.len(),
+            before.tracks[0].clips.len()
+        );
+        assert!(
+            (ed.timeline.tracks[0].clips[0].start - before.tracks[0].clips[0].start).abs() < 1e-9
+        );
 
         assert!(matches!(
             ed.apply(EditCommand::ExtractZone).unwrap_err(),
@@ -3430,7 +3486,9 @@ mod tests {
         .unwrap();
         let _ = left;
         let clips = &ed.timeline.tracks[0].clips;
-        assert!(clips.iter().any(|c| c.media_path == "b.mp4" && (c.start - 4.0).abs() < 1e-6));
+        assert!(clips
+            .iter()
+            .any(|c| c.media_path == "b.mp4" && (c.start - 4.0).abs() < 1e-6));
     }
 
     #[test]
@@ -3486,7 +3544,12 @@ mod tests {
         })
         .unwrap();
 
-        let track = ed.timeline.tracks.iter().find(|t| t.id == track_id).unwrap();
+        let track = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .unwrap();
         let c3_placed = track.clips.iter().find(|c| c.id == c3).unwrap();
         // c3 duration is 4.0, gap [5.0, 7.0] is only 2.0.
         // It must NOT be placed inside [5.0, 7.0] or overlap [0, 5] or [7, 12]!
@@ -3528,8 +3591,7 @@ mod tests {
         let vid = res.primary_clip_id.unwrap();
         let aid = res.secondary_clip_id.unwrap();
         assert_eq!(ed.timeline.tracks[0].clips[0].linked_clip_id, Some(aid));
-        ed.apply(EditCommand::UnlinkClip { clip_id: vid })
-            .unwrap();
+        ed.apply(EditCommand::UnlinkClip { clip_id: vid }).unwrap();
         assert!(ed.timeline.tracks[0].clips[0].linked_clip_id.is_none());
         ed.apply(EditCommand::LinkClips {
             clip_a: vid,
@@ -3621,13 +3683,14 @@ mod tests {
             muted: true,
         })
         .unwrap();
-        assert!(ed
-            .timeline
-            .tracks
-            .iter()
-            .find(|t| t.id == a1)
-            .unwrap()
-            .muted);
+        assert!(
+            ed.timeline
+                .tracks
+                .iter()
+                .find(|t| t.id == a1)
+                .unwrap()
+                .muted
+        );
 
         // 7. Unlink → move audio later (export start gap scenario)
         let v_clip = ed.timeline.tracks[0].clips[0].id;
@@ -3735,180 +3798,182 @@ mod tests {
     }
 }
 
-
 /// --- Performance / scale / consistency ---------------------------------
 #[cfg(test)]
 mod scale_tests {
     use super::*;
 
-/// Build a project with `n` linked AV pairs spread over V1/A1, simulating a
-/// long editing session, and return (editor, video clip ids).
-fn build_stress(n: usize) -> (TimelineEditor, Vec<ClipId>) {
-    let mut ed = TimelineEditor::new();
-    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
-    let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
-    let mut ids = Vec::with_capacity(n);
-    for i in 0..n {
-        let start = (i as f64) * 4.0;
-        let res = ed
-            .apply(EditCommand::AddAvPair {
-                video_track_id: v1,
-                audio_track_id: a1,
-                media_path: format!("clip{i}.mp4"),
-                source_path: None,
-                start,
-                in_point: 0.0,
-                out_point: 4.0,
+    /// Build a project with `n` linked AV pairs spread over V1/A1, simulating a
+    /// long editing session, and return (editor, video clip ids).
+    fn build_stress(n: usize) -> (TimelineEditor, Vec<ClipId>) {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = (i as f64) * 4.0;
+            let res = ed
+                .apply(EditCommand::AddAvPair {
+                    video_track_id: v1,
+                    audio_track_id: a1,
+                    media_path: format!("clip{i}.mp4"),
+                    source_path: None,
+                    start,
+                    in_point: 0.0,
+                    out_point: 4.0,
+                })
+                .unwrap();
+            ids.push(res.primary_clip_id.unwrap());
+        }
+        (ed, ids)
+    }
+
+    #[test]
+    fn stress_500_clips_split_move_trim_stay_valid() {
+        let (mut ed, ids) = build_stress(500);
+        // Split 100 clips (the razor storm case).
+        for (i, id) in ids.iter().take(100).enumerate() {
+            ed.apply(EditCommand::SplitClip {
+                clip_id: *id,
+                at: i as f64 * 4.0 + 2.0,
+                sync_linked: true,
             })
             .unwrap();
-        ids.push(res.primary_clip_id.unwrap());
-    }
-    (ed, ids)
-}
-
-#[test]
-fn stress_500_clips_split_move_trim_stay_valid() {
-    let (mut ed, ids) = build_stress(500);
-    // Split 100 clips (the razor storm case).
-    for (i, id) in ids.iter().take(100).enumerate() {
-        ed.apply(EditCommand::SplitClip {
-            clip_id: *id,
-            at: i as f64 * 4.0 + 2.0,
-            sync_linked: true,
-        })
-        .unwrap();
-    }
-    assert!(ed.timeline.validate().is_empty(), "valid after splits");
-    // Move 50 right-halves (no-ops via collision resolution must not corrupt).
-    for (i, id) in ids.iter().take(50).enumerate() {
-        let _ = ed.apply(EditCommand::MoveClip {
-            clip_id: *id,
-            new_start: i as f64 * 4.0 + 1.0,
-            sync_linked: true,
-            target_track_id: None,
-        });
-    }
-    assert!(ed.timeline.validate().is_empty(), "valid after moves");
-    // Trim 50.
-    for (i, id) in ids.iter().skip(100).take(50).enumerate() {
-        ed.apply(EditCommand::TrimClip {
-            clip_id: *id,
-            in_point: 0.5,
-            out_point: 3.5,
-            keep_end: false,
-            sync_linked: true,
-        })
-        .unwrap();
-    }
-    assert!(ed.timeline.validate().is_empty(), "valid after trims");
-    // Ripple delete 20.
-    for id in ids.iter().skip(200).take(20) {
-        let _ = ed.apply(EditCommand::RippleDelete {
-            clip_id: *id,
-            remove_linked: true,
-        });
-    }
-    let issues = ed.timeline.validate();
-    assert!(issues.is_empty(), "timeline corrupt after storm: {issues:?}");
-}
-
-#[test]
-fn stress_undo_redo_roundtrip_preserves_content() {
-    // 40 pairs + 40 splits = 80 undo entries, inside max_history (100).
-    let (mut ed, ids) = build_stress(40);
-    for (i, id) in ids.iter().enumerate() {
-        ed.apply(EditCommand::SplitClip {
-            clip_id: *id,
-            at: i as f64 * 4.0 + 1.0,
-            sync_linked: true,
-        })
-        .unwrap();
-    }
-    let after_edits = ed.timeline.clone();
-    // Undo the splits, then redo them.
-    for _ in 0..ids.len() {
-        ed.undo().unwrap();
-    }
-    for _ in 0..ids.len() {
-        ed.redo().unwrap();
-    }
-    assert!(
-        ed.timeline.validate().is_empty(),
-        "valid after undo/redo storm"
-    );
-    assert_eq!(
-        ed.timeline.tracks[0].clips.len(),
-        after_edits.tracks[0].clips.len()
-    );
-    assert!((ed.timeline.duration() - after_edits.duration()).abs() < 1e-9);
-}
-
-#[test]
-fn validation_detects_corruption() {
-    let mut ed = TimelineEditor::new();
-    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
-    let id = ed
-        .apply(EditCommand::AddClip {
-            track_id: v1,
-            media_path: "a.mp4".into(),
-            source_path: None,
-            start: 0.0,
-            in_point: 0.0,
-            out_point: 5.0,
-            role: MediaRole::Video,
-            linked_clip_id: None,
-        })
-        .unwrap()
-        .primary_clip_id
-        .unwrap();
-    assert!(ed.timeline.validate().is_empty());
-    // Simulate corruption: dangling link + inverted range.
-    ed.timeline.tracks[0].clips[0].linked_clip_id = Some(Uuid::new_v4());
-    ed.timeline.tracks[0].clips[0].out_point = 0.0;
-    let issues = ed.timeline.validate();
-    assert!(issues.len() >= 2, "expected ≥2 issues, got {issues:?}");
-    let _ = id;
-}
-
-#[test]
-fn repeated_split_100_is_cheap_and_linked() {
-    // 100 progressive splits: each cut targets the right half (razor-dragging
-    // down one long clip) and must keep the linked audio pair in lockstep.
-    let mut ed = TimelineEditor::new();
-    let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
-    let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
-    let mut vid = ed
-        .apply(EditCommand::AddAvPair {
-            video_track_id: v1,
-            audio_track_id: a1,
-            media_path: "long.mp4".into(),
-            source_path: None,
-            start: 0.0,
-            in_point: 0.0,
-            out_point: 100.0,
-        })
-        .unwrap()
-        .primary_clip_id
-        .unwrap();
-    for i in 1..100 {
-        vid = ed
-            .apply(EditCommand::SplitClip {
-                clip_id: vid,
-                at: i as f64,
+        }
+        assert!(ed.timeline.validate().is_empty(), "valid after splits");
+        // Move 50 right-halves (no-ops via collision resolution must not corrupt).
+        for (i, id) in ids.iter().take(50).enumerate() {
+            let _ = ed.apply(EditCommand::MoveClip {
+                clip_id: *id,
+                new_start: i as f64 * 4.0 + 1.0,
                 sync_linked: true,
+                target_track_id: None,
+            });
+        }
+        assert!(ed.timeline.validate().is_empty(), "valid after moves");
+        // Trim 50.
+        for (i, id) in ids.iter().skip(100).take(50).enumerate() {
+            ed.apply(EditCommand::TrimClip {
+                clip_id: *id,
+                in_point: 0.5,
+                out_point: 3.5,
+                keep_end: false,
+                sync_linked: true,
+            })
+            .unwrap();
+        }
+        assert!(ed.timeline.validate().is_empty(), "valid after trims");
+        // Ripple delete 20.
+        for id in ids.iter().skip(200).take(20) {
+            let _ = ed.apply(EditCommand::RippleDelete {
+                clip_id: *id,
+                remove_linked: true,
+            });
+        }
+        let issues = ed.timeline.validate();
+        assert!(
+            issues.is_empty(),
+            "timeline corrupt after storm: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn stress_undo_redo_roundtrip_preserves_content() {
+        // 40 pairs + 40 splits = 80 undo entries, inside max_history (100).
+        let (mut ed, ids) = build_stress(40);
+        for (i, id) in ids.iter().enumerate() {
+            ed.apply(EditCommand::SplitClip {
+                clip_id: *id,
+                at: i as f64 * 4.0 + 1.0,
+                sync_linked: true,
+            })
+            .unwrap();
+        }
+        let after_edits = ed.timeline.clone();
+        // Undo the splits, then redo them.
+        for _ in 0..ids.len() {
+            ed.undo().unwrap();
+        }
+        for _ in 0..ids.len() {
+            ed.redo().unwrap();
+        }
+        assert!(
+            ed.timeline.validate().is_empty(),
+            "valid after undo/redo storm"
+        );
+        assert_eq!(
+            ed.timeline.tracks[0].clips.len(),
+            after_edits.tracks[0].clips.len()
+        );
+        assert!((ed.timeline.duration() - after_edits.duration()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn validation_detects_corruption() {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let id = ed
+            .apply(EditCommand::AddClip {
+                track_id: v1,
+                media_path: "a.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 5.0,
+                role: MediaRole::Video,
+                linked_clip_id: None,
             })
             .unwrap()
             .primary_clip_id
             .unwrap();
+        assert!(ed.timeline.validate().is_empty());
+        // Simulate corruption: dangling link + inverted range.
+        ed.timeline.tracks[0].clips[0].linked_clip_id = Some(Uuid::new_v4());
+        ed.timeline.tracks[0].clips[0].out_point = 0.0;
+        let issues = ed.timeline.validate();
+        assert!(issues.len() >= 2, "expected ≥2 issues, got {issues:?}");
+        let _ = id;
     }
-    let issues = ed.timeline.validate();
-    assert!(issues.is_empty(), "valid after 99 splits: {issues:?}");
-    let v_clips = &ed.timeline.tracks[0].clips;
-    let a_clips = &ed.timeline.tracks[2].clips;
-    assert_eq!(v_clips.len(), 100);
-    assert_eq!(a_clips.len(), 100);
-    for (v, a) in v_clips.iter().zip(a_clips.iter()) {
-        assert!((v.start - a.start).abs() < 1e-9, "A/V pair desynced");
+
+    #[test]
+    fn repeated_split_100_is_cheap_and_linked() {
+        // 100 progressive splits: each cut targets the right half (razor-dragging
+        // down one long clip) and must keep the linked audio pair in lockstep.
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        let mut vid = ed
+            .apply(EditCommand::AddAvPair {
+                video_track_id: v1,
+                audio_track_id: a1,
+                media_path: "long.mp4".into(),
+                source_path: None,
+                start: 0.0,
+                in_point: 0.0,
+                out_point: 100.0,
+            })
+            .unwrap()
+            .primary_clip_id
+            .unwrap();
+        for i in 1..100 {
+            vid = ed
+                .apply(EditCommand::SplitClip {
+                    clip_id: vid,
+                    at: i as f64,
+                    sync_linked: true,
+                })
+                .unwrap()
+                .primary_clip_id
+                .unwrap();
+        }
+        let issues = ed.timeline.validate();
+        assert!(issues.is_empty(), "valid after 99 splits: {issues:?}");
+        let v_clips = &ed.timeline.tracks[0].clips;
+        let a_clips = &ed.timeline.tracks[2].clips;
+        assert_eq!(v_clips.len(), 100);
+        assert_eq!(a_clips.len(), 100);
+        for (v, a) in v_clips.iter().zip(a_clips.iter()) {
+            assert!((v.start - a.start).abs() < 1e-9, "A/V pair desynced");
+        }
     }
-}
 }

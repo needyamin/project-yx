@@ -100,9 +100,7 @@ impl MagicJob {
         if strokes.is_empty() {
             return Err("no mask strokes drawn".into());
         }
-        let num = |k: &str, d: f64| -> f64 {
-            params.get(k).and_then(|v| v.as_f64()).unwrap_or(d)
-        };
+        let num = |k: &str, d: f64| -> f64 { params.get(k).and_then(|v| v.as_f64()).unwrap_or(d) };
         let accuracy = params
             .get("trackingAccuracy")
             .and_then(|v| v.as_str())
@@ -113,7 +111,11 @@ impl MagicJob {
         // times). Degenerate ranges fall back to "whole media".
         let sin = num("scopeIn", 0.0).max(0.0);
         let sout = num("scopeOut", 0.0).max(0.0);
-        let (scope_in, scope_out) = if sout > sin + 1e-3 { (sin, sout) } else { (0.0, 0.0) };
+        let (scope_in, scope_out) = if sout > sin + 1e-3 {
+            (sin, sout)
+        } else {
+            (0.0, 0.0)
+        };
         Ok(Self {
             source: source.to_path_buf(),
             strokes,
@@ -166,6 +168,214 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
 }
 
 /* ------------------------------------------------------------------ */
+/* Region tracking (Blur tool auto-track)                              */
+/* ------------------------------------------------------------------ */
+
+/// Blur tool auto-track input: the rectangular region (normalized center +
+/// size) at the anchor, plus the clip-scoped source window.
+#[derive(Debug, Clone)]
+pub struct RegionTrackParams {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// Clip-local source time where the region currently sits.
+    pub anchor_time: f64,
+    pub scope_in: f64,
+    pub scope_out: f64,
+    pub accuracy: String,
+}
+
+/// Template-track the content under a rectangular region across the clip
+/// (same SAD machinery as the Magic Remove mask tracker) and return
+/// translation keyframes — `dx`/`dy` are normalized offsets from the anchor
+/// position, `t` is clip-local source time (0 = scope start). The caller
+/// stores them as position keyframes `x = anchorX + dx, y = anchorY + dy`.
+pub fn track_region(
+    source: &Path,
+    p: &RegionTrackParams,
+    cancel: Option<&AtomicBool>,
+    progress: &dyn Fn(f64, &str),
+) -> Result<Vec<MagicKeyframe>, String> {
+    if is_image_path(source) {
+        return Ok(vec![]);
+    }
+    let info = probe_media(source).map_err(|e| e.to_string())?;
+    if !info.has_video || info.width < 8 || info.height < 8 {
+        return Err("source has no video track".into());
+    }
+    let fps = if info.frame_rate > 0.1 {
+        info.frame_rate
+    } else {
+        30.0
+    };
+    let total = info.duration.max(0.1);
+    let total_frames = ((total * fps).ceil() as i64).max(1);
+    let scope_in = p.scope_in.max(0.0);
+    let scope_out = if p.scope_out > scope_in + 1e-3 {
+        p.scope_out.min(total)
+    } else {
+        total
+    };
+    let start_idx = ((scope_in * fps).floor() as i64).clamp(0, total_frames - 1);
+    let end_idx = ((scope_out * fps).ceil() as i64).clamp(start_idx + 1, total_frames);
+    let anchor_local = p.anchor_time.clamp(0.0, scope_out - scope_in);
+    let anchor_abs = scope_in + anchor_local;
+    let anchor_idx = ((anchor_abs * fps).round() as i64).clamp(start_idx, end_idx - 1);
+    let (tw, th) = track_scale(info.width, info.height);
+    let (radius, coarse) = search_window(&p.accuracy);
+    let back_window: i64 = ((45.0 * fps).round() as i64)
+        .min(anchor_idx - start_idx)
+        .max(0);
+
+    let mut reader = FrameReader::spawn(
+        source,
+        &["-ss", &format!("{anchor_abs:.3}")],
+        "gray",
+        Some((tw, th)),
+    )?;
+    let mut gray = Vec::new();
+    if !reader.next_frame(&mut gray)? {
+        return Err("could not decode anchor frame".into());
+    }
+    if cancelled(cancel) {
+        return Err("cancelled".into());
+    }
+
+    // Template: pixels sampled on a stride inside the region rect (keeps the
+    // SAD cost flat for huge regions) at the anchor frame.
+    let tw_i = tw as usize;
+    let th_i = th as usize;
+    let x0 = ((p.x - p.w / 2.0).clamp(0.0, 1.0) * tw as f64).round() as usize;
+    let y0 = ((p.y - p.h / 2.0).clamp(0.0, 1.0) * th as f64).round() as usize;
+    let x1 = ((p.x + p.w / 2.0).clamp(0.0, 1.0) * tw as f64).round() as usize;
+    let y1 = ((p.y + p.h / 2.0).clamp(0.0, 1.0) * th as f64).round() as usize;
+    let rx = x1.saturating_sub(x0).max(2);
+    let ry = y1.saturating_sub(y0).max(2);
+    let stride = ((rx * ry) as f64 / 2500.0).sqrt().ceil().max(1.0) as usize;
+    let mut pos: Vec<(usize, usize)> = Vec::new();
+    let mut tpl: Vec<u8> = Vec::new();
+    let mut y = y0;
+    while y < y1.min(th_i) {
+        let mut x = x0;
+        while x < x1.min(tw_i) {
+            pos.push((x, y));
+            tpl.push(gray[y * tw_i + x]);
+            x += stride;
+        }
+        y += stride;
+    }
+    if pos.len() < 24 {
+        return Err("region is too small to track — make the blur region larger".into());
+    }
+
+    let mut offsets: HashMap<i64, (i64, i64)> = HashMap::new();
+    offsets.insert(anchor_idx, (0, 0));
+
+    // Forward pass (same confidence-refresh scheme as the mask tracker).
+    let mut off = (0i64, 0i64);
+    let mut idx = anchor_idx;
+    let mut refresh = tpl.clone();
+    let mut since_refresh = 0usize;
+    while reader.next_frame(&mut gray)? {
+        idx += 1;
+        if cancelled(cancel) {
+            return Err("cancelled".into());
+        }
+        off = track_step(&refresh, &pos, tw_i, th_i, &gray, off, radius, coarse);
+        offsets.insert(idx, off);
+        let cur_sad = sad_at(&refresh, &pos, tw_i, th_i, &gray, off.0, off.1);
+        let conf = (pos.len() as u64) * 12;
+        since_refresh += 1;
+        if cur_sad < conf && since_refresh > (fps * 1.5).round() as usize {
+            for (i, &(px, py)) in pos.iter().enumerate() {
+                let nx = px as i64 + off.0;
+                let ny = py as i64 + off.1;
+                if nx >= 0 && ny >= 0 && nx < tw as i64 && ny < th as i64 {
+                    refresh[i] = gray[ny as usize * tw_i + nx as usize];
+                }
+            }
+            since_refresh = 0;
+        }
+        progress(
+            ((idx - anchor_idx) as f64 / (end_idx - anchor_idx).max(1) as f64 * 0.5).min(0.5),
+            "tracking",
+        );
+        if idx + 1 >= end_idx {
+            break;
+        }
+    }
+    let fwd_end = idx;
+    drop(reader);
+
+    // Backward pass over a bounded window (ring buffer of proxy frames).
+    if back_window > 0 {
+        let win_start_t = ((anchor_idx - back_window) as f64 / fps).max(0.0);
+        let mut reader = FrameReader::spawn(
+            source,
+            &[
+                "-ss",
+                &format!("{win_start_t:.3}"),
+                "-t",
+                &format!("{:.3}", anchor_abs - win_start_t + 0.05),
+            ],
+            "gray",
+            Some((tw, th)),
+        )?;
+        let mut ring: Vec<Vec<u8>> = Vec::with_capacity(back_window as usize + 1);
+        let mut gray = Vec::new();
+        while reader.next_frame(&mut gray)? {
+            if cancelled(cancel) {
+                return Err("cancelled".into());
+            }
+            ring.push(gray.clone());
+            if ring.len() > (back_window + 1) as usize {
+                ring.remove(0);
+            }
+        }
+        drop(reader);
+        let expected = (back_window + 1) as usize;
+        while ring.len() > expected {
+            ring.pop();
+        }
+        let mut off = (0i64, 0i64);
+        let mut fi = anchor_idx;
+        for frame in ring.iter().rev() {
+            offsets.insert(fi, off);
+            if fi == 0 {
+                break;
+            }
+            fi -= 1;
+            off = track_step(&tpl, &pos, tw_i, th_i, frame, off, radius, coarse);
+        }
+        if !ring.is_empty() {
+            offsets.insert(fi, off);
+        }
+        progress(0.5, "tracking");
+    }
+
+    // Decimate to ~8 Hz, emit as clip-local times (scope start = 0).
+    let sample_every = ((fps / 8.0).round() as i64).max(1);
+    let mut kf: Vec<MagicKeyframe> = Vec::new();
+    let mut sorted: Vec<(i64, (i64, i64))> = offsets.into_iter().collect();
+    sorted.sort_by_key(|(i, _)| *i);
+    for (i, (dx, dy)) in sorted.iter() {
+        if *i % sample_every == 0 || *i == anchor_idx || *i == start_idx || *i == fwd_end {
+            kf.push(MagicKeyframe {
+                t: (*i as f64 / fps) - scope_in,
+                dx: *dx as f64 / tw as f64,
+                dy: *dy as f64 / th as f64,
+                manual: false,
+            });
+        }
+    }
+    kf.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+    kf.dedup_by(|a, b| (b.t - a.t).abs() < 1e-4);
+    progress(1.0, "tracking");
+    Ok(kf)
+}
+
+/* ------------------------------------------------------------------ */
 /* Mask rasterization                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -191,13 +401,7 @@ fn stamp_circle(mask: &mut [bool], w: usize, h: usize, cx: f64, cy: f64, r: i64,
 
 /// Rasterize strokes into a binary mask at the given size, translated by
 /// (`dx`, `dy`) fractions of width/height.
-pub fn rasterize_mask(
-    strokes: &[MagicStroke],
-    w: usize,
-    h: usize,
-    dx: f64,
-    dy: f64,
-) -> Vec<bool> {
+pub fn rasterize_mask(strokes: &[MagicStroke], w: usize, h: usize, dx: f64, dy: f64) -> Vec<bool> {
     let mut mask = vec![false; w * h];
     for s in strokes {
         let r = ((s.radius.max(0.0015)) * h as f64).round() as i64;
@@ -348,7 +552,12 @@ struct FrameReader {
 }
 
 impl FrameReader {
-    fn spawn(src: &Path, input_opts: &[&str], pix_fmt: &str, scale: Option<(u32, u32)>) -> Result<Self, String> {
+    fn spawn(
+        src: &Path,
+        input_opts: &[&str],
+        pix_fmt: &str,
+        scale: Option<(u32, u32)>,
+    ) -> Result<Self, String> {
         let mut cmd = command_ffmpeg();
         // Input options (-ss/-t) must precede -i.
         if !input_opts.is_empty() {
@@ -581,11 +790,28 @@ pub fn track_mask(
         if cancelled(cancel) {
             return Err("cancelled".into());
         }
-        off = track_step(&refresh, &pos, tw as usize, th as usize, &gray, off, radius, coarse);
+        off = track_step(
+            &refresh,
+            &pos,
+            tw as usize,
+            th as usize,
+            &gray,
+            off,
+            radius,
+            coarse,
+        );
         offsets.insert(idx, off);
         // Periodic template refresh at the tracked position resists appearance
         // drift (lighting/rotation); only refresh on confident matches.
-        let cur_sad = sad_at(&refresh, &pos, tw as usize, th as usize, &gray, off.0, off.1);
+        let cur_sad = sad_at(
+            &refresh,
+            &pos,
+            tw as usize,
+            th as usize,
+            &gray,
+            off.0,
+            off.1,
+        );
         let conf = (pos.len() as u64) * 12;
         since_refresh += 1;
         if cur_sad < conf && since_refresh > (fps * 1.5).round() as usize {
@@ -676,11 +902,7 @@ pub fn track_mask(
     let mut sorted: Vec<(i64, (i64, i64))> = offsets.into_iter().collect();
     sorted.sort_by_key(|(i, _)| *i);
     for (i, (dx, dy)) in sorted.iter() {
-        if *i % sample_every == 0
-            || *i == anchor_idx
-            || *i == 0
-            || *i == fwd_end
-        {
+        if *i % sample_every == 0 || *i == anchor_idx || *i == 0 || *i == fwd_end {
             kf.push(MagicKeyframe {
                 t: *i as f64 / fps,
                 dx: *dx as f64 / tw as f64,
@@ -830,7 +1052,10 @@ pub fn render_inpaint(
     let expand_px = (job.expand * h as f64).round() as usize;
     let feather_px = (job.feather * h as f64).round() as usize;
     let dilated = dilate_bool(&binary0, w, h, expand_px);
-    let mut alpha0: Vec<u8> = dilated.iter().map(|v| if *v { 255u8 } else { 0u8 }).collect();
+    let mut alpha0: Vec<u8> = dilated
+        .iter()
+        .map(|v| if *v { 255u8 } else { 0u8 })
+        .collect();
     if feather_px > 0 {
         let blurred = blur_u8(&alpha0, w, h, feather_px);
         // The core of the mask MUST remain 255 (100% removal).
@@ -902,10 +1127,7 @@ pub fn render_inpaint(
     let mut enc_child = enc
         .spawn()
         .map_err(|e| format!("ffmpeg encode spawn failed: {e}"))?;
-    let mut enc_in = enc_child
-        .stdin
-        .take()
-        .ok_or("no ffmpeg stdin")?;
+    let mut enc_in = enc_child.stdin.take().ok_or("no ffmpeg stdin")?;
 
     let _frame: Vec<u8> = Vec::with_capacity(frame_bytes);
     let mut lookahead_buf: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
@@ -1024,15 +1246,8 @@ pub fn render_inpaint(
                             // the mask boundary (small regions blend cleanly;
                             // large ones soften).
                             let fo = p * 3;
-                            let mut est = spatial_fill_pixel(
-                                cur,
-                                binary,
-                                w,
-                                h,
-                                p % w,
-                                p / w,
-                                max_dist,
-                            );
+                            let mut est =
+                                spatial_fill_pixel(cur, binary, w, h, p % w, p / w, max_dist);
                             if est == [0, 0, 0] {
                                 est = [cur[fo], cur[fo + 1], cur[fo + 2]];
                             }
@@ -1043,7 +1258,8 @@ pub fn render_inpaint(
                             let orig = cur[o + c] as f64;
                             o_slice[k * 3 + c] = (orig * (1.0 - af) + fill[c] as f64 * af)
                                 .round()
-                                .clamp(0.0, 255.0) as u8;
+                                .clamp(0.0, 255.0)
+                                as u8;
                         }
                     }
                 });
@@ -1080,7 +1296,9 @@ pub fn track_and_render(
     cancel: Option<Arc<AtomicBool>>,
     progress: &dyn Fn(f64, &str),
 ) -> Result<Vec<MagicKeyframe>, String> {
-    let kf = track_mask(job, cancel.as_deref(), &|p, phase| progress(p * 0.35, phase))?;
+    let kf = track_mask(job, cancel.as_deref(), &|p, phase| {
+        progress(p * 0.35, phase)
+    })?;
     let mut job2 = job.clone();
     job2.keyframes = kf.clone();
     render_inpaint(&job2, out, cancel.as_deref(), &|p, phase| {
@@ -1118,7 +1336,10 @@ mod tests {
         assert!(!mask[50 * 200 + 100 + 15]);
 
         // Eraser strokes carve back out.
-        let erase = MagicStroke { erase: true, ..stroke.clone() };
+        let erase = MagicStroke {
+            erase: true,
+            ..stroke.clone()
+        };
         let mask2 = rasterize_mask(&[stroke.clone(), erase.clone()], 200, 100, 0.0, 0.0);
         assert!(!mask2[50 * 200 + 100]);
 
@@ -1173,8 +1394,18 @@ mod tests {
     #[test]
     fn offset_at_interpolates_and_clamps() {
         let kf = vec![
-            MagicKeyframe { t: 0.0, dx: 0.0, dy: 0.0, manual: false },
-            MagicKeyframe { t: 2.0, dx: 0.1, dy: -0.2, manual: false },
+            MagicKeyframe {
+                t: 0.0,
+                dx: 0.0,
+                dy: 0.0,
+                manual: false,
+            },
+            MagicKeyframe {
+                t: 2.0,
+                dx: 0.1,
+                dy: -0.2,
+                manual: false,
+            },
         ];
         assert_eq!(offset_at(&kf, 1.0), (0.05, -0.1));
         assert_eq!(offset_at(&kf, -5.0), (0.0, 0.0));
@@ -1186,7 +1417,11 @@ mod tests {
     fn cache_hash_changes_with_params() {
         let base = MagicJob {
             source: PathBuf::from("a.mp4"),
-            strokes: vec![MagicStroke { points: vec![[0.1, 0.1]], radius: 0.02, erase: false }],
+            strokes: vec![MagicStroke {
+                points: vec![[0.1, 0.1]],
+                radius: 0.02,
+                erase: false,
+            }],
             keyframes: vec![],
             anchor_time: 1.0,
             feather: 0.008,
@@ -1200,7 +1435,12 @@ mod tests {
         moved.strokes[0].points[0][0] += 0.01;
         assert_ne!(base.cache_hash(true), moved.cache_hash(true));
         let mut kf = base.clone();
-        kf.keyframes.push(MagicKeyframe { t: 1.0, dx: 0.02, dy: 0.0, manual: false });
+        kf.keyframes.push(MagicKeyframe {
+            t: 1.0,
+            dx: 0.02,
+            dy: 0.0,
+            manual: false,
+        });
         assert_ne!(base.cache_hash(true), kf.cache_hash(true));
     }
 
@@ -1262,7 +1502,11 @@ mod tests {
     fn cache_hash_changes_with_scope() {
         let base = MagicJob {
             source: PathBuf::from("a.mp4"),
-            strokes: vec![MagicStroke { points: vec![[0.1, 0.1]], radius: 0.02, erase: false }],
+            strokes: vec![MagicStroke {
+                points: vec![[0.1, 0.1]],
+                radius: 0.02,
+                erase: false,
+            }],
             keyframes: vec![],
             anchor_time: 1.0,
             feather: 0.008,
@@ -1305,11 +1549,18 @@ mod tests {
             "-y",
         ])
         .arg(&src);
-        assert!(gen.status().expect("ffmpeg spawn").success(), "test media generation failed");
+        assert!(
+            gen.status().expect("ffmpeg spawn").success(),
+            "test media generation failed"
+        );
 
         let mut job = MagicJob {
             source: src.clone(),
-            strokes: vec![MagicStroke { points: vec![[0.5, 0.5]], radius: 0.08, erase: false }],
+            strokes: vec![MagicStroke {
+                points: vec![[0.5, 0.5]],
+                radius: 0.08,
+                erase: false,
+            }],
             keyframes: vec![],
             anchor_time: 2.5,
             feather: 0.008,

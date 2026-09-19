@@ -1,12 +1,25 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject, type WheelEvent as ReactWheelEvent } from "react";
 import { clipFadeGain, formatTime, mediaTimeForClip, type Clip } from "../timeline/types";
 import { ContextMenuPopup, type ContextMenuItem } from "../ui/ContextMenu";
-import { previewVideoStyle, type FilterInstance } from "../effects/effects";
+import {
+  previewVideoStyle,
+  bgMaskRenderKey,
+  rasterizeBgMask,
+  type BgMaskShape,
+  type FilterInstance,
+} from "../effects/effects";
 import { subscribeBinDrag } from "../bin/binDrag";
 import { usePlayheadTime } from "../playback/playbackClock";
 import { TextPresetPicker, type TextPresetParams } from "./TextPresets";
 import { ImagePicker, type MonitorImageItem } from "./ImagePicker";
 import { MagicRemoveOverlay } from "./MagicRemove";
+import { BlurRegionOverlayMemo } from "./BlurRegion";
+import {
+  BackgroundKeyPanel,
+  KeyPreviewCanvas,
+  type KeyFilterState,
+  type KeyToolMode,
+} from "./KeyTools";
 import type { MagicKeyframe, MagicStroke } from "../effects/effects";
 import {
   clientToSource,
@@ -15,6 +28,7 @@ import {
   pointInElement,
   type ContentRect,
   type FitMode,
+  type MirrorTransform,
 } from "./monitorGeometry";
 import "./ProjectMonitor.css";
 
@@ -112,7 +126,6 @@ type Props = {
   onCropTool?: (on: boolean) => void;
   cropDraft?: CropRect | null;
   onCropCommit?: (crop: CropRect) => void;
-  chromakeyActive?: boolean;
   onEyedropColor?: (hex: string) => void;
   /** Magic Remove (AI Eraser) tool state + params of the target clip. */
   magicTool?: boolean;
@@ -139,6 +152,31 @@ type Props = {
     anchorTime: number | null;
   }) => void;
   onMagicCancel?: () => void;
+  /** Blur Region tool: the enabled blurregion filter on the displayed clip. */
+  blurRegion?: {
+    clipId: string;
+    filterId: string;
+    params: Record<string, unknown>;
+    /** The clip the filter lives on (time mapping for keyframes). */
+    clip: Clip;
+  } | null;
+  blurTool?: boolean;
+  onBlurTool?: (on: boolean) => void;
+  /** Commit blur-region patches (geometry, sliders, keyframes). */
+  onBlurCommit?: (patch: Record<string, unknown>) => void;
+  onBlurTrack?: () => void;
+  onBlurCancelTrack?: () => void;
+  onBlurRemove?: () => void;
+  blurBusy?: { phase: string; percent: number } | null;
+  blurStatus?: string | null;
+  /** BG Key tool: which mode is open (null = closed). */
+  keyTool?: KeyToolMode | null;
+  onKeyTool?: (mode: KeyToolMode | null) => void;
+  /** Enabled chromakey + bgmask params on the displayed clip. */
+  keyFilters?: KeyFilterState;
+  onChromaChange?: (patch: Record<string, unknown>) => void;
+  onMaskChange?: (patch: Record<string, unknown>) => void;
+  onKeyMaskSaved?: (maskKey: string, maskPath: string) => void;
   /** When Clip Monitor is hidden, show a control to restore it. */
   onShowClipMonitor?: () => void;
   /** Whether the project timeline contains any clips. */
@@ -267,6 +305,27 @@ function IconMagic() {
   );
 }
 
+function IconBlur() {
+  return (
+    <MonitorIcon>
+      <rect x="2.5" y="4.5" width="11" height="7" rx="2" strokeDasharray="2.4 1.6" />
+      <path d="M6 8h4" />
+      <path d="M9.5 6.2c.9 1.1.9 2.5 0 3.6" />
+    </MonitorIcon>
+  );
+}
+
+function IconKey() {
+  return (
+    <MonitorIcon>
+      <circle cx="5.5" cy="8" r="2.6" />
+      <path d="M8.1 8h5.4" />
+      <path d="M11.2 8v2.2" />
+      <path d="M13 8v1.6" />
+    </MonitorIcon>
+  );
+}
+
 function IconAspectWide() {
   return (
     <MonitorIcon>
@@ -323,7 +382,6 @@ export function ProjectMonitor({
   onCropTool,
   cropDraft,
   onCropCommit,
-  chromakeyActive = false,
   onEyedropColor,
   magicTool = false,
   onMagicTool,
@@ -336,6 +394,21 @@ export function ProjectMonitor({
   onMagicTrack,
   onMagicRemove,
   onMagicCancel,
+  blurRegion = null,
+  blurTool = false,
+  onBlurTool,
+  onBlurCommit,
+  onBlurTrack,
+  onBlurCancelTrack,
+  onBlurRemove,
+  blurBusy = null,
+  blurStatus = null,
+  keyTool = null,
+  onKeyTool,
+  keyFilters,
+  onChromaChange,
+  onMaskChange,
+  onKeyMaskSaved,
   onShowClipMonitor,
   hasTimelineClips = false,
   layers = [],
@@ -410,6 +483,52 @@ export function ProjectMonitor({
   const wheelCommitTimer = useRef(0);
   /** Target of the pending wheel-zoom stream (element-aware commit). */
   const wheelTargetRef = useRef<TransformTarget | null>(null);
+  /** The keyed preview canvas element (blur region mirrors it when active). */
+  const keyCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  /** Eyedropper is active ONLY while the BG Key chroma mode is open. Tying
+   * it to "a chromakey filter exists on the selected clip" permanently
+   * hijacked every monitor press after applying BG key — transform/drag
+   * gestures became impossible until deselecting (the inspector edits key
+   * color through a color input, so it never needs the monitor eyedropper). */
+  const eyedropActive = keyTool === "chroma";
+  /** The keyed preview replaces the base visual whenever a chromakey or
+   * bgmask filter is enabled on the displayed clip (WYSIWYG alpha). */
+  const keyPreviewActive = !!(keyFilters?.chroma || keyFilters?.mask);
+
+  /** Persist the bgmask alpha mask: whenever shapes/feather/invert changed
+   * (maskKey != render key), rasterize at source resolution and hand the PNG
+   * to App (which writes it to the derived cache via save_bg_mask). The
+   * export path reads the SAME file, so preview == export exactly. */
+  const maskSig = keyFilters?.mask ? bgMaskRenderKey(keyFilters.mask) : "";
+  const rasterizeTimer = useRef(0);
+  const saveMaskRef = useRef(onKeyMaskSaved);
+  saveMaskRef.current = onKeyMaskSaved;
+  useEffect(() => {
+    const mask = keyFilters?.mask;
+    if (!mask || !maskSig || !saveMaskRef.current) return;
+    if (maskSig === mask.maskKey) return;
+    const shapes = (Array.isArray(mask.shapes) ? mask.shapes : []) as BgMaskShape[];
+    if (!shapes.length) return;
+    window.clearTimeout(rasterizeTimer.current);
+    rasterizeTimer.current = window.setTimeout(() => {
+      const size = liveMediaSize() ?? mediaSize;
+      if (!size || size.w < 2 || size.h < 2) return;
+      const w = Math.min(2048, Math.round(size.w));
+      const h = Math.max(2, Math.round((w * size.h) / size.w));
+      const canvas = rasterizeBgMask(
+        w,
+        h,
+        shapes,
+        typeof mask.feather === "number" ? mask.feather : 0.01,
+        mask.invert === true,
+      );
+      if (!canvas) return;
+      saveMaskRef.current?.(maskSig, canvas.toDataURL("image/png"));
+    }, 350);
+    return () => window.clearTimeout(rasterizeTimer.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maskSig, keyFilters?.mask, mediaSize]);
 
   const cropZero: CropRect = { left: 0, top: 0, right: 0, bottom: 0 };
   const currentCrop = activeCrop ?? cropDraft ?? cropZero;
@@ -547,6 +666,18 @@ export function ProjectMonitor({
     !cropTool &&
     !!cropDraft &&
     cropDraft.left + cropDraft.top + cropDraft.right + cropDraft.bottom > 0.001;
+  /** Region overlays are stored relative to the VISIBLE frame: with an
+   * applied crop the element content fills the frame box, so overlays map
+   * 1:1 and the draw source is the crop sub-rect of the media. */
+  const visibleContent: ContentRect = cropApplied ? { x: 0, y: 0, w: 1, h: 1 } : content;
+  const srcRect = cropApplied
+    ? {
+      left: cropDraft?.left ?? 0,
+      top: cropDraft?.top ?? 0,
+      right: cropDraft?.right ?? 0,
+      bottom: cropDraft?.bottom ?? 0,
+    }
+    : undefined;
   const manipulableLayer = selectedClipId
     ? (layers.find((l) => l.clip.id === selectedClipId) ?? null)
     : null;
@@ -568,6 +699,45 @@ export function ProjectMonitor({
       ? (parseClipTransform(manipulableLayer.clip) ?? DEFAULT_TRANSFORM)
       : (transformParams ?? DEFAULT_TRANSFORM),
   );
+
+  /** Live transform of the BASE preview for the mirror canvases (key/blur):
+   * the pending gesture values while the base element is the drag target,
+   * else the committed Transform filter of the base clip. Null = identity
+   * (also when a PiP layer is selected — its transform lives on its own
+   * element, never on the base mirrors). Read per frame by the canvases'
+   * render loops, so transform gestures are visible without re-renders. */
+  function baseMirrorTransform(): MirrorTransform | null {
+    if (manipulableLayer) return null;
+    const live =
+      liveElRef.current === activeVisualEl() ? currentTransformRef.current : null;
+    const p = live ?? transformParams;
+    if (!p) return null;
+    if (
+      Math.abs(p.x) < 1e-4 &&
+      Math.abs(p.y) < 1e-4 &&
+      Math.abs(p.scale - 1) < 1e-4 &&
+      Math.abs(p.rotation) < 1e-4
+    ) {
+      return null;
+    }
+    return { x: p.x, y: p.y, scale: p.scale, rotation: p.rotation };
+  }
+
+  /** A freshly committed transform (edit, undo, reconcile) supersedes the
+   * pending live gesture values the mirror canvases read — otherwise an
+   * undo would leave the mirrors on the pre-undo transform. Keyed by value
+   * signature: the prop object is fresh on every App render. */
+  const transformSig = transformParams
+    ? `${transformParams.x}|${transformParams.y}|${transformParams.scale}|${transformParams.rotation}`
+    : "";
+  const lastTransformSigRef = useRef("");
+  useEffect(() => {
+    if (transformSig === lastTransformSigRef.current) return;
+    lastTransformSigRef.current = transformSig;
+    currentTransformRef.current = null;
+    liveElRef.current = null;
+  }, [transformSig]);
+
   const textDraggable = !!onTextCommit && !!textOverlay && !cropTool && previewMode === "video";
   /** Text resize handles show on hover/interaction and take priority over
    * the media handles so both never clutter the frame at once. */
@@ -575,7 +745,7 @@ export function ProjectMonitor({
   // Magic Remove owns the frame while open — the brush overlay is the only
   // interaction; transform handles + the opacity HUD would just clutter it.
   const handlesVisible =
-    transformEnabled && (manipulableLayer != null || !!effectiveMediaSize) && !textHandlesActive && !magicTool;
+    transformEnabled && (manipulableLayer != null || !!effectiveMediaSize) && !textHandlesActive && !magicTool && !blurTool && !keyTool;
   const currentOpacityPct = Math.round(
     (manipulableLayer
       ? (parseClipTransform(manipulableLayer.clip)?.opacity ?? 1)
@@ -1278,17 +1448,30 @@ export function ProjectMonitor({
     onCropTool?.(false);
   }
 
-  function onVideoClick(e: React.MouseEvent<HTMLVideoElement>) {
-    if (!chromakeyActive || !onEyedropColor || !videoRef.current) return;
-    const video = videoRef.current;
+  /** Eyedrop the color under the pointer from the active visual (video or
+   * image — the element may be visually hidden behind the key canvas, it
+   * still decodes). Runs on frame pointer-down while eyedropActive. */
+  function pickColorAt(e: ReactPointerEvent) {
+    if (!eyedropActive || !onEyedropColor) return;
+    const el = activeVisualEl();
     const frame = frameRef.current;
-    if (!video.videoWidth || !video.videoHeight || !frame) return;
+    if (!el || !frame) return;
+    let srcW = 0;
+    let srcH = 0;
+    if (el instanceof HTMLVideoElement) {
+      srcW = el.videoWidth;
+      srcH = el.videoHeight;
+    } else if (el instanceof HTMLImageElement) {
+      srcW = el.naturalWidth;
+      srcH = el.naturalHeight;
+    }
+    if (!srcW || !srcH) return;
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx2d = canvas.getContext("2d");
+    canvas.width = srcW;
+    canvas.height = srcH;
+    const ctx2d = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx2d) return;
-    ctx2d.drawImage(video, 0, 0);
+    ctx2d.drawImage(el as CanvasImageSource, 0, 0);
     const frameRect = frame.getBoundingClientRect();
     // Map the click through the displayed content rect; when a crop filter
     // zooms the visible region (object-view-box + fill), the visible frame
@@ -1313,6 +1496,11 @@ export function ProjectMonitor({
     const px = ctx2d.getImageData(x, y, 1, 1).data;
     const hex = `#${[px[0], px[1], px[2]].map((n) => n.toString(16).padStart(2, "0")).join("")}`;
     onEyedropColor(hex);
+  }
+
+  function onVideoClick(e: React.MouseEvent<HTMLVideoElement>) {
+    if (!eyedropActive || !onEyedropColor) return;
+    pickColorAt(e as unknown as ReactPointerEvent);
   }
 
   const canPlay = Boolean(previewSrc || hasTimelineClips || duration > 0);
@@ -1353,6 +1541,16 @@ export function ProjectMonitor({
       type: "item",
       label: magicTool ? "Exit Magic Remove" : "Magic Remove (AI Eraser)",
       action: () => onMagicTool?.(!magicTool),
+    },
+    {
+      type: "item",
+      label: blurTool ? "Exit Blur Region" : "Blur Region",
+      action: () => onBlurTool?.(!blurTool),
+    },
+    {
+      type: "item",
+      label: keyTool ? "Exit Remove Background" : "Remove Background (Key)",
+      action: () => onKeyTool?.(keyTool ? null : "chroma"),
     },
     { type: "sep" },
     {
@@ -1467,6 +1665,24 @@ export function ProjectMonitor({
           </button>
           <button
             type="button"
+            className={blurTool ? "active" : ""}
+            title="Blur Region — drag a blurred area over the monitor (shapes, feather, keyframes, auto-track)"
+            onClick={() => onBlurTool?.(!blurTool)}
+          >
+            <IconBlur />
+            <span>Blur</span>
+          </button>
+          <button
+            type="button"
+            className={keyTool ? "active" : ""}
+            title="Remove Background — chroma key a solid color or select areas to remove"
+            onClick={() => onKeyTool?.(keyTool ? null : "chroma")}
+          >
+            <IconKey />
+            <span>BG</span>
+          </button>
+          <button
+            type="button"
             title="Add an image overlay — pick from this project or browse your disk"
             onClick={() => setImagePickerOpen(true)}
           >
@@ -1514,8 +1730,13 @@ export function ProjectMonitor({
           }}
           className={`monitor-frame ${tiktok ? "phone" : "wide"} ${cropTool ? "crop-mode" : ""} ${magicTool ? "magic-mode" : ""} ${transformActive ? "transform-mode" : ""} ${dropTarget ? "drop-target" : ""}`}
           onPointerDown={(e) => {
-            if (magicTool) {
-              // The Magic Remove overlay owns pointer input in this mode.
+            if (eyedropActive) {
+              // Color picking has priority over gestures in key mode.
+              pickColorAt(e);
+              return;
+            }
+            if (magicTool || blurTool || keyTool === "area") {
+              // Region tools own the frame; their overlays handle input.
               return;
             }
             if (cropTool) {
@@ -1545,11 +1766,18 @@ export function ProjectMonitor({
             playsInline
             muted
             preload="auto"
+            // CORS-mode load: Tauri's asset protocol answers with
+            // Access-Control-Allow-Origin, keeping the canvas un-tainted so
+            // the BG-key/blur previews can read pixels. Without this,
+            // drawImage from the cross-origin asset origin poisons the
+            // canvas and getImageData throws — blanking the monitor.
+            crossOrigin="anonymous"
             onClick={onVideoClick}
             onLoadedMetadata={(e) => onVisualMetadata(e.currentTarget)}
             style={{
               display: previewMode === "video" && previewSrc && !previewIsImage ? "block" : "none",
-              cursor: chromakeyActive ? "crosshair" : transformEnabled ? "move" : undefined,
+              visibility: keyPreviewActive ? "hidden" : undefined,
+              cursor: eyedropActive ? "crosshair" : transformEnabled ? "move" : undefined,
               background: layers.length > 0 ? "transparent" : undefined,
             }}
           />
@@ -1637,13 +1865,15 @@ export function ProjectMonitor({
               src={previewIsImage ? (previewSrc ?? undefined) : undefined}
               alt=""
               draggable={false}
+              crossOrigin="anonymous"
               onLoad={(e) => {
                 const img = e.currentTarget;
                 if (img.naturalWidth > 0) setMediaSize({ w: img.naturalWidth, h: img.naturalHeight });
               }}
               style={{
                 display: previewMode === "video" && previewSrc && previewIsImage ? "block" : "none",
-                cursor: transformEnabled ? "move" : undefined,
+                visibility: keyPreviewActive ? "hidden" : undefined,
+                cursor: eyedropActive ? "crosshair" : transformEnabled ? "move" : undefined,
                 background: layers.length > 0 ? "transparent" : undefined,
               }}
             />
@@ -1707,6 +1937,73 @@ export function ProjectMonitor({
               onRemove={(m) => onMagicRemove?.(m)}
               onCancel={() => onMagicCancel?.()}
               onDone={() => onMagicTool?.(false)}
+            />
+          )}
+          {/* BG Key live preview: keyed/alpha-composited frame replaces the
+              base visual (which stays hidden but keeps decoding). */}
+          {keyPreviewActive && previewMode === "video" && frameSize.w > 2 && (
+            <KeyPreviewCanvas
+              isImage={previewIsImage}
+              playing={playing}
+              frameSize={frameSize}
+              content={visibleContent}
+              mediaSize={effectiveMediaSize}
+              srcRect={srcRect}
+              filters={keyFilters ?? { chroma: null, mask: null }}
+              getDrawSource={() =>
+                previewIsImage
+                  ? (imageRef?.current ?? null)
+                  : (videoRef.current ?? null)
+              }
+              getMirrorTransform={baseMirrorTransform}
+              elRef={keyCanvasRef}
+            />
+          )}
+          {/* Blur Region overlay: always previews when the filter exists;
+              the panel + handles appear while the tool is open. Keyed by
+              clip id so gesture state never leaks across clips. */}
+          {blurRegion && previewMode === "video" && frameSize.w > 2 && (
+            <BlurRegionOverlayMemo
+              key={`${blurRegion.clipId}:${blurRegion.filterId}`}
+              clip={blurRegion.clip}
+              src={previewSrc}
+              isImage={previewIsImage}
+              frameSize={frameSize}
+              content={visibleContent}
+              mediaSize={effectiveMediaSize}
+              srcRect={srcRect}
+              params={blurRegion.params}
+              toolOpen={blurTool}
+              busy={blurBusy}
+              status={blurStatus}
+              getSourceEl={() =>
+                keyCanvasRef.current ??
+                (activeVisualEl() as
+                  | HTMLVideoElement
+                  | HTMLImageElement
+                  | HTMLCanvasElement
+                  | null)
+              }
+              getMirrorTransform={baseMirrorTransform}
+              onCommit={(patch) => onBlurCommit?.(patch)}
+              onTrack={() => onBlurTrack?.()}
+              onCancelTrack={() => onBlurCancelTrack?.()}
+              onRemove={() => onBlurRemove?.()}
+              onDone={() => onBlurTool?.(false)}
+            />
+          )}
+          {/* BG Key tool panel (+ select-area drawing surface). */}
+          {keyTool && previewMode === "video" && (
+            <BackgroundKeyPanel
+              mode={keyTool}
+              onMode={(m) => onKeyTool?.(m)}
+              chroma={keyFilters?.chroma ?? null}
+              mask={keyFilters?.mask ?? null}
+              content={visibleContent}
+              frameSize={frameSize}
+              onChromaChange={(patch) => onChromaChange?.(patch)}
+              onMaskChange={(patch) => onMaskChange?.(patch)}
+              onDone={() => onKeyTool?.(null)}
             />
           )}
           {gestureBadge && <div className="tf-badge">{gestureBadge}</div>}
@@ -2094,6 +2391,7 @@ const MonitorLayer = memo(function MonitorLayer({
         src={src}
         alt=""
         draggable={false}
+        crossOrigin="anonymous"
         onLoad={(e) => {
           const img = e.currentTarget;
           if (img.naturalWidth > 0) onMediaSize(clip.id, img.naturalWidth, img.naturalHeight);
@@ -2112,6 +2410,7 @@ const MonitorLayer = memo(function MonitorLayer({
       muted
       playsInline
       preload="auto"
+      crossOrigin="anonymous"
       onLoadedMetadata={seekNow}
       onLoadedData={seekNow}
       onCanPlay={seekNow}

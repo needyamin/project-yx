@@ -225,10 +225,11 @@ export function ClipMonitor({ media, aspect, onClose, onAddToTimeline }: Props) 
             className="monitor-video"
             playsInline
             preload="metadata"
+            crossOrigin="anonymous"
             style={{ display: mode === "video" && src ? "block" : "none" }}
           />
           {mode === "image" && src && (
-            <img className="monitor-video" src={src} alt={media?.name ?? "Image"} draggable={false} />
+            <img className="monitor-video" src={src} alt={media?.name ?? "Image"} draggable={false} crossOrigin="anonymous" />
           )}
           <div
             className="monitor-audio-only"

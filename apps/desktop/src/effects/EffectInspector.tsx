@@ -322,6 +322,46 @@ function ParamEditors({
           </label>
           <Slider label="Similarity" min={0.01} max={1} step={0.01} value={num("similarity", 0.3)} onChange={(v) => set("similarity", v)} />
           <Slider label="Blend" min={0} max={1} step={0.01} value={num("blend", 0.1)} onChange={(v) => set("blend", v)} />
+          <Slider label="Spill" min={0} max={1} step={0.01} value={num("spill", 0)} onChange={(v) => set("spill", v)} />
+        </div>
+      );
+    case "blurregion":
+      return (
+        <div className="ei-params">
+          <p className="ei-hint">Drag the region in the Project Monitor (Blur tool) — position, size, rotation and keyframes live there.</p>
+          <label className="ei-color">
+            Shape
+            <select
+              value={typeof params.shape === "string" ? params.shape : "rect"}
+              onChange={(e) => set("shape", e.target.value)}
+            >
+              <option value="rect">Rectangle</option>
+              <option value="rounded">Rounded</option>
+              <option value="circle">Circle</option>
+              <option value="ellipse">Ellipse</option>
+            </select>
+          </label>
+          <Slider label="Intensity" min={0.05} max={1} step={0.01} value={num("intensity", 0.5)} onChange={(v) => set("intensity", v)} />
+          <Slider label="Feather" min={0} max={0.5} step={0.01} value={num("feather", 0.08)} onChange={(v) => set("feather", v)} />
+          <Slider label="Opacity" min={0.05} max={1} step={0.01} value={num("opacity", 1)} onChange={(v) => set("opacity", v)} />
+          <Slider label="Rotation" min={-180} max={180} step={1} value={num("rotation", 0)} onChange={(v) => set("rotation", v)} />
+        </div>
+      );
+    case "bgmask":
+      return (
+        <div className="ei-params">
+          <p className="ei-hint">Select areas in the Project Monitor (BG tool). {Array.isArray(params.shapes) ? params.shapes.length : 0} area(s), feather below. Fully non-destructive.</p>
+          <Slider label="Feather" min={0} max={0.08} step={0.002} value={num("feather", 0.01)} onChange={(v) => set("feather", v)} />
+          <div className="ei-checks">
+            <label>
+              <input
+                type="checkbox"
+                checked={params.invert === true}
+                onChange={(e) => set("invert", e.target.checked)}
+              />{" "}
+              Invert (keep only selected)
+            </label>
+          </div>
         </div>
       );
     case "volume":

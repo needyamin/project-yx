@@ -47,7 +47,9 @@ export type EffectKind =
   | "cinematic"
   | "dream"
   | "magic"
-  | "magicremove";
+  | "magicremove"
+  | "blurregion"
+  | "bgmask";
 
 export type FilterInstance = {
   id: string;
@@ -123,6 +125,22 @@ export const EFFECT_CATALOG: {
       roles: ["video"],
       category: "Magic",
       params: ["brushSize", "feather", "expand", "trackingAccuracy", "removalStrength"],
+    },
+    {
+      id: "blurregion",
+      label: "Blur Region",
+      heavy: true,
+      roles: ["video"],
+      category: "Magic",
+      params: ["shape", "intensity", "feather", "opacity", "rotation"],
+    },
+    {
+      id: "bgmask",
+      label: "Remove Background (Key)",
+      heavy: true,
+      roles: ["video"],
+      category: "Magic",
+      params: ["shapes", "feather", "invert"],
     },
   ];
 
@@ -240,6 +258,36 @@ export function defaultParams(kind: string): Record<string, unknown> {
         renderKey: "",
         resultPath: "",
       };
+    /* Blur Region: geometry is normalized to the SOURCE frame (center x/y,
+       full width/height as fractions, rotation degrees); intensity 0..1 maps
+       to a gaussian sigma; feather is a fraction of the region's min
+       dimension. Keyframes share the same fields sampled at clip-local
+       source times — see regionStateAt / regionRenderKey. */
+    case "blurregion":
+      return {
+        x: 0.5,
+        y: 0.5,
+        w: 0.3,
+        h: 0.3,
+        rotation: 0,
+        shape: "rect",
+        cornerRadius: 0.15,
+        intensity: 0.5,
+        feather: 0.08,
+        opacity: 1,
+        keyframes: [],
+      };
+    /* BG Key select-area removal: shapes rasterize to an alpha-mask PNG
+       (maskPath, content-hashed maskKey) so preview and export share the
+       exact same mask. */
+    case "bgmask":
+      return {
+        shapes: [],
+        feather: 0.01,
+        invert: false,
+        maskPath: "",
+        maskKey: "",
+      };
     default:
       return {};
   }
@@ -321,6 +369,10 @@ export function effectMeta(kind: string): { glyph: string; hue: string } {
       return { glyph: "◆", hue: "#3dd68c" };
     case "magicremove":
       return { glyph: "✷", hue: "#b76af0" };
+    case "blurregion":
+      return { glyph: "▢", hue: "#6ea8ff" };
+    case "bgmask":
+      return { glyph: "◫", hue: "#3dd68c" };
     case "volume":
       return { glyph: "♪", hue: "#f0a35e" };
     case "equalizer":
@@ -634,28 +686,349 @@ export function magicOffsetAt(
   return { dx: 0, dy: 0 };
 }
 
-/** Apply chromakey on a canvas frame (simple distance key). */export function applyChromakeyToImageData(
+
+
+/* ---------------------------------------------------------------------- */
+/* Blur Region (Blur tool) helpers                                         */
+/* ---------------------------------------------------------------------- */
+
+export type BlurShape = "rect" | "rounded" | "circle" | "ellipse";
+
+/** One animation key of a blur region. All geometry is normalized to the
+ * SOURCE frame; `t` is clip-local source time (0 = clip in-point). */
+export type BlurRegionKeyframe = {
+  t: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  intensity: number;
+  feather: number;
+  opacity: number;
+  /** Shape snaps to the nearest key (shapes don't crossfade). */
+  shape?: BlurShape;
+  cornerRadius?: number;
+};
+
+/** Fully-resolved blur region state at a moment in time. */
+export type RegionState = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  shape: BlurShape;
+  cornerRadius: number;
+  intensity: number;
+  feather: number;
+  opacity: number;
+};
+
+export function blurRegionDefaults(): RegionState {
+  return {
+    x: 0.5,
+    y: 0.5,
+    w: 0.3,
+    h: 0.3,
+    rotation: 0,
+    shape: "rect",
+    cornerRadius: 0.15,
+    intensity: 0.5,
+    feather: 0.08,
+    opacity: 1,
+  };
+}
+
+/** Parse one keyframe-ish param bag with fallbacks (shared by keys and the
+ * static top-level params). */
+function regionFrom(
+  p: Record<string, unknown>,
+  fallback: RegionState,
+): RegionState {
+  const num = (k: string, d: number) =>
+    typeof p[k] === "number" && Number.isFinite(p[k] as number)
+      ? (p[k] as number)
+      : d;
+  const shape = p.shape;
+  return {
+    x: num("x", fallback.x),
+    y: num("y", fallback.y),
+    w: num("w", fallback.w),
+    h: num("h", fallback.h),
+    rotation: num("rotation", fallback.rotation),
+    shape:
+      shape === "rounded" || shape === "circle" || shape === "ellipse"
+        ? shape
+        : "rect",
+    cornerRadius: num("cornerRadius", fallback.cornerRadius),
+    intensity: num("intensity", fallback.intensity),
+    feather: num("feather", fallback.feather),
+    opacity: num("opacity", fallback.opacity),
+  };
+}
+
+function lerpField(
+  keys: BlurRegionKeyframe[],
+  t: number,
+  field: keyof BlurRegionKeyframe,
+): number {
+  const kf = keys;
+  if (t <= kf[0].t) return kf[0][field] as number;
+  if (t >= kf[kf.length - 1].t) return kf[kf.length - 1][field] as number;
+  for (let i = 0; i < kf.length - 1; i++) {
+    if (t >= kf[i].t && t <= kf[i + 1].t) {
+      const span = Math.max(1e-6, kf[i + 1].t - kf[i].t);
+      const f = (t - kf[i].t) / span;
+      return (
+        (kf[i][field] as number) +
+        ((kf[i + 1][field] as number) - (kf[i][field] as number)) * f
+      );
+    }
+  }
+  return kf[kf.length - 1][field] as number;
+}
+
+/** Resolve the effective region state at clip-local source time `t`,
+ * interpolating keyframes linearly (shape snaps to the nearest key). */
+export function regionStateAt(
+  params: Record<string, unknown> | null | undefined,
+  t: number,
+): RegionState {
+  const base = regionFrom((params ?? {}) as Record<string, unknown>, blurRegionDefaults());
+  const raw = (params?.keyframes ?? []) as BlurRegionKeyframe[];
+  const kf = raw
+    .filter(
+      (k) =>
+        k &&
+        typeof k.t === "number" &&
+        Number.isFinite(k.t) &&
+        typeof k.x === "number" &&
+        typeof k.y === "number",
+    )
+    .sort((a, b) => a.t - b.t);
+  if (kf.length === 0) return base;
+  // Shape snaps to the nearest key (shapes don't crossfade).
+  let shape = kf[0].shape ?? base.shape;
+  let dist = Math.abs(kf[0].t - t);
+  let cornerRadius = typeof kf[0].cornerRadius === "number" ? kf[0].cornerRadius : base.cornerRadius;
+  for (const k of kf) {
+    const d = Math.abs(k.t - t);
+    if (d < dist) {
+      dist = d;
+      shape = k.shape ?? base.shape;
+      cornerRadius =
+        typeof k.cornerRadius === "number" ? k.cornerRadius : base.cornerRadius;
+    }
+  }
+  return {
+    x: lerpField(kf, t, "x"),
+    y: lerpField(kf, t, "y"),
+    w: lerpField(kf, t, "w"),
+    h: lerpField(kf, t, "h"),
+    rotation: lerpField(kf, t, "rotation"),
+    shape,
+    cornerRadius,
+    intensity: lerpField(kf, t, "intensity"),
+    feather: lerpField(kf, t, "feather"),
+    opacity: lerpField(kf, t, "opacity"),
+  };
+}
+
+/** Upsert a keyframe at time `t` with the given state (sorted, deduped). */
+export function upsertRegionKeyframe(
+  keys: BlurRegionKeyframe[] | undefined,
+  t: number,
+  state: RegionState,
+): BlurRegionKeyframe[] {
+  const next = (keys ?? []).filter((k) => Math.abs(k.t - t) > 1e-4);
+  next.push({ t, ...state });
+  next.sort((a, b) => a.t - b.t);
+  return next;
+}
+
+/** Remove the keyframe nearest to `t` when within `eps` seconds. */
+export function removeRegionKeyframe(
+  keys: BlurRegionKeyframe[] | undefined,
+  t: number,
+  eps = 0.25,
+): BlurRegionKeyframe[] {
+  if (!keys?.length) return [];
+  let best = 0;
+  let bestD = Infinity;
+  keys.forEach((k, i) => {
+    const d = Math.abs(k.t - t);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  });
+  if (bestD > eps) return keys;
+  return keys.filter((_, i) => i !== best);
+}
+
+/** Everything that changes the exported region — used to detect stale
+ * state and (later) sidecar renders. */
+export function regionRenderKey(
+  params: Record<string, unknown> | null | undefined,
+): string {
+  if (!params) return "";
+  return JSON.stringify({
+    s: params.shape,
+    c: params.cornerRadius,
+    k: params.keyframes ?? [],
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Chroma key / BG mask canvas processing (KeyPreview)                      */
+/* ---------------------------------------------------------------------- */
+
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace("#", "").slice(0, 6).padEnd(6, "0");
+  return [
+    parseInt(h.slice(0, 2), 16) || 0,
+    parseInt(h.slice(2, 4), 16) || 255,
+    parseInt(h.slice(4, 6), 16) || 0,
+  ];
+}
+
+/** Distance key with soft blend ramp + spill suppression (matches the
+ * FFmpeg chromakey+despill export intent). Mutates `data` in place. */
+export function applyChromakeyToImageData(
   data: ImageData,
   colorHex: string,
   similarity: number,
   blend: number,
+  spill = 0,
 ): void {
-  const hex = colorHex.replace("#", "");
-  const kr = parseInt(hex.slice(0, 2), 16) || 0;
-  const kg = parseInt(hex.slice(2, 4), 16) || 255;
-  const kb = parseInt(hex.slice(4, 6), 16) || 0;
-  const thresh = similarity * 441.67; // ~sqrt(3*255^2)
-  const soft = Math.max(1, blend * 441.67);
+  const [kr, kg, kb] = hexToRgb(colorHex);
+  const thresh = Math.max(0, similarity) * 441.67; // ~sqrt(3*255^2)
+  const soft = Math.max(1, Math.max(0, blend) * 441.67);
   const px = data.data;
+  // Spill suppression targets the key color's dominant channel.
+  const dom = kg >= kr && kg >= kb ? 1 : kb >= kr && kb >= kg ? 2 : 0;
+  const others: [number, number] = dom === 1 ? [0, 2] : [0, 1];
   for (let i = 0; i < px.length; i += 4) {
     const dr = px[i] - kr;
     const dg = px[i + 1] - kg;
     const db = px[i + 2] - kb;
     const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+    let alpha = 255;
     if (dist < thresh) {
-      px[i + 3] = 0;
+      alpha = 0;
     } else if (dist < thresh + soft) {
-      px[i + 3] = Math.round(255 * ((dist - thresh) / soft));
+      alpha = Math.round(255 * ((dist - thresh) / soft));
+    }
+    if (alpha < 255) {
+      px[i + 3] = Math.min(px[i + 3], alpha);
+    }
+    if (spill > 0 && alpha > 0 && dom !== 0) {
+      // Pull the dominant channel down toward the other two, scaled by the
+      // spill amount — classic despill, applied where key contamination
+      // dominates (weighted by closeness to the key color).
+      const a = px[i + others[0]];
+      const b = px[i + others[1]];
+      const limit = Math.max(a, b);
+      const d = px[i + dom] - limit;
+      if (d > 0) {
+        const closeness = 1 - Math.min(1, dist / (thresh + soft));
+        px[i + dom] = Math.round(px[i + dom] - d * spill * (0.35 + 0.65 * closeness));
+      }
     }
   }
+}
+
+/** A select-area shape in normalized source coordinates. */
+export type BgMaskShape = {
+  id: string;
+  type: "rect" | "ellipse" | "lasso";
+  mode: "add" | "sub";
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  points?: [number, number][];
+};
+
+/** Build the alpha mask canvas (white = keep) for a bgmask filter. */
+export function rasterizeBgMask(
+  w: number,
+  h: number,
+  shapes: BgMaskShape[],
+  feather: number,
+  invert: boolean,
+): HTMLCanvasElement | null {
+  if (!shapes.length) return null;
+  const mask = document.createElement("canvas");
+  mask.width = Math.max(1, w);
+  mask.height = Math.max(1, h);
+  const ctx = mask.getContext("2d");
+  if (!ctx) return null;
+  const featherPx = Math.max(0, feather) * Math.min(w, h);
+  for (const s of shapes) {
+    ctx.save();
+    ctx.globalCompositeOperation =
+      s.mode === "sub" ? "destination-out" : "source-over";
+    if (featherPx > 0.5) ctx.filter = `blur(${featherPx.toFixed(2)}px)`;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    if (s.type === "rect") {
+      const x = (s.x ?? 0) * w;
+      const y = (s.y ?? 0) * h;
+      const sw = (s.w ?? 0) * w;
+      const sh = (s.h ?? 0) * h;
+      ctx.rect(x - sw / 2, y - sh / 2, sw, sh);
+    } else if (s.type === "ellipse") {
+      const x = (s.x ?? 0) * w;
+      const y = (s.y ?? 0) * h;
+      ctx.ellipse(
+        x, y,
+        Math.max(1, ((s.w ?? 0) * w) / 2),
+        Math.max(1, ((s.h ?? 0) * h) / 2),
+        0, 0, Math.PI * 2,
+      );
+    } else if (s.points && s.points.length > 2) {
+      ctx.moveTo(s.points[0][0] * w, s.points[0][1] * h);
+      for (let i = 1; i < s.points.length; i++) {
+        ctx.lineTo(s.points[i][0] * w, s.points[i][1] * h);
+      }
+      ctx.closePath();
+    }
+    ctx.fill();
+    ctx.restore();
+  }
+  if (invert) {
+    const inv = document.createElement("canvas");
+    inv.width = mask.width;
+    inv.height = mask.height;
+    const ictx = inv.getContext("2d");
+    if (!ictx) return mask;
+    ictx.fillStyle = "#ffffff";
+    ictx.fillRect(0, 0, inv.width, inv.height);
+    ictx.globalCompositeOperation = "destination-out";
+    ictx.drawImage(mask, 0, 0);
+    return inv;
+  }
+  return mask;
+}
+
+/** Hash of everything a bgmask render depends on (mask PNG liveness). */
+export function bgMaskRenderKey(
+  params: Record<string, unknown> | null | undefined,
+): string {
+  if (!params) return "";
+  return JSON.stringify({
+    s: params.shapes ?? [],
+    f: params.feather,
+    i: params.invert === true,
+  });
+}
+
+/** Find the enabled filter of a kind on a clip (or null). */
+export function findEnabledFilter(
+  filters: FilterInstance[] | undefined,
+  kind: string,
+): FilterInstance | undefined {
+  return filters?.find((f) => f.kind === kind && f.enabled);
 }

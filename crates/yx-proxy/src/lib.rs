@@ -134,7 +134,10 @@ impl ProxyManager {
                 // A previously failed/cancelled job must be retryable —
                 // returning it stuck forever meant one transient ffmpeg
                 // failure permanently disabled proxies for that source.
-                if matches!(existing.status, ProxyStatus::Failed | ProxyStatus::Cancelled) {
+                if matches!(
+                    existing.status,
+                    ProxyStatus::Failed | ProxyStatus::Cancelled
+                ) {
                     let id = existing.id;
                     let job = guard.get_mut(&id).expect("existing job id");
                     job.status = ProxyStatus::Queued;
@@ -226,10 +229,7 @@ impl ProxyManager {
             flag
         };
 
-        let scale = format!(
-            "scale=-2:{}:flags=fast_bilinear",
-            policy.proxy.height
-        );
+        let scale = format!("scale=-2:{}:flags=fast_bilinear", policy.proxy.height);
         let bitrate = format!("{}k", policy.proxy.video_bitrate_kbps);
         let threads = policy.encode_threads.to_string();
 
@@ -289,7 +289,12 @@ impl ProxyManager {
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
-                self.finish_job(&id, &tmp_path, ProxyStatus::Cancelled, "cancelled".to_string());
+                self.finish_job(
+                    &id,
+                    &tmp_path,
+                    ProxyStatus::Cancelled,
+                    "cancelled".to_string(),
+                );
                 return Err(ProxyError::Cancelled);
             }
             match child.try_wait()? {
@@ -341,7 +346,10 @@ impl ProxyManager {
         let guard = self.inner.lock();
         guard
             .values()
-            .find(|j| j.source_path == source && matches!(j.status, ProxyStatus::Ready | ProxyStatus::Skipped))
+            .find(|j| {
+                j.source_path == source
+                    && matches!(j.status, ProxyStatus::Ready | ProxyStatus::Skipped)
+            })
             .map(|j| j.proxy_path.clone())
             .unwrap_or_else(|| source.to_path_buf())
     }

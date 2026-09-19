@@ -105,3 +105,43 @@ export function pointInElement(
     clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom
   );
 }
+
+/** Transform-filter values of the base preview clip (normalized -1..1
+ * offset, scale, degrees) — what mirror canvases must replicate. */
+export type MirrorTransform = {
+  x: number;
+  y: number;
+  scale: number;
+  rotation: number;
+};
+
+/**
+ * Apply the base clip's Transform filter to a mirror-canvas 2D context so
+ * the drawn content matches the transformed preview element beneath/behind
+ * it. The mirror canvas shares the frame's pixel grid (its CSS box is the
+ * displayed content rect and both centers coincide), so the translate is
+ * `x * 0.5 * canvasW` px — the same displacement the element gets from
+ * `translate(x*50%, y*50%)` of the frame box. The caller must reset the
+ * transform (setTransform identity) before clearing and after drawing:
+ * clearRect is transform-aware and would miss pixels under a transform.
+ */
+export function applyTransformToMirrorCtx(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  t: MirrorTransform | null | undefined,
+): void {
+  if (
+    !t ||
+    (Math.abs(t.x) < 1e-4 &&
+      Math.abs(t.y) < 1e-4 &&
+      Math.abs(t.scale - 1) < 1e-4 &&
+      Math.abs(t.rotation) < 1e-4)
+  ) {
+    return;
+  }
+  ctx.translate(w / 2 + t.x * 0.5 * w, h / 2 + t.y * 0.5 * h);
+  ctx.rotate((t.rotation * Math.PI) / 180);
+  ctx.scale(t.scale, t.scale);
+  ctx.translate(-w / 2, -h / 2);
+}

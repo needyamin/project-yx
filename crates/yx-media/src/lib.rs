@@ -6,9 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use yx_detect::{
-    command_ffmpeg, command_ffprobe, PerformancePolicy, PerformanceTier,
-};
+use yx_detect::{command_ffmpeg, command_ffprobe, PerformancePolicy, PerformanceTier};
 
 #[derive(Debug, Error)]
 pub enum MediaError {
@@ -27,6 +25,11 @@ pub enum MediaError {
 }
 
 pub mod magic;
+pub mod region;
+
+/// Label uniquer for branching filter_complex fragments (bgmask etc.) —
+/// labels are graph-global across all clip fragments.
+static FRAG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
@@ -282,9 +285,7 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
             "sharpen" => {
                 let amount = num(p, "amount", 0.0).clamp(0.0, 3.0);
                 if amount > 0.01 {
-                    parts.push(format!(
-                        "unsharp=5:5:{amount:.3}:5:5:0.0"
-                    ));
+                    parts.push(format!("unsharp=5:5:{amount:.3}:5:5:0.0"));
                 }
             }
             "vdenoise" => {
@@ -298,9 +299,7 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 let strength = num(p, "strength", 0.0).clamp(0.0, 256.0);
                 if strength > 1.0 {
                     let rx = strength.clamp(16.0, 256.0) as i32;
-                    parts.push(format!(
-                        "deshake=rx={rx}:ry={rx}:edge=mirror"
-                    ));
+                    parts.push(format!("deshake=rx={rx}:ry={rx}:edge=mirror"));
                 }
             }
             "lut" | "lut3d" => {
@@ -311,7 +310,10 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     .trim()
                     .to_string();
                 if !lut_path.is_empty() {
-                    let escaped = lut_path.replace('\\', "/").replace(':', "\\:").replace('\'', "\\'");
+                    let escaped = lut_path
+                        .replace('\\', "/")
+                        .replace(':', "\\:")
+                        .replace('\'', "\\'");
                     parts.push(format!("lut3d=file='{escaped}'"));
                 }
             }
@@ -336,10 +338,13 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     );
                     if boxed {
                         let boxcolor = ffmpeg_color(
-                            p.get("boxcolor").and_then(|v| v.as_str()).unwrap_or("#00000073"),
+                            p.get("boxcolor")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("#00000073"),
                             "black@0.45",
                         );
-                        let boxborderw = num(p, "boxborderw", 14.0).clamp(0.0, 200.0).round() as i32;
+                        let boxborderw =
+                            num(p, "boxborderw", 14.0).clamp(0.0, 200.0).round() as i32;
                         dt.push_str(&format!(
                             ":box=1:boxcolor={boxcolor}:boxborderw={boxborderw}"
                         ));
@@ -347,7 +352,9 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     let borderw = num(p, "borderw", 0.0).clamp(0.0, 60.0).round() as i32;
                     if borderw >= 1 {
                         let bordercolor = ffmpeg_color(
-                            p.get("bordercolor").and_then(|v| v.as_str()).unwrap_or("#000000"),
+                            p.get("bordercolor")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("#000000"),
                             "black",
                         );
                         dt.push_str(&format!(":borderw={borderw}:bordercolor={bordercolor}"));
@@ -382,6 +389,51 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 parts.push(format!(
                     "chromakey=0x{hex}:similarity={similarity:.4}:blend={blend:.4}"
                 ));
+                // Spill suppression (BG Key tool): despill the surviving
+                // foreground with the dominant key channel.
+                let spill = num(p, "spill", 0.0).clamp(0.0, 1.0);
+                if spill > 0.01 {
+                    let kr = u8::from_str_radix(hex.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
+                    let kg = u8::from_str_radix(hex.get(2..4).unwrap_or("ff"), 16).unwrap_or(255);
+                    let kb = u8::from_str_radix(hex.get(4..6).unwrap_or("00"), 16).unwrap_or(0);
+                    let despill_type = if kg >= kr && kg >= kb {
+                        "green"
+                    } else {
+                        "blue"
+                    };
+                    parts.push(format!("despill=type={despill_type}:mix={spill:.4}"));
+                }
+            }
+            "bgmask" => {
+                // Select-area removal: the alpha mask (rect/ellipse/lasso
+                // shapes with feather + invert, rasterized by the UI) ships as
+                // a PNG so preview and export share the exact same mask.
+                let mask_path = p
+                    .get("maskPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !mask_path.is_empty() && Path::new(&mask_path).is_file() {
+                    let escaped = mask_path
+                        .replace('\\', "/")
+                        .replace(':', "\\:")
+                        .replace('\'', "\\'");
+                    let k = FRAG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    parts.push(format!(
+                        "format=rgba[bgs{k}];movie='{escaped}',scale={fw:.0}:{fh:.0},format=gray,setsar=1[bgm{k}];[bgs{k}][bgm{k}]alphamerge"
+                    ));
+                }
+            }
+            "blurregion" => {
+                if let Some(frag) = region::build_region_blur_fragment(
+                    p,
+                    frame_w.max(2) & !1,
+                    frame_h.max(2) & !1,
+                    seg.duration(),
+                ) {
+                    parts.push(frag);
+                }
             }
             "transform" => {
                 let scale = num(p, "scale", 1.0).clamp(0.05, 8.0);
@@ -405,7 +457,10 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                 // offset. Transparent padding keeps overlay layers (PiP)
                 // compositable; on the base layer the padding is cropped or
                 // blends over the black canvas — visually identical.
-                if x.abs() > 1e-4 || y.abs() > 1e-4 || (scale - 1.0).abs() > 1e-4 || rotation.abs() > 1e-3
+                if x.abs() > 1e-4
+                    || y.abs() > 1e-4
+                    || (scale - 1.0).abs() > 1e-4
+                    || rotation.abs() > 1e-3
                 {
                     let ox = (fw * x * 0.5) as i32;
                     let oy = (fh * y * 0.5) as i32;
@@ -421,9 +476,7 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     if !rgba {
                         parts.push("format=rgba".into());
                     }
-                    parts.push(format!(
-                        "colorchannelmixer=aa={opacity:.4}"
-                    ));
+                    parts.push(format!("colorchannelmixer=aa={opacity:.4}"));
                 }
             }
             "dream" => {
@@ -550,9 +603,7 @@ pub fn build_audio_effect_chain(seg: &ExportSegment) -> String {
             }
             "normalize" => {
                 let target = num(&f.params, "target", -16.0).clamp(-30.0, -8.0);
-                parts.push(format!(
-                    "loudnorm=I={target:.1}:TP=-1.5:LRA=11"
-                ));
+                parts.push(format!("loudnorm=I={target:.1}:TP=-1.5:LRA=11"));
             }
             "deesser" => {
                 let amount = num(&f.params, "amount", 0.0).clamp(0.0, 1.0);
@@ -819,14 +870,12 @@ fn append_encoder_args(
     };
 
     let (vcodec, hw_preset) = match (codec, encoder, use_hw) {
-        (ExportCodec::H265, VideoEncoder::Nvenc, _) | (ExportCodec::H265, VideoEncoder::Auto, true) => {
-            ("hevc_nvenc", "p5")
-        }
+        (ExportCodec::H265, VideoEncoder::Nvenc, _)
+        | (ExportCodec::H265, VideoEncoder::Auto, true) => ("hevc_nvenc", "p5"),
         (ExportCodec::H265, VideoEncoder::Qsv, _) => ("hevc_qsv", "slow"),
         (ExportCodec::H265, VideoEncoder::Amf, _) => ("hevc_amf", "quality"),
-        (ExportCodec::H264, VideoEncoder::Nvenc, _) | (ExportCodec::H264, VideoEncoder::Auto, true) => {
-            ("h264_nvenc", "p5")
-        }
+        (ExportCodec::H264, VideoEncoder::Nvenc, _)
+        | (ExportCodec::H264, VideoEncoder::Auto, true) => ("h264_nvenc", "p5"),
         (ExportCodec::H264, VideoEncoder::Qsv, _) => ("h264_qsv", "slow"),
         (ExportCodec::H264, VideoEncoder::Amf, _) => ("h264_amf", "quality"),
         (ExportCodec::H265, _, _) => ("libx265", ""),
@@ -906,7 +955,14 @@ pub fn build_export_args(
 ) -> Result<Vec<String>, MediaError> {
     ensure_ffmpeg()?;
 
-    let vf = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, false);
+    let vf = video_scale_chain(
+        req.match_source,
+        req.width,
+        req.height,
+        req.fit,
+        req.fps,
+        false,
+    );
 
     let mut args = vec![
         "-y".into(),
@@ -996,8 +1052,22 @@ pub fn build_timeline_export_args(
 
     let v_count = req.video.len();
     let a_count = req.audio.len();
-    let scale_base = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, false);
-    let scale_overlay = video_scale_chain(req.match_source, req.width, req.height, req.fit, req.fps, true);
+    let scale_base = video_scale_chain(
+        req.match_source,
+        req.width,
+        req.height,
+        req.fit,
+        req.fps,
+        false,
+    );
+    let scale_overlay = video_scale_chain(
+        req.match_source,
+        req.width,
+        req.height,
+        req.fit,
+        req.fps,
+        true,
+    );
     let w = req.width.max(2) & !1;
     let h = req.height.max(2) & !1;
 
@@ -1253,13 +1323,15 @@ where
     // KillOnDrop guard: an early return (read error, cancel) must never leak
     // a running ffmpeg child holding the output file open. The guard is
     // disarmed after the explicit wait below.
-    let mut child = KillOnDrop(command_ffmpeg()
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| MediaError::FfmpegFailed(e.to_string()))?);
+    let mut child = KillOnDrop(
+        command_ffmpeg()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| MediaError::FfmpegFailed(e.to_string()))?,
+    );
 
     let stderr = child
         .stderr
@@ -1389,46 +1461,54 @@ mod tests {
         let req = TimelineExportRequest {
             video: vec![
                 ExportSegment {
-            is_image: false,
+                    is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 0.0,
                     out_point: 2.5,
                     start: 0.0,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                reverse: false, speed: 1.0, filters: vec![],
+                    reverse: false,
+                    speed: 1.0,
+                    filters: vec![],
                 },
                 ExportSegment {
-            is_image: false,
+                    is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 5.0,
                     out_point: 8.0,
                     start: 2.5,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                reverse: false, speed: 1.0, filters: vec![],
+                    reverse: false,
+                    speed: 1.0,
+                    filters: vec![],
                 },
             ],
             audio: vec![
                 ExportSegment {
-            is_image: false,
+                    is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 0.0,
                     out_point: 2.5,
                     start: 0.0,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                reverse: false, speed: 1.0, filters: vec![],
+                    reverse: false,
+                    speed: 1.0,
+                    filters: vec![],
                 },
                 ExportSegment {
-            is_image: false,
+                    is_image: false,
                     path: PathBuf::from("a.mp4"),
                     in_point: 5.0,
                     out_point: 8.0,
                     start: 2.5,
                     fade_in: 0.0,
                     fade_out: 0.0,
-                reverse: false, speed: 1.0, filters: vec![],
+                    reverse: false,
+                    speed: 1.0,
+                    filters: vec![],
                 },
             ],
             output_path: PathBuf::from("out.mp4"),
@@ -1464,24 +1544,28 @@ mod tests {
         }
         let req = TimelineExportRequest {
             video: vec![ExportSegment {
-            is_image: false,
+                is_image: false,
                 path: PathBuf::from("v.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
                 start: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-            reverse: false, speed: 1.0, filters: vec![],
+                reverse: false,
+                speed: 1.0,
+                filters: vec![],
             }],
             audio: vec![ExportSegment {
-            is_image: false,
+                is_image: false,
                 path: PathBuf::from("a.mp4"),
                 in_point: 0.0,
                 out_point: 3.0,
                 start: 2.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-            reverse: false, speed: 1.0, filters: vec![],
+                reverse: false,
+                speed: 1.0,
+                filters: vec![],
             }],
             output_path: PathBuf::from("gap.mp4"),
             width: 1280,
@@ -1498,7 +1582,10 @@ mod tests {
         };
         let args = build_timeline_export_args(&req, &test_policy()).expect("args");
         let joined = args.join(" ");
-        assert!(joined.contains("adelay=2000|2000"), "expected 2s audio delay: {joined}");
+        assert!(
+            joined.contains("adelay=2000|2000"),
+            "expected 2s audio delay: {joined}"
+        );
         assert!(joined.contains("color=c=black"));
         assert!(joined.contains("amix="));
     }
@@ -1510,24 +1597,28 @@ mod tests {
         }
         let req = TimelineExportRequest {
             video: vec![ExportSegment {
-            is_image: false,
+                is_image: false,
                 path: PathBuf::from("v.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
                 start: 0.0,
                 fade_in: 0.5,
                 fade_out: 1.0,
-            reverse: false, speed: 1.0, filters: vec![],
+                reverse: false,
+                speed: 1.0,
+                filters: vec![],
             }],
             audio: vec![ExportSegment {
-            is_image: false,
+                is_image: false,
                 path: PathBuf::from("a.mp4"),
                 in_point: 0.0,
                 out_point: 5.0,
                 start: 0.0,
                 fade_in: 0.25,
                 fade_out: 0.75,
-            reverse: false, speed: 1.0, filters: vec![],
+                reverse: false,
+                speed: 1.0,
+                filters: vec![],
             }],
             output_path: PathBuf::from("fade.mp4"),
             width: 1280,
@@ -1560,7 +1651,9 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
-            reverse: false, speed: 1.0, filters: vec![
+            reverse: false,
+            speed: 1.0,
+            filters: vec![
                 ExportFilter {
                     kind: "crop".into(),
                     enabled: true,
@@ -1657,7 +1750,9 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
-            reverse: false, speed: 1.0, filters: vec![
+            reverse: false,
+            speed: 1.0,
+            filters: vec![
                 ExportFilter {
                     kind: "denoise".into(),
                     enabled: true,
@@ -1687,7 +1782,9 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
-            reverse: false, speed: 1.0, filters: vec![ExportFilter {
+            reverse: false,
+            speed: 1.0,
+            filters: vec![ExportFilter {
                 kind: "denoise".into(),
                 enabled: true,
                 params: serde_json::json!({"nf": -5.0, "nr": 10.0}),

@@ -25,10 +25,13 @@ import {
   previewPitchRate,
   previewVideoStyle,
   previewVolumeGain,
+  regionStateAt,
   type FilterInstance,
   type MagicKeyframe,
   type MagicStroke,
+  type RegionState,
 } from "./effects/effects";
+import type { KeyToolMode } from "./monitors/KeyTools";
 import {
   AdvancedAudioDialog,
   type AdvancedAudioTarget,
@@ -116,6 +119,8 @@ const UPSERT_FILTER_KINDS = new Set([
   "normalize",
   "deesser",
   "magicremove",
+  "blurregion",
+  "bgmask",
 ]);
 
 /** React-state playhead refresh while playing is handled by the playback
@@ -233,6 +238,11 @@ function App() {
   const [magicStatus, setMagicStatus] = useState<string | null>(null);
   /** Panel values before the filter exists (first stroke creates it). */
   const [magicDraft, setMagicDraft] = useState<Record<string, unknown> | null>(null);
+  /* --- Blur Region + BG Key tools --- */
+  const [blurTool, setBlurTool] = useState(false);
+  const [blurBusy, setBlurBusy] = useState<{ phase: string; percent: number } | null>(null);
+  const [blurStatus, setBlurStatus] = useState<string | null>(null);
+  const [keyTool, setKeyTool] = useState<KeyToolMode | null>(null);
   const magicDraftRef = useRef<Record<string, unknown> | null>(null);
   /** Serializes magicremove filter commits: two rapid stroke commits used to
    * both see "no filter yet" and create DUPLICATE filters — downstream reads
@@ -332,56 +342,18 @@ function App() {
   const refreshBoot = useCallback(async () => {
     const info = await invoke<BootInfo>("get_boot_info");
     setBoot(info);
-    // Crash recovery: adopt the last session's autosave INTO THE ENGINE
-    // (adopt_autosave replaces engine state, so recovered clip ids stay
-    // valid for edits). Missing/corrupt/empty autosave → fresh boot.
-    let restored = false;
-    try {
-      const saved = await invoke<Timeline | null>("adopt_autosave");
-      if (saved) {
-        const next = normalizeTimeline(saved);
-        recordEngine(next);
-        setTimeline(next);
-        restored = true;
-      }
-    } catch {
-      /* recovery is best-effort — never block boot */
-    }
-    if (!restored) {
-      const next = normalizeTimeline(info.timeline);
-      recordEngine(next);
-      setTimeline(next);
-    }
-    setStatus(
-      restored
-        ? `Recovered unsaved changes from last session · ${info.policy.tier} tier`
-        : `Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`,
-    );
+    // Every launch starts fresh — the boot timeline from the engine is the
+    // whole project. Nothing is persisted or restored behind the user's back
+    // (explicit Save/Open .yxp files are the only persistence).
+    const next = normalizeTimeline(info.timeline);
+    recordEngine(next);
+    setTimeline(next);
+    setStatus(`Ready · ${info.policy.tier} tier · ${info.policy.proxy.height}p proxy`);
   }, []);
 
   useEffect(() => {
     refreshBoot().catch((e) => setStatus(String(e)));
   }, [refreshBoot]);
-
-  /** Autosave: debounced (3 s), engine-authoritative write. Rust serializes
-   * the ENGINE timeline — a UI/state divergence can never be persisted.
-   * Always saved, even when empty, so "deleted everything" is a real state
-   * that must not resurrect an older session after a crash. */
-  const autosaveTimerRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!timeline) return;
-    if (autosaveTimerRef.current != null) window.clearTimeout(autosaveTimerRef.current);
-    autosaveTimerRef.current = window.setTimeout(() => {
-      autosaveTimerRef.current = null;
-      void invoke("save_autosave").catch(() => {});
-    }, 3000);
-    return () => {
-      if (autosaveTimerRef.current != null) {
-        window.clearTimeout(autosaveTimerRef.current);
-        autosaveTimerRef.current = null;
-      }
-    };
-  }, [timeline]);
 
   // Magic Remove pipeline progress (tracking / background reconstruction).
   useEffect(() => {
@@ -414,6 +386,24 @@ function App() {
           `✨ Magic Remove ${phase === "tracking" ? "tracking mask" : "rebuilding background"}… ${Math.round(percent * 100)}%`,
         );
       }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  // Blur tool auto-track progress (own event so the Magic panel stays quiet).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ percent: number; phase: string }>("blur-progress", (event) => {
+      const { percent, phase } = event.payload;
+      if (phase === "done") {
+        setBlurBusy(null);
+        return;
+      }
+      setBlurBusy({ phase, percent });
     }).then((fn) => {
       unlisten = fn;
     });
@@ -802,11 +792,15 @@ function App() {
     }
     const stack = videoStackAtPlayhead(tl, t);
     const prevStack = videoStackRef.current;
+    // Compare OBJECT identity, not just ids: reconcile replaces the clip
+    // object whenever its content changed (filter edits — blur region, BG
+    // key, transform, text), keeping the id. An id-only compare left the
+    // React state on the pre-edit clip, so every monitor tool derived from
+    // it (blurRegion/keyFilters/transform/text) rendered stale params and
+    // committed gestures snapped back.
     const stackChanged =
       stack.length !== prevStack.length ||
-      stack.some((s, i) => s.clip.id !== prevStack[i]?.clip.id);
-    // Always refresh the base ref: reconcile may have replaced the clip
-    // object (edit) without changing its id.
+      stack.some((s, i) => s.clip !== prevStack[i]?.clip);
     videoUnderRef.current = stack[0] ?? null;
     if (stackChanged) {
       videoStackRef.current = stack;
@@ -1744,6 +1738,19 @@ function App() {
       toggleMagicTool(true);
       return;
     }
+    // The Blur Region and BG Key tools likewise live in the Project Monitor.
+    if (kind === "blurregion") {
+      toggleBlurTool(true);
+      return;
+    }
+    if (kind === "bgmask") {
+      toggleKeyTool("area");
+      return;
+    }
+    if (kind === "chromakey") {
+      toggleKeyTool("chroma");
+      return;
+    }
     const roles = EFFECT_CATALOG.find((e) => e.id === kind)?.roles;
     if (roles && !roles.includes(selectedClip.clip.role)) {
       setStatus(`${kind} is for ${roles.join("/")} clips`);
@@ -2165,6 +2172,8 @@ function App() {
         return;
       }
       setCropTool(false);
+      setBlurTool(false);
+      setKeyTool(null);
       if (playingRef.current) {
         if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
         if (audioRef.current && !audioRef.current.paused) audioRef.current.pause();
@@ -2330,6 +2339,282 @@ function App() {
 
   function cancelMagic() {
     void invoke("magic_remove_cancel").catch(() => undefined);
+  }
+
+  /* --- Blur Region tool ---------------------------------------------- */
+
+  /** Video OR image clip under the playhead (region effects apply to both). */
+  function resolveVisualTarget(): Clip | null {
+    const tl = timelineRef.current;
+    if (!tl) return null;
+    const hit = clipAtPlayhead(tl, playheadRef.current, "video");
+    if (hit) return hit.clip;
+    if (selectedClipId) {
+      const sel = tl.tracks
+        .flatMap((t) => t.clips)
+        .find((c) => c.id === selectedClipId && c.role === "video");
+      if (sel) {
+        seekTimeline(sel.start);
+        return sel;
+      }
+    }
+    return null;
+  }
+
+  /** Pause playback for interactive region tools (same as Magic Remove). */
+  function pauseForRegionTool() {
+    if (playingRef.current) {
+      if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
+      if (audioRef.current && !audioRef.current.paused) audioRef.current.pause();
+      playingRef.current = false;
+      setPlaying(false);
+    }
+  }
+
+  function toggleBlurTool(on: boolean) {
+    if (on) {
+      const target = resolveVisualTarget();
+      if (!target) {
+        setStatus("Park the playhead on a video or image clip to use the Blur tool");
+        return;
+      }
+      setCropTool(false);
+      setKeyTool(null);
+      pauseForRegionTool();
+      if (selectedClipId !== target.id) setSelectedClipId(target.id);
+      const existing = (target.filters ?? []).find((f) => f.kind === "blurregion");
+      if (!existing) {
+        void engineEdit<Timeline>(
+          "add_filter",
+          { clipId: target.id, kind: "blurregion", params: defaultParams("blurregion") },
+          { onError: (e) => setStatus(String(e)) },
+        ).then((next) => {
+          if (next) setTimeline(normalizeTimeline(next));
+        });
+      } else if (!existing.enabled) {
+        void engineEdit<Timeline>(
+          "set_filter_enabled",
+          { clipId: target.id, filterId: existing.id, enabled: true },
+          { onError: (e) => setStatus(String(e)) },
+        ).then((next) => {
+          if (next) setTimeline(normalizeTimeline(next));
+        });
+      }
+    }
+    setBlurTool(on);
+    if (on) setBlurStatus(null);
+  }
+
+  /** Enabled blurregion filter on the clip under the playhead. */
+  const monitorBlurRegion = useMemo(() => {
+    const clip = videoUnderPlayhead?.clip;
+    if (!clip) return null;
+    const f = (clip.filters ?? []).find((x) => x.kind === "blurregion" && x.enabled);
+    if (!f) return null;
+    return {
+      clipId: clip.id,
+      filterId: f.id,
+      params: (f.params ?? {}) as Record<string, unknown>,
+      clip,
+    };
+  }, [videoUnderPlayhead]);
+  const blurRegionRef = useRef(monitorBlurRegion);
+  blurRegionRef.current = monitorBlurRegion;
+
+  async function commitBlurRegion(patch: Record<string, unknown>) {
+    const br = blurRegionRef.current;
+    if (!br) return;
+    const saved = await updateFilterParamsOnClip(br.clipId, br.filterId, {
+      ...br.params,
+      ...patch,
+    });
+    if (!saved) setBlurStatus("Could not save the region — try again");
+  }
+
+  /** Auto-track: follow the region content across the clip and store
+   * position keyframes (size/rotation/intensity stay as set). */
+  async function runBlurTrack() {
+    const clip = resolveVisualTarget();
+    const br = blurRegionRef.current;
+    if (!clip || !br) return;
+    if (isImagePath(clip.media_path)) {
+      setBlurStatus("Auto Track needs a video clip");
+      return;
+    }
+    setBlurBusy({ phase: "tracking", percent: 0 });
+    setBlurStatus(null);
+    try {
+      const t = Math.max(
+        0,
+        mediaTimeForClip(clip, playheadRef.current) - clip.in_point,
+      );
+      const anchor: RegionState = regionStateAt(br.params, t);
+      const res = await invoke<{ keyframes: MagicKeyframe[] }>("blur_region_track", {
+        source: clip.media_path,
+        region: {
+          x: anchor.x,
+          y: anchor.y,
+          w: anchor.w,
+          h: anchor.h,
+          anchorTime: t,
+          scopeIn: clip.in_point,
+          scopeOut: clip.out_point,
+          accuracy: "medium",
+        },
+      });
+      const kfs = (res.keyframes ?? []).map((k) => ({
+        t: k.t,
+        x: anchor.x + k.dx,
+        y: anchor.y + k.dy,
+        w: anchor.w,
+        h: anchor.h,
+        rotation: anchor.rotation,
+        intensity: anchor.intensity,
+        feather: anchor.feather,
+        opacity: anchor.opacity,
+      }));
+      if (!kfs.length) {
+        setBlurStatus("Tracking produced no keyframes — try a larger region");
+        return;
+      }
+      const saved = await updateFilterParamsOnClip(clip.id, br.filterId, {
+        ...br.params,
+        keyframes: kfs,
+      });
+      if (!saved) throw new Error("could not save the tracked keyframes");
+      setBlurStatus(
+        "Tracked across the clip - " +
+          kfs.length +
+          " keyframes. Scrub to check; moving the region edits the key at the playhead.",
+      );
+    } catch (e) {
+      setBlurStatus("Tracking failed: " + cleanMagicErr(String(e)));
+    } finally {
+      setBlurBusy(null);
+    }
+  }
+
+  function cancelBlurTrack() {
+    void invoke("magic_remove_cancel").catch(() => undefined);
+  }
+
+  async function removeBlurRegion() {
+    const br = blurRegionRef.current;
+    if (!br) return;
+    const next = await engineEdit<Timeline>(
+      "remove_filter",
+      { clipId: br.clipId, filterId: br.filterId },
+      { onError: (e) => setStatus(String(e)) },
+    );
+    if (!next) return;
+    setTimeline(normalizeTimeline(next));
+    setBlurTool(false);
+    setStatus("Blur region removed");
+  }
+
+  /* --- BG Key tool (chroma key + select-area removal) ----------------- */
+
+  function toggleKeyTool(mode: KeyToolMode | null) {
+    if (mode) {
+      const target = resolveVisualTarget();
+      if (!target) {
+        setStatus("Park the playhead on a video or image clip to remove a background");
+        return;
+      }
+      setCropTool(false);
+      setBlurTool(false);
+      pauseForRegionTool();
+      if (selectedClipId !== target.id) setSelectedClipId(target.id);
+      const kind = mode === "chroma" ? "chromakey" : "bgmask";
+      const existing = (target.filters ?? []).find((f) => f.kind === kind);
+      if (!existing) {
+        void engineEdit<Timeline>(
+          "add_filter",
+          { clipId: target.id, kind, params: defaultParams(kind) },
+          { onError: (e) => setStatus(String(e)) },
+        ).then((next) => {
+          if (next) setTimeline(normalizeTimeline(next));
+        });
+      } else if (!existing.enabled) {
+        void engineEdit<Timeline>(
+          "set_filter_enabled",
+          { clipId: target.id, filterId: existing.id, enabled: true },
+          { onError: (e) => setStatus(String(e)) },
+        ).then((next) => {
+          if (next) setTimeline(normalizeTimeline(next));
+        });
+      }
+    }
+    setKeyTool(mode);
+  }
+
+  /** Enabled chromakey + bgmask params on the displayed clip (live preview
+   * + tool panel run off these). */
+  const monitorKeyFilters = useMemo(() => {
+    const clip = videoUnderPlayhead?.clip;
+    const ck = clip
+      ? (clip.filters ?? []).find((f) => f.kind === "chromakey" && f.enabled)
+      : undefined;
+    const bm = clip
+      ? (clip.filters ?? []).find((f) => f.kind === "bgmask" && f.enabled)
+      : undefined;
+    return {
+      chroma: ck ? ((ck.params ?? {}) as Record<string, unknown>) : null,
+      mask: bm ? ((bm.params ?? {}) as Record<string, unknown>) : null,
+    };
+  }, [videoUnderPlayhead]);
+  const keyFilterIdsRef = useRef<{
+    clipId?: string;
+    chroma?: string;
+    chromaParams?: Record<string, unknown>;
+    mask?: string;
+    maskParams?: Record<string, unknown>;
+  }>({});
+  useEffect(() => {
+    const clip = videoUnderPlayhead?.clip;
+    const ck = clip
+      ? (clip.filters ?? []).find((f) => f.kind === "chromakey" && f.enabled)
+      : undefined;
+    const bm = clip
+      ? (clip.filters ?? []).find((f) => f.kind === "bgmask" && f.enabled)
+      : undefined;
+    keyFilterIdsRef.current = {
+      clipId: clip?.id,
+      chroma: ck?.id,
+      chromaParams: ck ? ((ck.params ?? {}) as Record<string, unknown>) : undefined,
+      mask: bm?.id,
+      maskParams: bm ? ((bm.params ?? {}) as Record<string, unknown>) : undefined,
+    };
+  }, [monitorKeyFilters, videoUnderPlayhead]);
+
+  async function commitChromaParams(patch: Record<string, unknown>) {
+    const ids = keyFilterIdsRef.current;
+    if (!ids.clipId || !ids.chroma) return;
+    await updateFilterParamsOnClip(ids.clipId, ids.chroma, {
+      ...(ids.chromaParams ?? {}),
+      ...patch,
+    });
+  }
+
+  async function commitMaskParams(patch: Record<string, unknown>) {
+    const ids = keyFilterIdsRef.current;
+    if (!ids.clipId || !ids.mask) return;
+    await updateFilterParamsOnClip(ids.clipId, ids.mask, {
+      ...(ids.maskParams ?? {}),
+      ...patch,
+    });
+  }
+
+  /** Receives the rasterized mask PNG from the monitor (same canvas code the
+   * preview uses), persists it in the derived cache and points the filter at
+   * it — export and preview then share the exact mask. */
+  async function rasterizeMaskSaved(maskKey: string, dataUrl: string) {
+    try {
+      const path = await invoke<string>("save_bg_mask", { data: dataUrl });
+      await commitMaskParams({ maskPath: path, maskKey });
+    } catch (e) {
+      setStatus("Could not save the selection mask: " + cleanMagicErr(String(e)));
+    }
   }
 
 
@@ -2859,9 +3144,6 @@ function App() {
       setTimeline(next);
       setSelectedClipId(null);
       seekTimeline(0);
-      // The opened file is now authoritative — a stale autosave must never
-      // resurrect the previous session on the next boot.
-      void invoke("clear_autosave").catch(() => {});
       setStatus(`Opened ${fileName(path)}`);
     } catch (e) {
       setStatus(String(e));
@@ -2901,7 +3183,6 @@ function App() {
       setTimeline(next);
       setSelectedClipId(null);
       seekTimeline(0);
-      void invoke("clear_autosave").catch(() => {});
       setStatus("New project");
     } catch (e) {
       setStatus(String(e));
@@ -3194,6 +3475,27 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [magicTool]);
+
+  // Region tools only exist over a visual clip — leaving video mode closes
+  // them so the toolbar buttons and gesture ownership never go stale.
+  useEffect(() => {
+    if (blurTool && !videoUnderPlayhead) setBlurTool(false);
+    if (keyTool && !videoUnderPlayhead) setKeyTool(null);
+  }, [blurTool, keyTool, videoUnderPlayhead]);
+
+  // Escape exits the Blur Region / BG Key tools.
+  useEffect(() => {
+    if (!blurTool && !keyTool) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setBlurTool(false);
+        setKeyTool(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [blurTool, keyTool]);
 
   /** Persist a monitor transform gesture on a specific clip. Creates the
    * Transform filter on demand when the clip has none (drag/wheel work
@@ -4321,12 +4623,10 @@ function App() {
               })()
             }
             onCropCommit={(crop) => void commitCrop(crop)}
-            chromakeyActive={Boolean(
-              selectedClip?.clip.filters?.some((f) => f.kind === "chromakey" && f.enabled),
-            )}
             onEyedropColor={(hex) => {
-              const f = selectedClip?.clip.filters?.find((x) => x.kind === "chromakey");
-              if (f) void updateFilterParams(f.id, { ...(f.params as object), color: hex });
+              // Only reachable while the BG Key chroma mode is open (the
+              // monitor scopes eyedropping to the open tool).
+              void commitChromaParams({ color: hex });
             }}
             magicTool={magicTool}
             onMagicTool={toggleMagicTool}
@@ -4341,6 +4641,23 @@ function App() {
             onMagicTrack={(m) => void runMagicTrack(m)}
             onMagicRemove={(m) => void runMagicRemoveRender(m)}
             onMagicCancel={cancelMagic}
+            blurRegion={monitorBlurRegion}
+            blurTool={blurTool}
+            onBlurTool={(on) => toggleBlurTool(on)}
+            onBlurCommit={(patch) => void commitBlurRegion(patch)}
+            onBlurTrack={() => void runBlurTrack()}
+            onBlurCancelTrack={cancelBlurTrack}
+            onBlurRemove={() => void removeBlurRegion()}
+            blurBusy={blurBusy}
+            blurStatus={blurStatus}
+            keyTool={keyTool}
+            onKeyTool={(mode) => toggleKeyTool(mode)}
+            keyFilters={monitorKeyFilters}
+            onChromaChange={(patch) => void commitChromaParams(patch)}
+            onMaskChange={(patch) => void commitMaskParams(patch)}
+            onKeyMaskSaved={(maskKey, dataUrl) =>
+              void rasterizeMaskSaved(maskKey, dataUrl)
+            }
             onShowClipMonitor={
               clipMonitorOpen ? undefined : () => setClipMonitorOpen(true)
             }
