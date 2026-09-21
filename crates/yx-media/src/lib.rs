@@ -467,6 +467,15 @@ pub fn build_video_effect_chain(seg: &ExportSegment, frame_w: u32, frame_h: u32)
                     if !rgba {
                         parts.push("format=rgba".into());
                     }
+                    // Zoom (or rotation) can push the frame past the canvas,
+                    // and pad errors out on oversized input ("Padded
+                    // dimensions cannot be smaller than input dimensions").
+                    // Clamp back to the canvas first; the pan offset rides on
+                    // this crop when there is overflow and on the pad when
+                    // the frame is smaller (zoom-out).
+                    parts.push(format!(
+                        "crop=w='min(iw,{fw})':h='min(ih,{fh})':x='max(0,min((iw-ow)/2-{ox},iw-ow))':y='max(0,min((ih-oh)/2-{oy},ih-oh))'"
+                    ));
                     parts.push(format!(
                         "pad={fw}:{fh}:(ow-iw)/2+{ox}:(oh-ih)/2+{oy}:color=0x00000000"
                     ));
@@ -1681,6 +1690,34 @@ mod tests {
         assert!(chain.contains("eq=brightness"), "{chain}");
         assert!(chain.contains("boxblur="), "{chain}");
         assert!(chain.contains("chromakey="), "{chain}");
+    }
+
+    #[test]
+    fn video_effect_chain_transform_zoom_clamps_before_pad() {
+        // Zoom-in (>1) makes the frame larger than the canvas; pad errors on
+        // oversized input, so a clamp crop must come first.
+        let seg = ExportSegment {
+            is_image: false,
+            path: PathBuf::from("v.mp4"),
+            in_point: 0.0,
+            out_point: 4.0,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false,
+            speed: 1.0,
+            filters: vec![ExportFilter {
+                kind: "transform".into(),
+                enabled: true,
+                params: serde_json::json!({"scale":1.4,"rotation":0.0,"opacity":1.0,"x":0.01,"y":-0.02}),
+            }],
+        };
+        let chain = build_video_effect_chain(&seg, 1920, 1080);
+        let clamp = chain
+            .find("crop=w='min(iw,1920)'")
+            .expect("clamp crop before pad");
+        let pad = chain.find("pad=1920:1080").expect("pad");
+        assert!(clamp < pad, "clamp crop must precede pad: {chain}");
     }
 
     #[test]
