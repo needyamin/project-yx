@@ -741,6 +741,29 @@ fn ripple_delete(
     Ok(editor.timeline().clone())
 }
 
+/// Remove every clip from every track (undoable; one undo step).
+#[tauri::command]
+fn clear_timeline(state: State<'_, AppState>) -> Result<Timeline, String> {
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::ClearTimelineClips)
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
+/// Remove every clip from one track (undoable; refuses locked tracks).
+#[tauri::command]
+fn clear_track(track_id: String, state: State<'_, AppState>) -> Result<Timeline, String> {
+    let track_id: TrackId = track_id
+        .parse()
+        .map_err(|e| format!("bad track id: {e}"))?;
+    let mut editor = state.editor.lock();
+    editor
+        .apply(EditCommand::ClearTrackClips { track_id })
+        .map_err(|e| e.to_string())?;
+    Ok(editor.timeline().clone())
+}
+
 #[tauri::command]
 fn unlink_clip(clip_id: String, state: State<'_, AppState>) -> Result<Timeline, String> {
     let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
@@ -1570,7 +1593,12 @@ fn collect_export_segments(
                 .find(|f| f.kind == FilterKind::MagicRemove && f.enabled)
             {
                 if let Some(p) = mr.params.get("resultPath").and_then(|v| v.as_str()) {
-                    if !p.is_empty() && Path::new(p).is_file() {
+                    // A stale render (mask settings changed after the job — the
+                    // frontend marks this `status: "stale"` and clears the
+                    // path) must never be baked in: preview shows the
+                    // original, so export has to match.
+                    let stale = mr.params.get("status").and_then(|v| v.as_str()) == Some("stale");
+                    if !stale && !p.is_empty() && Path::new(p).is_file() {
                         let sin = mr
                             .params
                             .get("scopeIn")
@@ -2174,6 +2202,8 @@ pub fn run() {
             add_transition,
             remove_clip,
             ripple_delete,
+            clear_timeline,
+            clear_track,
             unlink_clip,
             link_clips,
             set_track_mute,

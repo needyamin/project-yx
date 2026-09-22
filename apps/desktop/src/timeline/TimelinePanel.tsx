@@ -89,6 +89,10 @@ type Props = {
   library?: LibraryItem[];
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
+  /** Remove every clip from every track (one undo step; stops playback). */
+  onClearTimeline?: () => void;
+  /** Remove every clip from one track (one undo step; stops playback). */
+  onClearTrack?: (trackId: string) => void;
 };
 
 export function TimelinePanel({
@@ -118,6 +122,8 @@ export function TimelinePanel({
   onAddMediaPath,
   onAdvancedAudio,
   onAdvancedVideo,
+  onClearTimeline,
+  onClearTrack,
 }: Props) {
   const panelRef = useRef<HTMLElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -1546,6 +1552,8 @@ export function TimelinePanel({
           }}
           onAdvancedAudio={onAdvancedAudio}
           onAdvancedVideo={onAdvancedVideo}
+          onClearTimeline={onClearTimeline}
+          onClearTrack={onClearTrack}
         />
       )}
     </section>

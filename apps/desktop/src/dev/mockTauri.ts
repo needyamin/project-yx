@@ -145,8 +145,55 @@ export function installMockTauri(opts: { clips: number; mediaUrls: string[] }): 
           hit.clip.out_point = at;
           hit.track.clips.push(right);
           hit.track.clips.sort((a, b) => a.start - b.start);
+          if (
+            args.syncLinked &&
+            hit.clip.linked_clip_id &&
+            hit.track.kind !== (findClip(hit.clip.linked_clip_id)?.track.kind ?? hit.track.kind)
+          ) {
+            // Split the linked partner at the same timeline time and link the
+            // right-hand pair (matches the engine's SplitClip behavior).
+            const partner = findClip(hit.clip.linked_clip_id);
+            if (partner && at > partner.clip.start && at < partner.clip.start + (partner.clip.out_point - partner.clip.in_point)) {
+              const pRight: MockClip = {
+                ...partner.clip,
+                id: `r${callbackId++}`,
+                start: at,
+                in_point: at,
+              };
+              partner.clip.out_point = at;
+              partner.clip.linked_clip_id = null;
+              partner.track.clips.push(pRight);
+              partner.track.clips.sort((a, b) => a.start - b.start);
+              right.linked_clip_id = pRight.id;
+              pRight.linked_clip_id = right.id;
+            }
+          }
         }
       }
+      return respond();
+    },
+    remove_clip: async (args) => {
+      pushUndo();
+      const hit = findClip(String(args.clipId));
+      if (hit) {
+        const linked = hit.clip.linked_clip_id;
+        hit.track.clips = hit.track.clips.filter((c) => c.id !== hit.clip.id);
+        if (args.removeLinked !== false && linked) {
+          const partner = findClip(linked);
+          if (partner) partner.track.clips = partner.track.clips.filter((c) => c.id !== linked);
+        }
+      }
+      return respond();
+    },
+    clear_timeline: async () => {
+      pushUndo();
+      for (const track of timeline.tracks) track.clips = [];
+      return respond();
+    },
+    clear_track: async (args) => {
+      pushUndo();
+      const track = timeline.tracks.find((t) => t.id === String(args.trackId));
+      if (track) track.clips = [];
       return respond();
     },
     add_filter: async (args) => {

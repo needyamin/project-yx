@@ -151,24 +151,53 @@ export function BlurRegionOverlay({
 
   /** Optimistic slider echo (mirrors MagicRemove's pattern): committed
    * params lag the pointer by one IPC round-trip; without the echo the
-   * controlled sliders snap back mid-drag. */
+   * controlled sliders snap back mid-drag. Echoes expire after a short TTL
+   * so external changes (undo/redo, failed commits) resync the UI. */
   const [echo, setEcho] = useState<Record<string, number | string>>({});
+  const echoAtRef = useRef<Record<string, number>>({});
   useEffect(() => {
     setEcho((prev) => {
       if (!Object.keys(prev).length) return prev;
       const next: Record<string, number | string> = {};
       for (const [k, v] of Object.entries(prev)) {
         if (params[k] !== v) next[k] = v;
+        else delete echoAtRef.current[k];
       }
       return next;
     });
   }, [params]);
-  const shown = echo.shape
-    ? { ...state, shape: echo.shape as BlurShape }
-    : state;
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setEcho((prev) => {
+        const now = Date.now();
+        let changed = false;
+        const next: Record<string, number | string> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (now - (echoAtRef.current[k] ?? 0) > 1500) {
+            delete echoAtRef.current[k];
+            changed = true;
+          } else {
+            next[k] = v;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 500);
+    return () => window.clearInterval(id);
+  }, []);
   const echoedIntensity = typeof echo.intensity === "number" ? echo.intensity : state.intensity;
   const echoedFeather = typeof echo.feather === "number" ? echo.feather : state.feather;
   const echoedOpacity = typeof echo.opacity === "number" ? echo.opacity : state.opacity;
+  const shown = {
+    ...state,
+    shape: (typeof echo.shape === "string" ? (echo.shape as BlurShape) : state.shape),
+    // Slider echoes overlay the committed state: consecutive rapid changes
+    // accumulate (the keyframe upsert path snapshots the full state, so a
+    // stale props base would silently revert the earlier sliders in a burst).
+    intensity: echoedIntensity,
+    feather: echoedFeather,
+    opacity: echoedOpacity,
+  };
 
   /** Live gesture draft (px-space interactions land here via rAF). */
   const [draft, setDraft] = useState<RegionState | null>(null);
@@ -223,8 +252,11 @@ export function BlurRegionOverlay({
     }
   }, [shown, draft, localTime]);
 
-  /** Commit the current region state: full-params patch when static, a
-   * keyframe upsert when animated. One invoke per gesture / slider settle. */
+  /** Commit the current region state. Static mode diffs against the
+   * committed params and sends ONLY the changed keys — a full-state write
+   * built from render-time props used to revert every other change in a
+   * rapid burst (the app merges patches into the saved params). Animated
+   * mode upserts a keyframe, which carries the full state by design. */
   const commitState = useCallback(
     (s: RegionState, patchKeys?: boolean) => {
       const c = clampRegion(s);
@@ -232,22 +264,20 @@ export function BlurRegionOverlay({
         onCommit({
           keyframes: upsertRegionKeyframe(keys, localTime, c),
         });
-      } else {
-        onCommit({
-          x: c.x,
-          y: c.y,
-          w: c.w,
-          h: c.h,
-          rotation: c.rotation,
-          shape: c.shape,
-          cornerRadius: c.cornerRadius,
-          intensity: c.intensity,
-          feather: c.feather,
-          opacity: c.opacity,
-        });
+        return;
       }
+      const committed = regionStateAt(params, localTime);
+      const patch: Record<string, unknown> = {};
+      const fields: (keyof RegionState)[] = [
+        "x", "y", "w", "h", "rotation", "shape", "cornerRadius",
+        "intensity", "feather", "opacity",
+      ];
+      for (const k of fields) {
+        if (!Object.is(c[k], committed[k])) patch[k] = c[k];
+      }
+      if (Object.keys(patch).length > 0) onCommit(patch);
     },
-    [keys, localTime, onCommit],
+    [keys, localTime, onCommit, params],
   );
 
   /* --- Preview mirror: draw the effective source into the region canvas --- */
@@ -470,16 +500,17 @@ export function BlurRegionOverlay({
   /* --- Panel actions --- */
 
   const setParam = (key: string, value: number | string) => {
+    echoAtRef.current[key] = Date.now();
     setEcho((prev) => ({ ...prev, [key]: value }));
     if (typeof value === "number") {
-      const s = clampRegion({ ...state, [key]: value });
+      const s = clampRegion({ ...shown, [key]: value });
       commitState(s);
     } else {
       // Shape: commit whole state (also fixes circle proportions).
       const s = clampRegion({
-        ...state,
+        ...shown,
         shape: value as BlurShape,
-        ...(value === "circle" ? { w: Math.max(state.w, state.h), h: Math.max(state.w, state.h) } : {}),
+        ...(value === "circle" ? { w: Math.max(shown.w, shown.h), h: Math.max(shown.w, shown.h) } : {}),
       });
       commitState(s);
     }

@@ -107,8 +107,11 @@ export function MagicRemoveOverlay({
   /** Optimistic slider echo: the committed params lag the pointer by one
    * async IPC round-trip; without the echo the controlled inputs snap back
    * to the old value and fight the drag. Each echoed key drops out of the
-   * map the moment the saved params confirm it. */
+   * map the moment the saved params confirm it — or after a short TTL, so
+   * external changes (undo/redo, a failed commit) can never leave a control
+   * showing a value the clip does not have. */
   const [paramEcho, setParamEcho] = useState<Record<string, number | string>>({});
+  const echoAtRef = useRef<Record<string, number>>({});
   useEffect(() => {
     setParamEcho((prev) => {
       if (Object.keys(prev).length === 0) return prev;
@@ -116,13 +119,35 @@ export function MagicRemoveOverlay({
       const p = (params ?? {}) as Record<string, unknown>;
       for (const [k, v] of Object.entries(prev)) {
         if (p[k] !== v) next[k] = v;
+        else delete echoAtRef.current[k];
       }
       return next;
     });
   }, [params]);
+  // TTL sweep: drop echoes that were never confirmed (failed commit, undo).
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setParamEcho((prev) => {
+        const now = Date.now();
+        let changed = false;
+        const next: Record<string, number | string> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (now - (echoAtRef.current[k] ?? 0) > 1500) {
+            delete echoAtRef.current[k];
+            changed = true;
+          } else {
+            next[k] = v;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 500);
+    return () => window.clearInterval(id);
+  }, []);
   const param = <T,>(key: string, fallback: T): T =>
     key in paramEcho ? (paramEcho[key] as T) : fallback;
   const setParam = (key: string, value: number | string) => {
+    echoAtRef.current[key] = Date.now();
     setParamEcho((prev) => ({ ...prev, [key]: value }));
     onParamChange({ [key]: value });
   };
@@ -188,33 +213,52 @@ export function MagicRemoveOverlay({
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const contentH = content.h * frameSize.h;
+    // Live visualization of the advanced mask settings — the sliders must
+    // show their effect on the mask immediately, before ✨ Remove bakes them
+    // into the sidecar (the engine dilates by `expand`, blurs the alpha by
+    // `feather`, and blends the fill by `removalStrength`).
+    const expandPx = Math.max(0, param("expand", params?.expand ?? 0.004) * contentH);
+    const featherPx = Math.max(0, param("feather", params?.feather ?? 0.008) * contentH);
+    const strength = Math.max(0, Math.min(100, param("removalStrength", params?.removalStrength ?? 100))) / 100;
     const toPx = (p: [number, number]): [number, number] => [
       (content.x + (p[0] + offset.dx) * content.w) * frameSize.w,
       (content.y + (p[1] + offset.dy) * content.h) * frameSize.h,
     ];
     for (const s of strokesRef.current) {
       if (s.points.length === 0) continue;
-      const r = Math.max(2, s.radius * contentH);
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.globalCompositeOperation = s.erase ? "destination-out" : "source-over";
-      ctx.beginPath();
+      const r = Math.max(2, s.radius * contentH) + (s.erase ? 0 : expandPx);
+      const path = new Path2D();
       const [x0, y0] = toPx(s.points[0]);
-      ctx.moveTo(x0, y0);
+      path.moveTo(x0, y0);
       if (s.points.length === 1) {
         // Zero-length path with round cap still fills — nudge by a hair.
-        ctx.lineTo(x0 + 0.01, y0);
+        path.lineTo(x0 + 0.01, y0);
       }
       for (let i = 1; i < s.points.length; i++) {
         const [x, y] = toPx(s.points[i]);
-        ctx.lineTo(x, y);
+        path.lineTo(x, y);
+      }
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalCompositeOperation = s.erase ? "destination-out" : "source-over";
+      ctx.globalAlpha = s.erase ? 1 : strength;
+      if (!s.erase && featherPx > 0.5) {
+        // Soft fringe under the solid core — mirrors the engine's feathered
+        // alpha (the core stays at full removal, the edge fades out).
+        ctx.filter = `blur(${featherPx.toFixed(2)}px)`;
+        ctx.lineWidth = r * 2;
+        ctx.strokeStyle = ACCENTS.fill;
+        ctx.stroke(path);
+        ctx.filter = "none";
       }
       ctx.lineWidth = r * 2;
       ctx.strokeStyle = s.erase ? "rgba(0,0,0,1)" : ACCENTS.fill;
-      ctx.stroke();
+      ctx.stroke(path);
     }
+    ctx.filter = "none";
+    ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = "source-over";
-  }, [strokes, offset.dx, offset.dy, content, frameSize]);
+  }, [strokes, offset.dx, offset.dy, content, frameSize, params, paramEcho]);
 
   useEffect(() => {
     draw();

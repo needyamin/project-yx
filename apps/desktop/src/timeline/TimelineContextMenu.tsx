@@ -66,6 +66,10 @@ type Props = {
   onAdvancedVideo?: (clipId: string) => void;
   /** Cross dissolve with the previous clip on the same track. */
   onAddTransition?: (clipId: string, duration: number) => void;
+  /** Remove every clip from every track (one undo step). */
+  onClearTimeline?: () => void;
+  /** Remove every clip from one track (one undo step). */
+  onClearTrack?: (trackId: string) => void;
 };
 
 export function TimelineContextMenu({
@@ -92,6 +96,8 @@ export function TimelineContextMenu({
   onAdvancedAudio,
   onAdvancedVideo,
   onAddTransition,
+  onClearTimeline,
+  onClearTrack,
 }: Props) {
   const ref = useRef<HTMLDivElement | null>(null);
 
@@ -133,6 +139,8 @@ export function TimelineContextMenu({
     onAdvancedAudio,
     onAdvancedVideo,
     onAddTransition,
+    onClearTimeline,
+    onClearTrack,
   });
 
   const left = Math.min(menu.x, window.innerWidth - 220);
@@ -193,6 +201,8 @@ function buildItems(p: {
   onAdvancedAudio?: (clipId: string, tab?: "overview" | "waveform" | "effects") => void;
   onAdvancedVideo?: (clipId: string) => void;
   onAddTransition?: (clipId: string, duration: number) => void;
+  onClearTimeline?: () => void;
+  onClearTrack?: (trackId: string) => void;
 }): Item[] {
   const { menu } = p;
   const t = menu.target;
@@ -226,6 +236,19 @@ function buildItems(p: {
         action: () => p.onAddAudioTrack(),
       },
       { type: "sep" },
+      {
+        type: "item",
+        label: "Clear All from Track",
+        danger: true,
+        disabled: t.locked,
+        action: () => p.onClearTrack?.(t.trackId),
+      },
+      {
+        type: "item",
+        label: "Clear All from Timeline",
+        danger: true,
+        action: () => p.onClearTimeline?.(),
+      },
       {
         type: "item",
         label: `Delete ${t.trackKind} track`,
@@ -352,6 +375,19 @@ function buildItems(p: {
         label: "Add audio track",
         action: () => p.onAddAudioTrack(),
       },
+      { type: "sep" },
+      {
+        type: "item",
+        label: "Clear All from Track",
+        danger: true,
+        action: () => p.onClearTrack?.(t.trackId),
+      },
+      {
+        type: "item",
+        label: "Clear All from Timeline",
+        danger: true,
+        action: () => p.onClearTimeline?.(),
+      },
     ];
   }
 
@@ -397,6 +433,13 @@ function buildItems(p: {
         p.onSeek(t.at);
         p.onAddMarker();
       },
+    },
+    { type: "sep" },
+    {
+      type: "item",
+      label: "Clear All from Timeline",
+      danger: true,
+      action: () => p.onClearTimeline?.(),
     },
   ];
 }

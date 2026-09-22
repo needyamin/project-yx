@@ -193,6 +193,60 @@ w.__qa = {
       v.currentTime = Math.max(0, Math.min(t, v.duration - 0.05));
     }
   },
+  /** Authoritative playhead (seconds) — sample it to verify playback. */
+  clock(): number {
+    return playbackClock.get();
+  },
+  /** Whether the app considers itself playing. */
+  playing(): boolean {
+    return !!document.querySelector(".transport-play.active, [class*='playing']");
+  },
+  /** Timeline state snapshot: per-track clip ranges (start–end) + media. */
+  timelineState() {
+    return Array.from(document.querySelectorAll(".tl-lane[data-track-id]")).map(
+      (lane) => ({
+        id: (lane as HTMLElement).dataset.trackId,
+        clips: Array.from(lane.querySelectorAll(".tl-clip")).map((c) => ({
+          id: (c as HTMLElement).dataset.clipId,
+          left: (c as HTMLElement).style.left,
+          width: (c as HTMLElement).style.width,
+        })),
+      }),
+    );
+  },
+  /** Open the timeline context menu on a clip / lane / ruler and click an
+   * item by (localized) label text. */
+  async ctxMenu(where: "clip" | "lane" | "ruler", label: string) {
+    let target: Element | null = null;
+    if (where === "clip") {
+      target = document.querySelector(".tl-clip");
+    } else if (where === "lane") {
+      target = document.querySelector(".tl-lane[data-track-id]");
+    } else {
+      target = document.querySelector(".tl-ruler");
+    }
+    if (!target) return { error: `${where} not found` };
+    const r = target.getBoundingClientRect();
+    const opts: MouseEventInit = {
+      bubbles: true,
+      cancelable: true,
+      clientX: r.left + Math.min(80, r.width / 2),
+      clientY: r.top + r.height / 2,
+    };
+    target.dispatchEvent(new MouseEvent("contextmenu", opts));
+    await sleep(120);
+    const items = Array.from(document.querySelectorAll(".tl-context-menu .tl-ctx-item"));
+    const found = items.find((b) => b.textContent?.includes(label));
+    if (!found) {
+      return {
+        error: `item "${label}" not found`,
+        items: items.map((b) => b.textContent?.trim()),
+      };
+    }
+    (found as HTMLElement).click();
+    await sleep(300);
+    return { ok: true, label };
+  },
   errs(): string[] {
     return [...w.__errs];
   },

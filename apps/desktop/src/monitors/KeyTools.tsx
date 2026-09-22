@@ -478,8 +478,11 @@ export function BackgroundKeyPanel({
   onMaskChange: (patch: Record<string, unknown>) => void;
   onDone: () => void;
 }) {
-  // Optimistic echoes (same pattern as the other monitor tools).
+  // Optimistic echoes (same pattern as the other monitor tools). Echoes
+  // expire after a short TTL so undo/redo or a failed commit can never leave
+  // a control showing a value the clip does not have.
   const [echo, setEcho] = useState<Record<string, number | string>>({});
+  const echoAtRef = useRef<Record<string, number>>({});
   useEffect(() => {
     setEcho((prev) => {
       if (!Object.keys(prev).length) return prev;
@@ -487,10 +490,30 @@ export function BackgroundKeyPanel({
       const next: Record<string, number | string> = {};
       for (const [k, v] of Object.entries(prev)) {
         if (c[k] !== v) next[k] = v;
+        else delete echoAtRef.current[k];
       }
       return next;
     });
   }, [chroma]);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setEcho((prev) => {
+        const now = Date.now();
+        let changed = false;
+        const next: Record<string, number | string> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (now - (echoAtRef.current[k] ?? 0) > 1500) {
+            delete echoAtRef.current[k];
+            changed = true;
+          } else {
+            next[k] = v;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 500);
+    return () => window.clearInterval(id);
+  }, []);
   const val = (k: string, d: number): number =>
     typeof echo[k] === "number"
       ? (echo[k] as number)
@@ -505,6 +528,7 @@ export function BackgroundKeyPanel({
     : [];
 
   const setNum = (k: string, v: number) => {
+    echoAtRef.current[k] = Date.now();
     setEcho((prev) => ({ ...prev, [k]: v }));
     onChromaChange({ [k]: v });
   };
@@ -648,6 +672,7 @@ export function BackgroundKeyPanel({
                   step={0.002}
                   value={typeof echo.feather === "number" ? echo.feather : num(mask, "feather", 0.01)}
                   onChange={(e) => {
+                    echoAtRef.current.feather = Date.now();
                     setEcho((prev) => ({ ...prev, feather: Number(e.target.value) }));
                     onMaskChange({ feather: Number(e.target.value) });
                   }}

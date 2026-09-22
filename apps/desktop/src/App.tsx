@@ -180,7 +180,6 @@ function App() {
   const playheadRef = useRef(0);
   const playingRef = useRef(false);
   const reverseRafRef = useRef(0);
-  const gapRafRef = useRef(0);
   const movePlayheadRef = useRef<((t: number) => void) | null>(null);
   const previewModeRef = useRef<PreviewMode>("empty");
   const videoUnderRef = useRef<UnderPlayhead | null>(null);
@@ -244,10 +243,11 @@ function App() {
   const [blurStatus, setBlurStatus] = useState<string | null>(null);
   const [keyTool, setKeyTool] = useState<KeyToolMode | null>(null);
   const magicDraftRef = useRef<Record<string, unknown> | null>(null);
-  /** Serializes magicremove filter commits: two rapid stroke commits used to
-   * both see "no filter yet" and create DUPLICATE filters — downstream reads
-   * only the first one, so extra brushed regions were silently not removed. */
-  const magicCommitChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  /** Serializes ALL filter-param commits (magic panel, blur region, BG key,
+   * inspector) through queueFilterCommit below: two rapid stroke commits used
+   * to both see "no filter yet" and create DUPLICATE filters — downstream
+   * reads only the first one, so extra brushed regions were silently not
+   * removed. */
   const magicStatusTickRef = useRef(0);
   /** When the current Magic Remove job started (epoch ms). */
   const [magicStartedAt, setMagicStartedAt] = useState(0);
@@ -708,7 +708,12 @@ function App() {
           void video
             .play()
             .then(() => setPlaying(true))
-            .catch(() => setPlaying(false));
+            .catch((err: unknown) => {
+              // An interrupted play() request (a boundary paused the element
+              // again) must never tear down the whole playback session.
+              if ((err as { name?: string } | null)?.name === "AbortError") return;
+              setPlaying(false);
+            });
           if (wantAudioSrc && audio) {
             void audio.play().catch(() => undefined);
           }
@@ -736,10 +741,20 @@ function App() {
           void video
             .play()
             .then(() => setPlaying(true))
-            .catch(() => setPlaying(false));
+            .catch((err: unknown) => {
+              // An interrupted play() request (a boundary paused the element
+              // again) must never tear down the whole playback session.
+              if ((err as { name?: string } | null)?.name === "AbortError") return;
+              setPlaying(false);
+            });
           if (wantAudioSrc && audio && audio.paused) {
             void audio.play().catch(() => undefined);
           }
+        }
+        // The A-track clip ended (timelineAudioSrc cleared) while the video
+        // keeps previewing: stop the element — it must never outlive its clip.
+        if (!wantAudioSrc && audio && !audio.paused) {
+          audio.pause();
         }
       }
       if (previewMode === "audio" && audio) {
@@ -748,7 +763,10 @@ function App() {
           void audio
             .play()
             .then(() => setPlaying(true))
-            .catch(() => setPlaying(false));
+            .catch((err: unknown) => {
+              if ((err as { name?: string } | null)?.name === "AbortError") return;
+              setPlaying(false);
+            });
         }
       }
       return;
@@ -761,7 +779,10 @@ function App() {
           void audio
             .play()
             .then(() => setPlaying(true))
-            .catch(() => setPlaying(false));
+            .catch((err: unknown) => {
+              if ((err as { name?: string } | null)?.name === "AbortError") return;
+              setPlaying(false);
+            });
         }
       };
       audio.addEventListener("loadedmetadata", onMeta, { once: true });
@@ -846,18 +867,18 @@ function App() {
   }, [timeline, updateUnderPlayhead]);
 
 
-  /** Master playback clock.
+  /** Master playback clock — ONE self-sufficient loop (see the tick below).
    *
    * Video mode uses requestVideoFrameCallback when available: each PRESENTED
    * decoded frame carries its media timestamp, so the playhead is derived
    * from actual frame delivery — no sampling jitter, correct behavior for
-   * 23.976/29.97/50/59.94/60 fps content. rAF sampling remains the fallback
-   * and drives audio-only playback. The gap ticker (separate effect) covers
-   * gaps and still images. */
+   * 23.976/29.97/50/59.94/60 fps content. rAF sampling remains the fallback,
+   * and the same loop drives audio-only playback, gaps and still images. */
   useEffect(() => {
-    if (!playing || previewMode === "empty") return;
+    if (!playing) return;
     let raf = 0;
     let stopped = false;
+    let lastWall = performance.now();
 
     /** Shared per-frame advance: map a media-file time to the timeline,
      * keep A-track/overdub audio locked, and handle cuts / gaps / end. */
@@ -869,7 +890,7 @@ function App() {
         mode === "video" ? videoUnderRef.current : audioUnderRef.current;
       if (!hit) return;
 
-      // Still images have no media clock — the gap ticker advances the
+      // Still images have no media clock — the wall path advances the
       // playhead across them while the monitor shows the picture.
       if (mode === "video" && isImagePath(hit.clip.media_path)) return;
 
@@ -891,13 +912,14 @@ function App() {
       const timelineTime = hit.clip.start + localMedia / speed;
       commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
 
-      // Keep A-track audio locked to the video clock.
+      // Keep A-track audio locked to the video clock (and the overdub layer
+      // in every mode — the same timeline-time → media-time mapping applies).
       const audio = audioRef.current;
       const audioHit = audioUnderRef.current;
       // Overdub layer (voiceover on another track) follows the same clock.
       const audio2 = audio2Ref.current;
       const audioHit2 = audioUnder2Ref.current;
-      if (mode === "video" && audio2 && audioHit2) {
+      if (audio2 && audioHit2) {
         const want2 = audioHit2.clip.in_point + (timelineTime - audioHit2.clip.start);
         const clamped2 = Math.max(
           audioHit2.clip.in_point,
@@ -911,7 +933,7 @@ function App() {
           }
         }
       }
-      if (mode === "video" && audio && audioHit && !audio.paused) {
+      if (audio && audioHit && !audio.paused) {
         const pitchRate = previewPitchRate(
           (audioHit.clip.filters ?? []) as FilterInstance[],
         );
@@ -924,13 +946,21 @@ function App() {
             );
           }
         }
+      } else if (mode === "video" && audio && !audioHit && !audio.paused) {
+        // The A-track audio clip ended (or none covers the playhead) while
+        // the video clock keeps driving: stop the element — audio must never
+        // outlive its clip, or it keeps playing the raw file for minutes.
+        audio.pause();
       }
 
-      // Cut / gap / end-of-clip handling.
+      // Cut / gap / end-of-clip handling. `active.ended` covers media whose
+      // file ends (a hair) before the clip's out_point — without it the
+      // boundary never fires and the playhead pins at the last mapped frame.
       const clipEnd = hit.clip.start + clipTimelineDuration(hit.clip);
       if (
         timelineTime >= clipEnd - 0.02 ||
-        active.currentTime >= hit.clip.out_point - shift - 0.02
+        active.currentTime >= hit.clip.out_point - shift - 0.02 ||
+        active.ended
       ) {
         const next = tl
           ? nextClipAfter(tl, clipEnd, mode === "video" ? "video" : "audio")
@@ -946,12 +976,32 @@ function App() {
             Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
 
           if (isSameMedia && isContiguousTimeline && isContinuousMedia) {
-            // Seamless continuous playback across split point.
-            commitPlayhead(next.clip.start, false);
+            // Seamless continuous playback across the split point: the source
+            // file is continuous, so the element keeps rolling. Commit the
+            // mapped position — never jump the playhead backwards to the
+            // boundary, which stuttered at every split.
+            if (active.ended) {
+              // The file ended exactly at the boundary: restart into the
+              // next clip's source range.
+              try {
+                active.currentTime = next.clip.in_point - nextTarget.shift;
+              } catch {
+                /* metadata not ready */
+              }
+              if (playingRef.current) void active.play().catch(() => undefined);
+            }
+            commitPlayhead(Math.max(next.clip.start, timelineTime), false);
             return;
           } else if (isSameMedia && isContiguousTimeline) {
             // Same media, in_point jumped: seek within the loaded file.
-            active.currentTime = next.clip.in_point - nextTarget.shift;
+            try {
+              active.currentTime = next.clip.in_point - nextTarget.shift;
+            } catch {
+              /* metadata not ready */
+            }
+            if (active.ended && playingRef.current) {
+              void active.play().catch(() => undefined);
+            }
             commitPlayhead(next.clip.start, false);
             return;
           } else if (isContiguousTimeline) {
@@ -973,8 +1023,15 @@ function App() {
         const wasPlaying = playingRef.current;
         transitioningRef.current = true;
         active.pause();
-        audioRef.current?.pause();
-        audio2Ref.current?.pause();
+        // Keep the A-track/overdub elements rolling when their clips still
+        // cover the boundary — the wall path owns them from here; killing
+        // them here made every video-end → audio-continues handoff blip.
+        const audioCovered = tl ? clipAtPlayhead(tl, clipEnd, "audio") : null;
+        if (!audioCovered) audioRef.current?.pause();
+        const audio2Covered = tl
+          ? secondAudioAt(tl, clipEnd, audioCovered?.clip.id ?? null)
+          : null;
+        if (!audio2Covered) audio2Ref.current?.pause();
         window.setTimeout(() => {
           transitioningRef.current = false;
         }, 50);
@@ -992,29 +1049,89 @@ function App() {
       }
     };
 
-    /** rAF fallback: samples the media clock once per frame. In video mode
-     * it defers to the presented-frame clock below and only takes over if
-     * that chain has gone quiet (e.g. after a mid-playback source swap) —
-     * self-healing without explicit re-arm bookkeeping. */
+    /** The ONE self-sufficient playback loop. Runs in every preview mode for
+     * the whole session and decides per tick who owns the playhead:
+     *  1. real video under the playhead with frames flowing → the presented-
+     *     frame chain (below), with this loop as its 100 ms fallback sampler;
+     *  2. an audio clip under the playhead with the element playing → the
+     *     media-element clock via advance();
+     *  3. everything else (gaps, still images, empty stretches, media paused
+     *     mid-handoff) → wall-clock advance with media play/pause hand-off.
+     *
+     * Boundary continuation must never depend on React effects re-running:
+     * the old split (master clock + gap ticker keyed on previewMode) froze
+     * playback whenever a clip boundary left previewMode unchanged (multi-
+     * track overlaps) and double-drove the playhead in audio mode. */
     let lastFrameClockCommit = 0;
     const tick = () => {
       raf = requestAnimationFrame(tick);
-      if (!playingRef.current) return;
-      const mode = previewModeRef.current;
-      const active = mode === "video" ? videoRef.current : audioRef.current;
-      if (!active) return;
-      // Paused media means either reverse playback (own stepper drives the
-      // playhead) or a pending seek — the media clock is stale, so
-      // skip instead of corrupting the playhead with a frozen currentTime.
-      if (active.paused) return;
-      if (mode === "empty") return;
+      if (stopped || !playingRef.current) return;
+      // Reverse playback (own rAF stepper) and source swaps (load effect)
+      // own the media while their windows are open.
+      if (reverseRafRef.current) return;
+      if (transitioningRef.current) return;
+      const tl = timelineRef.current;
+      if (!tl) return;
+
+      const vUnder = videoUnderRef.current;
+      const video = videoRef.current;
+      const audio = audioRef.current;
+
+      // 1. Real video playing → the presented-frame clock rules.
       if (
-        mode === "video" &&
-        performance.now() - lastFrameClockCommit < 100
+        vUnder &&
+        !isImagePath(vUnder.clip.media_path) &&
+        video &&
+        !video.paused &&
+        !video.ended
       ) {
+        if (performance.now() - lastFrameClockCommit >= 100) {
+          advance("video", video, video.currentTime);
+        }
         return;
       }
-      advance(mode, active, active.currentTime);
+
+      // 2. Audio-only stretch with the element playing → element clock.
+      const aUnder = audioUnderRef.current;
+      if (
+        !vUnder &&
+        aUnder &&
+        audio &&
+        !audio.paused &&
+        !audio.ended &&
+        audio.getAttribute("src")
+      ) {
+        advance("audio", audio, audio.currentTime);
+        return;
+      }
+
+      // 3. Wall-clock path.
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastWall) / 1000);
+      lastWall = now;
+      const t = playheadRef.current + dt;
+      const dur = timelineDuration(tl, 10);
+      if (t >= dur) {
+        commitPlayhead(dur, true);
+        playingRef.current = false;
+        setPlaying(false);
+        videoRef.current?.pause();
+        audioRef.current?.pause();
+        audio2Ref.current?.pause();
+        return;
+      }
+
+      const vHit = clipAtPlayhead(tl, t, "video");
+      const handOffToVideo = !!vHit && !isImagePath(vHit.clip.media_path);
+      if (handOffToVideo) resumePlayRef.current = true;
+      commitPlayhead(t, handOffToVideo);
+      if (handOffToVideo && vHit) {
+        // Reached real video again — hand the clock back to the element
+        // (idempotent with the load effect; covers same-file handoffs where
+        // no source change re-runs it).
+        ensureVideoPlaying(vHit.clip, t);
+      }
+      syncPlaybackAudio(tl, t);
     };
     raf = requestAnimationFrame(tick);
 
@@ -1036,7 +1153,7 @@ function App() {
       };
       v.requestVideoFrameCallback(step);
     };
-    if (previewMode === "video") armFrameClock();
+    armFrameClock();
 
     // After a mid-playback source swap (cut to different media) the old
     // chain dies with the element's source; restart it when frames flow.
@@ -1051,7 +1168,7 @@ function App() {
       cancelAnimationFrame(raf);
       videoEl?.removeEventListener("playing", onFramesFlowing);
     };
-  }, [playing, previewMode, commitPlayhead]);
+  }, [playing, commitPlayhead]);
 
   // Media element state listeners (play/pause/error).
   useEffect(() => {
@@ -1078,8 +1195,6 @@ function App() {
       if (playingRef.current || transitioningRef.current) return;
       cancelAnimationFrame(reverseRafRef.current);
       reverseRafRef.current = 0;
-      cancelAnimationFrame(gapRafRef.current);
-      gapRafRef.current = 0;
       playingRef.current = false;
       setPlaying(false);
       audio?.pause();
@@ -1120,90 +1235,6 @@ function App() {
       active.removeEventListener("playing", onRecover);
     };
   }, [previewMode, timelineAudioSrc, commitPlayhead]);
-
-  // Gap playback ticker: drives playhead across gaps AND still-image clips
-  // at 1x (blank frame / picture) when no real video is playing.
-  const gapChainGenRef = useRef(0);
-  useEffect(() => {
-    const videoUnder = videoUnderRef.current;
-    const realVideoPlaying =
-      previewMode === "video" && !!videoUnder && !isImagePath(videoUnder.clip.media_path);
-    if (!playing || realVideoPlaying) {
-      if (gapRafRef.current) {
-        cancelAnimationFrame(gapRafRef.current);
-        gapRafRef.current = 0;
-      }
-      gapChainGenRef.current++;
-      return;
-    }
-    // Generation guard: any orphaned chain from a previous effect instance
-    // terminates itself instead of stacking (stacked chains multiplied the
-    // playhead rate).
-    const gen = ++gapChainGenRef.current;
-
-    let lastWall = performance.now();
-
-    const tick = (now: number) => {
-      if (!playingRef.current || gen !== gapChainGenRef.current) {
-        gapRafRef.current = 0;
-        return; // terminal: stop the chain instead of leaving a zombie loop
-      }
-      gapRafRef.current = requestAnimationFrame(tick);
-      const dt = Math.min(0.05, (now - lastWall) / 1000);
-      lastWall = now;
-
-      const currentPh = playheadRef.current;
-      const nextPh = currentPh + dt;
-
-      const tl = timelineRef.current;
-      const dur = tl ? timelineDuration(tl, 10) : 10;
-      if (nextPh >= dur) {
-        commitPlayhead(dur, true);
-        playingRef.current = false;
-        setPlaying(false);
-        const audio = audioRef.current;
-        if (audio && !audio.paused) audio.pause();
-        gapChainGenRef.current++;
-        gapRafRef.current = 0;
-        return;
-      }
-
-      const vHit = tl ? clipAtPlayhead(tl, nextPh, "video") : null;
-      const vClip = vHit && !isImagePath(vHit.clip.media_path) ? vHit : null;
-      if (vClip) {
-        // Reached the next video clip!
-        resumePlayRef.current = true;
-        commitPlayhead(nextPh, true);
-        return;
-      }
-
-      // Still in a gap: advance playhead (imperative + throttled state).
-      commitPlayhead(nextPh, false);
-
-      const aClip = tl ? clipAtPlayhead(tl, nextPh, "audio") : null;
-      const audio = audioRef.current;
-      if (audio && aClip) {
-        if (audio.paused) void audio.play().catch(() => undefined);
-      } else if (audio && !audio.paused && !aClip) {
-        audio.pause();
-      }
-      const audio2 = audio2Ref.current;
-      const aHit2 = secondAudioAt(tl, nextPh, aClip?.clip.id ?? null);
-      if (audio2 && aHit2 && audio2.getAttribute("src")) {
-        if (audio2.paused) void audio2.play().catch(() => undefined);
-      } else if (audio2 && !audio2.paused && !aHit2) {
-        audio2.pause();
-      }
-    };
-
-    gapRafRef.current = requestAnimationFrame(tick);
-    return () => {
-      if (gapRafRef.current) {
-        cancelAnimationFrame(gapRafRef.current);
-        gapRafRef.current = 0;
-      }
-    };
-  }, [playing, previewMode, commitPlayhead]);
 
   async function importPaths(paths: string[]) {
     const mediaPaths = paths.filter(isMediaPath);
@@ -1874,18 +1905,102 @@ function App() {
     return added?.id ?? null;
   }
 
-  async function updateFilterParams(filterId: string, params: Record<string, unknown>) {
-    if (!selectedClipId) return;
-    const next = await engineEdit<Timeline>(
-      "update_filter",
-      {
-        clipId: selectedClipId,
-        filterId,
-        params,
-      },
-      { onError: (e) => setStatus(String(e)) },
+  /** Filter-param commits MUST be serialized and merged into the SAVED
+   * params read fresh from timelineRef — never into render-state props.
+   * Sliders and overlay gestures fire faster than the IPC round-trip;
+   * merging into a stale snapshot silently reverted every earlier change in
+   * a burst (the UI kept the value, the clip did not — the classic "slider
+   * moved but nothing happened" bug). One global chain keeps every filter
+   * commit (magic panel, blur region, BG key, inspector) strictly ordered:
+   * each applies on top of the previous response. */
+  const filterCommitChainRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  function queueFilterCommit<T>(fn: () => Promise<T>): Promise<T> {
+    const chained = filterCommitChainRef.current.then(fn, fn);
+    filterCommitChainRef.current = chained.catch(() => {});
+    return chained;
+  }
+
+  /** The engine-confirmed params of a filter, read at commit time. */
+  function savedFilterParams(
+    clipId: string,
+    filterId: string,
+  ): { params: Record<string, unknown>; kind: string } | null {
+    const clip = timelineRef.current?.tracks
+      .flatMap((t) => t.clips)
+      .find((c) => c.id === clipId);
+    const f = clip?.filters?.find((x) => x.id === filterId);
+    if (!f) return null;
+    return {
+      params: (f.params ?? {}) as Record<string, unknown>,
+      kind: f.kind,
+    };
+  }
+
+  /** Merge a patch into a filter's SAVED params (queued, fresh-read). */
+  async function commitFilterParamsOnClip(
+    clipId: string,
+    filterId: string,
+    patch: Record<string, unknown>,
+  ): Promise<Timeline | null> {
+    return queueFilterCommit(async () => {
+      const saved = savedFilterParams(clipId, filterId);
+      if (!saved) return null;
+      const merged = { ...saved.params, ...patch };
+      invalidateStaleMagicRender(saved.kind, patch, merged);
+      return updateFilterParamsOnClip(clipId, filterId, merged);
+    });
+  }
+
+  /** Magic Remove bakes its result into a sidecar whose identity is the
+   * render key (strokes/keyframes/feather/expand/accuracy/strength). When one
+   * of those changes, a stored render no longer matches: drop it so preview
+   * AND export fall back to the original instead of exporting a stale mask.
+   * `status: "stale"` keeps the "press ✨ Remove to re-render" hint visible. */
+  const MAGIC_RENDER_KEYS = [
+    "strokes",
+    "keyframes",
+    "feather",
+    "expand",
+    "trackingAccuracy",
+    "removalStrength",
+  ] as const;
+
+  function invalidateStaleMagicRender(
+    kind: string,
+    patch: Record<string, unknown>,
+    merged: Record<string, unknown>,
+  ) {
+    if (kind !== "magicremove") return;
+    if ("resultPath" in patch || "renderKey" in patch) return;
+    const touchesRender = Object.keys(patch).some((k) =>
+      (MAGIC_RENDER_KEYS as readonly string[]).includes(k),
     );
-    if (next) setTimeline(normalizeTimeline(next));
+    if (!touchesRender) return;
+    if (!merged.resultPath) return;
+    merged.resultPath = "";
+    merged.renderKey = "";
+    merged.status = "stale";
+  }
+
+  async function updateFilterParams(
+    filterId: string,
+    params: Record<string, unknown>,
+    replace = false,
+  ) {
+    if (!selectedClipId) return;
+    const clipId = selectedClipId;
+    await queueFilterCommit(async () => {
+      const saved = savedFilterParams(clipId, filterId);
+      if (!saved) return;
+      // Patch mode (slider edits): apply only the changed keys on top of the
+      // saved params so concurrent/rapid edits never clobber each other and
+      // opaque blobs like magic strokes survive. Replace mode (Reset to
+      // default): the incoming object IS the new state.
+      const merged = replace ? params : { ...saved.params, ...params };
+      invalidateStaleMagicRender(saved.kind, replace ? {} : params, merged);
+      await updateFilterParamsOnClip(clipId, filterId, merged);
+    });
   }
 
   async function toggleFilter(filterId: string, enabled: boolean) {
@@ -1973,6 +2088,112 @@ function App() {
     }
   }
 
+  /** Hand the playhead back to real video after a gap / still-image stretch:
+   * load the clip's source if needed, seek, and resume playback. Idempotent —
+   * the load effect performs the same steps on source changes, and the guards
+   * make double calls harmless (the playback loop also calls this for
+   * same-file handoffs where no source change would re-run the load effect). */
+  function ensureVideoPlaying(clip: Clip, t: number) {
+    const video = videoRef.current;
+    if (!video || !playingRef.current) return;
+    if (video.ended) {
+      // The file is exhausted before the clip's out_point: leave the last
+      // frame up — the wall path keeps the playhead moving to the clip end,
+      // where boundary handling takes over. Re-seeking here every tick would
+      // storm the element and freeze the picture anyway.
+      return;
+    }
+    const target = previewTarget(clip);
+    const wantSrc = convertFileSrcSafe(target.path);
+    if (!wantSrc) return;
+    video.muted = true;
+    const start = () => {
+      try {
+        const want =
+          mediaTimeForClip(clip, t) -
+          (convertFileSrcSafe(target.path) === video.getAttribute("src")
+            ? target.shift
+            : 0);
+        if (Math.abs(video.currentTime - want) > 0.05) {
+          video.currentTime = want;
+        }
+      } catch {
+        /* metadata not ready */
+      }
+      try {
+        video.playbackRate = clip.reverse ? 1 : clipSpeed(clip);
+      } catch {
+        /* ignore */
+      }
+      if (playingRef.current && video.paused) {
+        void video
+          .play()
+          .then(() => setPlaying(true))
+          .catch((err: unknown) => {
+            // An interrupted play() request (a boundary paused the element
+            // again) must never tear down the whole playback session —
+            // that desynced "media plays, playhead frozen" states.
+            if ((err as { name?: string } | null)?.name === "AbortError") return;
+            setPlaying(false);
+          });
+      }
+    };
+    if (video.getAttribute("src") !== wantSrc) {
+      video.src = wantSrc;
+      video.load();
+      video.addEventListener("loadedmetadata", start, { once: true });
+    } else {
+      start();
+    }
+  }
+
+  /** Wall-path audio management: keep the A-track and overdub elements
+   * exactly covering the timeline position `t` — correct source, position,
+   * play while a clip covers, pause when none does. Audio must never outlive
+   * its clip (the old path left the element running to the file's end). */
+  function syncPlaybackAudio(tl: Timeline, t: number) {
+    const syncOne = (
+      el: HTMLAudioElement | null,
+      hit: { clip: Clip } | null,
+    ) => {
+      if (!el) return;
+      const src = hit ? convertFileSrcSafe(hit.clip.media_path) : "";
+      if (hit && src) {
+        if (el.getAttribute("src") !== src) {
+          el.src = src;
+          el.load();
+        }
+        const want = Math.max(
+          hit.clip.in_point,
+          Math.min(
+            hit.clip.in_point + (t - hit.clip.start),
+            hit.clip.out_point - 0.01,
+          ),
+        );
+        try {
+          if (el.ended) {
+            // The file is exhausted before the clip's out_point: leave it
+            // silent — the wall clock keeps the playhead moving, and a fresh
+            // clip (new src) resets `ended`. Seeking back here every tick
+            // would storm the element with corrective seeks.
+          } else if (el.paused) {
+            if (Math.abs(el.currentTime - want) > 0.05) el.currentTime = want;
+            void el.play().catch(() => undefined);
+          } else if (Math.abs(el.currentTime - want) > 0.25) {
+            el.currentTime = want;
+          }
+        } catch {
+          /* metadata not ready — the next tick corrects */
+        }
+      } else if (!el.paused) {
+        el.pause();
+      }
+    };
+    const aHit = clipAtPlayhead(tl, t, "audio");
+    syncOne(audioRef.current, aHit);
+    syncOne(audio2Ref.current ?? null, secondAudioAt(tl, t, aHit?.clip.id ?? null));
+  }
+
   /** Clip-scoped filter param update (updateFilterParams is bound to the
    * selected clip, which may differ from the clip under the playhead).
    * Returns the fresh Timeline so callers can read back the saved filter
@@ -2019,12 +2240,11 @@ function App() {
       .slice(0, 200);
   }
 
-  /** Run a magic commit after every previously queued one has settled, so
-   * timelineRef is up to date when the "existing filter?" check runs. */
+  /** Run a magic commit after every previously queued filter commit has
+   * settled, so timelineRef is up to date when the "existing filter?" check
+   * runs. Same chain as every other filter commit — strictly ordered. */
   function queueMagic<T>(fn: () => Promise<T>): Promise<T> {
-    const chained = magicCommitChainRef.current.then(fn, fn);
-    magicCommitChainRef.current = chained.catch(() => {});
-    return chained;
+    return queueFilterCommit(fn);
   }
 
   /** Merge every magicremove filter on a clip into the FIRST one (union of
@@ -2076,10 +2296,12 @@ function App() {
     const clip = tl?.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
     const existing = clip?.filters?.find((x) => x.kind === "magicremove");
     if (existing) {
-      const next = await updateFilterParamsOnClip(clipId, existing.id, {
+      const merged = {
         ...((existing.params ?? {}) as Record<string, unknown>),
         ...patch,
-      });
+      };
+      invalidateStaleMagicRender("magicremove", patch, merged);
+      const next = await updateFilterParamsOnClip(clipId, existing.id, merged);
       return findMagicIn(next, clipId);
     }
     const hasStrokes = Array.isArray(patch.strokes) && patch.strokes.length > 0;
@@ -2125,10 +2347,12 @@ function App() {
         null,
     );
     if (existing) {
-      await updateFilterParamsOnClip(target.id, existing.id, {
+      const merged = {
         ...((existing.params ?? {}) as Record<string, unknown>),
         ...patch,
-      });
+      };
+      invalidateStaleMagicRender("magicremove", patch, merged);
+      await updateFilterParamsOnClip(target.id, existing.id, merged);
       return;
     }
     const hasStrokes = Array.isArray(patch.strokes) && patch.strokes.length > 0;
@@ -2244,14 +2468,16 @@ function App() {
         source: clip.media_path,
         params: { ...p, ...scope },
       });
-      await updateFilterParamsOnClip(clip.id, f.filterId, {
-        ...p,
-        ...scope,
-        keyframes: res.keyframes ?? [],
-        status: "tracked",
-        resultPath: "",
-        renderKey: "",
-      });
+      await queueFilterCommit(() =>
+        updateFilterParamsOnClip(clip.id, f.filterId, {
+          ...p,
+          ...scope,
+          keyframes: res.keyframes ?? [],
+          status: "tracked",
+          resultPath: "",
+          renderKey: "",
+        }),
+      );
       setMagicStatus(
         "Tracked across the clip — press ✨ Remove, or use Adjust to correct the mask.",
       );
@@ -2299,13 +2525,15 @@ function App() {
         params: { ...p, ...scope },
         keyframes: Array.isArray(p.keyframes) ? p.keyframes : [],
       });
-      const saved = await updateFilterParamsOnClip(clip.id, f.filterId, {
-        ...p,
-        ...scope,
-        resultPath: path,
-        renderKey: magicRenderKey(p),
-        status: "ready",
-      });
+      const saved = await queueFilterCommit(() =>
+        updateFilterParamsOnClip(clip.id, f.filterId, {
+          ...p,
+          ...scope,
+          resultPath: path,
+          renderKey: magicRenderKey(p),
+          status: "ready",
+        }),
+      );
       if (!saved) {
         throw new Error(
           "Render finished but saving failed — press Remove again (the render is cached and will be instant)",
@@ -2424,10 +2652,10 @@ function App() {
   async function commitBlurRegion(patch: Record<string, unknown>) {
     const br = blurRegionRef.current;
     if (!br) return;
-    const saved = await updateFilterParamsOnClip(br.clipId, br.filterId, {
-      ...br.params,
-      ...patch,
-    });
+    // Patch-only commit, merged into the SAVED params by the per-filter
+    // queue (the old render-state merge silently dropped every change in a
+    // rapid burst except the last one).
+    const saved = await commitFilterParamsOnClip(br.clipId, br.filterId, patch);
     if (!saved) setBlurStatus("Could not save the region — try again");
   }
 
@@ -2477,10 +2705,12 @@ function App() {
         setBlurStatus("Tracking produced no keyframes — try a larger region");
         return;
       }
-      const saved = await updateFilterParamsOnClip(clip.id, br.filterId, {
-        ...br.params,
-        keyframes: kfs,
-      });
+      const saved = await queueFilterCommit(() =>
+        updateFilterParamsOnClip(clip.id, br.filterId, {
+          ...br.params,
+          keyframes: kfs,
+        }),
+      );
       if (!saved) throw new Error("could not save the tracked keyframes");
       setBlurStatus(
         "Tracked across the clip - " +
@@ -2590,19 +2820,13 @@ function App() {
   async function commitChromaParams(patch: Record<string, unknown>) {
     const ids = keyFilterIdsRef.current;
     if (!ids.clipId || !ids.chroma) return;
-    await updateFilterParamsOnClip(ids.clipId, ids.chroma, {
-      ...(ids.chromaParams ?? {}),
-      ...patch,
-    });
+    await commitFilterParamsOnClip(ids.clipId, ids.chroma, patch);
   }
 
   async function commitMaskParams(patch: Record<string, unknown>) {
     const ids = keyFilterIdsRef.current;
     if (!ids.clipId || !ids.mask) return;
-    await updateFilterParamsOnClip(ids.clipId, ids.mask, {
-      ...(ids.maskParams ?? {}),
-      ...patch,
-    });
+    await commitFilterParamsOnClip(ids.clipId, ids.mask, patch);
   }
 
   /** Receives the rasterized mask PNG from the monitor (same canvas code the
@@ -3455,12 +3679,12 @@ function App() {
     return magicDraft;
   }, [magicTarget, magicDraft]);
 
-  /** Stale-render indicator: a resultPath exists but the mask/settings
-   * changed since it was rendered. */
+  /** Stale-render indicator: the stored sidecar no longer matches the mask
+   * settings (render key changed, or the change explicitly marked it stale). */
   const magicStale = useMemo(() => {
     if (!magicParams) return false;
     const p = magicParams as Record<string, unknown>;
-    return Boolean(p.resultPath) && magicResultReady(p) === null;
+    return p.status === "stale" || (Boolean(p.resultPath) && magicResultReady(p) === null);
   }, [magicParams]);
 
   // Escape exits the Magic Remove tool.
@@ -3875,8 +4099,6 @@ function App() {
     const stopPlayback = () => {
       cancelAnimationFrame(reverseRafRef.current);
       reverseRafRef.current = 0;
-      cancelAnimationFrame(gapRafRef.current);
-      gapRafRef.current = 0;
       playingRef.current = false;
       setPlaying(false);
       video?.pause();
@@ -4011,8 +4233,6 @@ function App() {
   function stopPlayback() {
     cancelAnimationFrame(reverseRafRef.current);
     reverseRafRef.current = 0;
-    cancelAnimationFrame(gapRafRef.current);
-    gapRafRef.current = 0;
     playingRef.current = false;
     setPlaying(false);
     videoRef.current?.pause();
@@ -4032,6 +4252,45 @@ function App() {
         /* ignore */
       }
     }
+  }
+
+  /** Clear every clip from every track (engine command; one undo step).
+   * Stops playback first — the session would otherwise "play" an empty
+   * timeline until its fallback duration. Confirms when clips exist. */
+  function clearTimelineAll() {
+    const hasClips = timelineRef.current?.tracks.some((t) => t.clips.length > 0);
+    if (hasClips && !window.confirm("Remove every clip from the timeline?")) {
+      return;
+    }
+    stopPlayback();
+    void engineEdit<Timeline>("clear_timeline", undefined, {
+      onError: (e) => setStatus(String(e)),
+    }).then((next) => {
+      if (!next) return;
+      setTimeline(normalizeTimeline(next));
+      setStatus("Cleared all clips from the timeline");
+    });
+  }
+
+  /** Clear every clip from one track (engine command; one undo step).
+   * Locked tracks are refused by the engine. Confirms when clips exist. */
+  function clearTrackClips(trackId: string) {
+    const track = timelineRef.current?.tracks.find((t) => t.id === trackId);
+    if (!track) return;
+    if (
+      track.clips.length > 0 &&
+      !window.confirm(`Remove every clip from ${track.name}?`)
+    ) {
+      return;
+    }
+    stopPlayback();
+    void engineEdit<Timeline>("clear_track", { trackId }, {
+      onError: (e) => setStatus(String(e)),
+    }).then((next) => {
+      if (!next) return;
+      setTimeline(normalizeTimeline(next));
+      setStatus("Cleared all clips from the track");
+    });
   }
 
   /** Reverse playback (J): steps the video's currentTime backwards on an
@@ -4431,6 +4690,7 @@ function App() {
       onToggleLink={() => void onToggleLink()}
       onLiftZone={() => void liftZone()}
       onExtractZone={() => void extractZone()}
+      onClearTimeline={clearTimelineAll}
       onAspect={setPreviewAspect}
       onZoomFit={() => viewControlsRef.current?.zoomFit()}
       onZoomIn={() => viewControlsRef.current?.zoomIn()}
@@ -4528,7 +4788,9 @@ function App() {
                 }))}
                 focusFilterId={focusFilterId}
                 fill
-                onUpdate={(id, params) => void updateFilterParams(id, params)}
+                onUpdate={(id, params, replace) =>
+                  void updateFilterParams(id, params, replace === true)
+                }
                 onToggle={(id, en) => void toggleFilter(id, en)}
                 onRemove={(id) => void removeFilter(id)}
               />
@@ -4708,6 +4970,8 @@ function App() {
             }
             onAdvancedAudio={(clipId, tab) => openAdvancedAudioForClip(clipId, tab)}
             onAdvancedVideo={(clipId) => openAdvancedVideoForClip(clipId)}
+            onClearTimeline={clearTimelineAll}
+            onClearTrack={clearTrackClips}
           />
         }
       />

@@ -29,6 +29,8 @@ type Props = {
   onToggleLink: () => void;
   onLiftZone: () => void;
   onExtractZone: () => void;
+  /** Remove every clip from every track (one undo step). */
+  onClearTimeline: () => void;
   onAspect: (a: "landscape" | "tiktok") => void;
   onZoomFit: () => void;
   onZoomIn: () => void;
@@ -65,6 +67,7 @@ export function TopMenubar({
   onToggleLink,
   onLiftZone,
   onExtractZone,
+  onClearTimeline,
   onAspect,
   onZoomFit,
   onZoomIn,
@@ -210,6 +213,10 @@ export function TopMenubar({
           </button>
           <button type="button" role="menuitem" onClick={item(onExtractZone)}>
             Extract Zone
+          </button>
+          <hr className="menu-sep" />
+          <button type="button" role="menuitem" onClick={item(onClearTimeline)}>
+            Clear All from Timeline
           </button>
         </Menu>
 

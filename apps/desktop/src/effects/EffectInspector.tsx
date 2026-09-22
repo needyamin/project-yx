@@ -36,7 +36,15 @@ type Props = {
   /** Expand this filter when set (e.g. after Apply). */
   focusFilterId?: string | null;
   fill?: boolean;
-  onUpdate: (filterId: string, params: Record<string, unknown>) => void;
+  /** `params` is a PATCH of the changed keys (or a full replacement when
+   * `replace` is true — "Reset to default"). The app merges patches into the
+   * saved params, so rapid edits never clobber each other or wipe opaque
+   * blobs like Magic Remove strokes. */
+  onUpdate: (
+    filterId: string,
+    params: Record<string, unknown>,
+    replace?: boolean,
+  ) => void;
   onToggle: (filterId: string, enabled: boolean) => void;
   onRemove: (filterId: string) => void;
 };
@@ -106,7 +114,7 @@ export function EffectInspector({
           {
             type: "item",
             label: "Reset to default",
-            action: () => onUpdate(ctx.filter.id, defaultParams(ctx.filter.kind)),
+            action: () => onUpdate(ctx.filter.id, defaultParams(ctx.filter.kind), true),
           },
         { type: "sep" },
         {
@@ -177,7 +185,7 @@ export function EffectInspector({
                       type="button"
                       className="ei-reset"
                       title="Reset to default"
-                      onClick={() => onUpdate(f.id, defaultParams(f.kind))}
+                      onClick={() => onUpdate(f.id, defaultParams(f.kind), true)}
                     >
                       ↺
                     </button>
@@ -201,7 +209,7 @@ export function EffectInspector({
                         <button
                           type="button"
                           className="ei-reset-full"
-                          onClick={() => onUpdate(f.id, defaultParams(f.kind))}
+                          onClick={() => onUpdate(f.id, defaultParams(f.kind), true)}
                         >
                           Reset to default
                         </button>
@@ -245,7 +253,11 @@ function ParamEditors({
   params: Record<string, unknown>;
   onChange: (p: Record<string, unknown>) => void;
 }) {
-  const set = (key: string, value: unknown) => onChange({ ...params, [key]: value });
+  // Patches carry ONLY the changed key: the app merges them into the saved
+  // params, so two fast slider drags can never overwrite each other's values
+  // (a full-object write built from render-time props used to revert every
+  // earlier change in the burst).
+  const set = (key: string, value: unknown) => onChange({ [key]: value });
   const num = (key: string, d: number) =>
     typeof params[key] === "number" ? (params[key] as number) : d;
 
@@ -642,18 +654,46 @@ function Slider({
   value: number;
   onChange: (v: number) => void;
 }) {
+  // Optimistic echo: committed params lag the pointer by one async IPC
+  // round-trip; without the echo the controlled input snaps back mid-drag.
+  // The echo expires after a short TTL so undo/redo or a failed commit can
+  // never leave the control showing a value the clip does not have.
+  const [echo, setEcho] = useState<number | null>(null);
+  const echoAtRef = useRef(0);
+  useEffect(() => {
+    if (echo === null) return;
+    if (Math.abs(value - echo) < 1e-9) {
+      setEcho(null); // saved params caught up
+      echoAtRef.current = 0;
+    }
+  }, [value, echo]);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (echo !== null && echoAtRef.current && Date.now() - echoAtRef.current > 1500) {
+        setEcho(null);
+        echoAtRef.current = 0;
+      }
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [echo]);
+  const shown = echo ?? value;
   return (
     <label className="ei-slider">
       <span>
-        {label} <em>{value.toFixed(2)}</em>
+        {label} <em>{shown.toFixed(2)}</em>
       </span>
       <input
         type="range"
         min={min}
         max={max}
         step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
+        value={shown}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          echoAtRef.current = Date.now();
+          setEcho(v);
+          onChange(v);
+        }}
       />
     </label>
   );

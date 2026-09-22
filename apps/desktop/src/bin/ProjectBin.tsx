@@ -403,6 +403,11 @@ export function ProjectBin({
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
                     onSelect(item.id);
+                  } else if (e.key === "Delete" || e.key === "Backspace") {
+                    // Remove/Delete bin content from the keyboard — the same
+                    // operation as the "Remove from bin" context-menu action.
+                    e.preventDefault();
+                    onRemoveFromBin(item);
                   }
                 }}
                 title="Drag to timeline or Clip Monitor · double-click to add"

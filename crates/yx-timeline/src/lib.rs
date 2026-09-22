@@ -710,6 +710,12 @@ pub enum EditCommand {
     LiftZone,
     /// Lift the zone, then close the gap on all unlocked tracks.
     ExtractZone,
+    /// Remove every clip from every track (one undo step).
+    ClearTimelineClips,
+    /// Remove every clip from one track (one undo step). Refuses locked tracks.
+    ClearTrackClips {
+        track_id: TrackId,
+    },
 }
 
 /// Result of applying a command that may create multiple clips.
@@ -1449,6 +1455,41 @@ impl TimelineEditor {
             }
             EditCommand::ExtractZone => {
                 self.extract_zone()?;
+                Ok(EditResult {
+                    primary_clip_id: None,
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::ClearTimelineClips => {
+                for track in &mut self.timeline.tracks {
+                    track.clips.clear();
+                }
+                Ok(EditResult {
+                    primary_clip_id: None,
+                    secondary_clip_id: None,
+                })
+            }
+            EditCommand::ClearTrackClips { track_id } => {
+                let removed_ids: Vec<ClipId> = {
+                    let track = self.timeline.track_mut(track_id)?;
+                    if track.locked {
+                        return Err(TimelineError::TrackLocked);
+                    }
+                    let ids = track.clips.iter().map(|c| c.id).collect();
+                    track.clips.clear();
+                    ids
+                };
+                // Drop now-dangling link references on surviving clips
+                // (same cleanup as RemoveTrack).
+                for track in &mut self.timeline.tracks {
+                    for clip in &mut track.clips {
+                        if let Some(link) = clip.linked_clip_id {
+                            if removed_ids.contains(&link) {
+                                clip.linked_clip_id = None;
+                            }
+                        }
+                    }
+                }
                 Ok(EditResult {
                     primary_clip_id: None,
                     secondary_clip_id: None,
@@ -3795,6 +3836,156 @@ mod tests {
         assert!(left.fade_out.abs() < 1e-9);
         assert!(right.fade_in.abs() < 1e-9);
         assert!((right.fade_out - 2.0).abs() < 1e-9);
+    }
+
+    /// Build a small A/V project: one linked pair on V1/A1 (split in two) and
+    /// one unlinked audio clip on A2. Returns the editor plus track ids.
+    fn editor_with_clips() -> (TimelineEditor, TrackId, TrackId, TrackId) {
+        let mut ed = TimelineEditor::new();
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        let a1 = ed.timeline.first_track(TrackKind::Audio).unwrap();
+        ed.apply(EditCommand::AddAvPair {
+            video_track_id: v1,
+            audio_track_id: a1,
+            media_path: "clip.mp4".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 10.0,
+        })
+        .unwrap();
+        ed.apply(EditCommand::AddTrack {
+            kind: TrackKind::Audio,
+            name: Some("A2".into()),
+        })
+        .unwrap();
+        let a2 = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .last()
+            .unwrap()
+            .id;
+        ed.apply(EditCommand::AddClip {
+            track_id: a2,
+            media_path: "music.mp3".into(),
+            source_path: None,
+            start: 0.0,
+            in_point: 0.0,
+            out_point: 5.0,
+            role: MediaRole::Audio,
+            linked_clip_id: None,
+        })
+        .unwrap();
+        ed.apply(EditCommand::SplitClip {
+            clip_id: ed.timeline.tracks[0].clips[0].id,
+            at: 4.0,
+            sync_linked: true,
+        })
+        .unwrap();
+        (ed, v1, a1, a2)
+    }
+
+    #[test]
+    fn clear_timeline_clips_removes_everything_and_keeps_tracks() {
+        let (mut ed, _v1, _a1, _a2) = editor_with_clips();
+        let track_count = ed.timeline.tracks.len();
+        let clip_count: usize = ed.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        assert!(clip_count > 0);
+
+        ed.apply(EditCommand::ClearTimelineClips).unwrap();
+        assert!(ed.timeline.tracks.iter().all(|t| t.clips.is_empty()));
+        assert_eq!(ed.timeline.tracks.len(), track_count);
+        assert!(ed.timeline.validate().is_empty());
+
+        // Undo restores every clip.
+        ed.undo().unwrap();
+        let restored: usize = ed.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        assert_eq!(restored, clip_count);
+    }
+
+    #[test]
+    fn clear_track_clips_removes_only_that_track_and_unlinks_partners() {
+        let (mut ed, _v1, _a1, a2) = editor_with_clips();
+        let video_clip_count = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.clips.len())
+            .sum::<usize>();
+        assert!(video_clip_count > 0);
+
+        ed.apply(EditCommand::ClearTrackClips { track_id: a2 })
+            .unwrap();
+        // Only A2 was emptied; the linked A/V pair on V1/A1 survives intact.
+        let a2_empty = ed
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == a2)
+            .unwrap()
+            .clips
+            .is_empty();
+        assert!(a2_empty);
+        let video_still = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.clips.len())
+            .sum::<usize>();
+        assert_eq!(video_still, video_clip_count);
+        assert!(ed.timeline.validate().is_empty());
+
+        // Clearing the video track drops the audio partners' dangling links.
+        let v1 = ed.timeline.first_track(TrackKind::Video).unwrap();
+        ed.apply(EditCommand::ClearTrackClips { track_id: v1 })
+            .unwrap();
+        assert!(ed
+            .timeline
+            .tracks
+            .iter()
+            .all(|t| t.clips.iter().all(|c| c.linked_clip_id.is_none())));
+        assert!(ed.timeline.validate().is_empty());
+
+        // Undo restores the video clips.
+        ed.undo().unwrap();
+        let restored = ed
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.clips.len())
+            .sum::<usize>();
+        assert_eq!(restored, video_clip_count);
+    }
+
+    #[test]
+    fn clear_track_clips_refuses_locked_track() {
+        let (mut ed, _v1, a1, _a2) = editor_with_clips();
+        ed.apply(EditCommand::SetTrackLock {
+            track_id: a1,
+            locked: true,
+        })
+        .unwrap();
+        let before: Vec<_> = ed
+            .timeline
+            .tracks
+            .iter()
+            .map(|t| t.clips.len())
+            .collect();
+        assert!(ed
+            .apply(EditCommand::ClearTrackClips { track_id: a1 })
+            .is_err());
+        let after: Vec<_> = ed
+            .timeline
+            .tracks
+            .iter()
+            .map(|t| t.clips.len())
+            .collect();
+        assert_eq!(before, after, "a failed clear must not mutate anything");
     }
 }
 
