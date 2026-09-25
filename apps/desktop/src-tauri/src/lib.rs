@@ -265,23 +265,31 @@ async fn get_media_thumbnail(
         std::fs::create_dir_all(out.parent().unwrap_or(&out)).map_err(|e| e.to_string())?;
         if !out.is_file() {
             let tmp = out.with_extension("tmp.jpg");
-            let status = yx_detect::command_ffmpeg()
-                .args([
-                    "-y",
-                    "-ss",
-                    &format!("{bucket:.3}"),
-                    "-i",
-                    &src_str,
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=192:-2",
-                    "-q:v",
-                    "5",
-                    tmp.to_str().ok_or("bad tmp path")?,
-                ])
-                .output()
-                .map_err(|e| e.to_string())?;
+            let tmp_arg = tmp.to_str().ok_or("bad tmp path")?;
+            let mut cmd = yx_detect::command_ffmpeg();
+            cmd.args([
+                "-y",
+                "-ss",
+                &format!("{bucket:.3}"),
+                "-i",
+                &src_str,
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=192:-2",
+                "-q:v",
+                "5",
+                tmp_arg,
+            ]);
+            // Bounded: a corrupt or unreadable file must fail the thumbnail
+            // (which the UI already renders as a blank clip) instead of
+            // parking this pool thread — and its job-manager slot — forever.
+            let status = yx_media::run_bounded(
+                &mut cmd,
+                yx_media::THUMBNAIL_TIMEOUT,
+                "thumbnail",
+            )
+            .map_err(|e| e.to_string())?;
             if !status.status.success() {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!(
@@ -317,18 +325,74 @@ async fn reprobe_hardware(state: State<'_, AppState>) -> Result<BootInfo, String
     })
 }
 
+/// Serialized proxy-enqueue queue.
+///
+/// `import_media` used to `std::thread::spawn` one OS thread per imported
+/// file, and every one of those threads called `ProxyManager::enqueue`, which
+/// runs its own `ffprobe` subprocess. Dropping a folder of 500 clips therefore
+/// created 500 threads and up to 500 concurrent ffprobe processes — on a
+/// machine the editor is explicitly supposed to keep responsive, and while the
+/// user is editing. One long-lived dispatcher drains a channel instead: the
+/// import path only performs a channel send, and proxy work (probe +
+/// transcode) is serialized behind the manager's single worker.
+fn proxy_enqueue_queue(
+) -> &'static Mutex<std::sync::mpsc::Sender<(Arc<ProxyManager>, PathBuf, PerformancePolicy)>> {
+    use std::sync::OnceLock;
+    type Msg = (Arc<ProxyManager>, PathBuf, PerformancePolicy);
+    static QUEUE: OnceLock<Mutex<std::sync::mpsc::Sender<Msg>>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        std::thread::Builder::new()
+            .name("yx-proxy-queue".into())
+            .spawn(move || {
+                while let Ok((manager, path, policy)) = rx.recv() {
+                    // Failures are recorded on the job itself; the dispatcher
+                    // must survive them and keep draining the queue.
+                    let _ = manager.enqueue(path.as_path(), &policy);
+                }
+            })
+            .expect("spawn proxy dispatcher");
+        Mutex::new(tx)
+    })
+}
+
 /// Async so the (cached) ffprobe inside never blocks the UI thread — a
 /// synchronous probe freezes every window interaction for its duration.
+///
+/// The probe itself runs on the blocking pool: an `async fn` body executes on
+/// the async runtime, so calling `probe_media` directly blocked a runtime
+/// worker thread for the duration of the subprocess. A batch import blocked
+/// one worker per file until every worker was stuck, which stalled unrelated
+/// IPC (save, load, export) behind it.
 #[tauri::command]
 async fn import_media(path: String, state: State<'_, AppState>) -> Result<MediaInfo, String> {
-    let info = cached_probe(&state, PathBuf::from(&path).as_path())?;
+    let source = PathBuf::from(&path);
+    let key = source.canonicalize().unwrap_or_else(|_| source.clone());
+    // Cheap in-memory hit first, so re-importing a known file spawns nothing.
+    let cached = state.probe_cache.lock().get(&key).cloned();
+    let info = match cached {
+        Some(info) => info,
+        None => {
+            let probe_path = source.clone();
+            let info = tauri::async_runtime::spawn_blocking(move || probe_media(&probe_path))
+                .await
+                .map_err(|e| format!("probe task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+            state.probe_cache.lock().insert(key, info.clone());
+            info
+        }
+    };
     let policy = state.policy.lock().clone();
     let proxies = Arc::clone(&state.proxies);
-    let source = PathBuf::from(&path);
-    // Queued on the background worker; completion is emitted via "proxy-ready".
-    std::thread::spawn(move || {
-        let _ = proxies.enqueue(source.as_path(), &policy);
-    });
+    // Queued on the background dispatcher; completion is emitted via
+    // "proxy-ready". A send failure only means the dispatcher died.
+    if proxy_enqueue_queue()
+        .lock()
+        .send((proxies, source, policy))
+        .is_err()
+    {
+        tracing::warn!("proxy enqueue dispatcher unavailable; skipping proxy");
+    }
     Ok(info)
 }
 
@@ -1050,10 +1114,16 @@ async fn magic_remove_render(
         let out = yx_media::magic::cache_path(&dir, &job);
         if !out.exists() {
             let tmp = out.with_extension("tmp.mp4");
+            // render_inpaint removes its own partial output on every failure
+            // path; a failed promote below must do the same or the partial
+            // render is stranded in the cache.
             yx_media::magic::render_inpaint(&job, &tmp, Some(&cancel), &|p, phase| {
                 emit_magic_progress(&emit_app, p, phase);
             })?;
-            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+            if let Err(err) = std::fs::rename(&tmp, &out) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("could not finalize magic render: {err}"));
+            }
         }
         Ok(out.display().to_string())
     })
@@ -1303,12 +1373,21 @@ fn set_clip_reverse(
 fn set_clip_speed(
     clip_id: String,
     speed: f64,
+    sync_linked: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Timeline, String> {
     let clip_id: ClipId = clip_id.parse().map_err(|e| format!("bad clip id: {e}"))?;
     let mut editor = state.editor.lock();
+    // Default to syncing: a linked A/V pair whose halves run at different rates
+    // is desynchronised by definition. The rate change is applied as a timeline
+    // operation, so a rejected conflict (e.g. slowing a clip into its neighbour
+    // in absolute-position mode) surfaces here as an error the UI can show.
     editor
-        .apply(EditCommand::SetClipSpeed { clip_id, speed })
+        .apply(EditCommand::SetClipSpeed {
+            clip_id,
+            speed,
+            sync_linked: sync_linked.unwrap_or(true),
+        })
         .map_err(|e| e.to_string())?;
     Ok(editor.timeline().clone())
 }
@@ -1366,26 +1445,34 @@ async fn render_audio_preview(
         let out = dir.join(format!("preview_{:016x}.wav", hasher.finish()));
 
         if !out.exists() {
-            let status = yx_detect::command_ffmpeg()
-                .args([
-                    "-ss",
-                    &format!("{in_point:.3}"),
-                    "-t",
-                    &format!("{duration:.3}"),
-                    "-i",
-                    &source,
-                    "-af",
-                    &chain,
-                    "-ar",
-                    "44100",
-                    "-ac",
-                    "2",
-                    "-threads",
-                    "1",
-                    out.to_str().ok_or("bad output path")?,
-                ])
-                .output()
-                .map_err(|e| e.to_string())?;
+            let out_arg = out.to_str().ok_or("bad output path")?;
+            let mut cmd = yx_detect::command_ffmpeg();
+            cmd.args([
+                "-ss",
+                &format!("{in_point:.3}"),
+                "-t",
+                &format!("{duration:.3}"),
+                "-i",
+                &source,
+                "-af",
+                &chain,
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-threads",
+                "1",
+                out_arg,
+            ]);
+            // Bounded: "Hear processed result" must either produce audio or
+            // report why. An unbounded wait here left the dialog showing a
+            // spinner with no way out when the source was unreadable.
+            let status = yx_media::run_bounded(
+                &mut cmd,
+                yx_media::AUDIO_PREVIEW_TIMEOUT,
+                "audio preview",
+            )
+            .map_err(|e| e.to_string())?;
             if !status.status.success() {
                 return Err(format!(
                     "audio preview render failed: {}",
@@ -1414,16 +1501,19 @@ fn finalize_media_recording(bytes: &[u8], ext: &str, prefix: &str) -> Result<Pat
     let raw = dir.join(format!("{prefix}_{nanos}_raw.{ext}"));
     std::fs::write(&raw, bytes).map_err(|e| e.to_string())?;
     let final_path = dir.join(format!("{prefix}_{nanos}.{ext}"));
-    let status = yx_detect::command_ffmpeg()
-        .args([
-            "-y",
-            "-i",
-            raw.to_str().ok_or("bad raw path")?,
-            "-c",
-            "copy",
-            final_path.to_str().ok_or("bad final path")?,
-        ])
-        .output()
+    let mut cmd = yx_detect::command_ffmpeg();
+    cmd.args([
+        "-y",
+        "-i",
+        raw.to_str().ok_or("bad raw path")?,
+        "-c",
+        "copy",
+        final_path.to_str().ok_or("bad final path")?,
+    ]);
+    // Bounded: this remux is what gives a recording its real duration. If it
+    // wedges, the raw file must still be adopted rather than leaving the
+    // recording in limbo — the fallback below already does exactly that.
+    let status = yx_media::run_bounded(&mut cmd, yx_media::REMUX_TIMEOUT, "recording remux")
         .map_err(|e| e.to_string())?;
     if status.status.success() {
         let _ = std::fs::remove_file(&raw);
@@ -2254,6 +2344,136 @@ fn dirs_cache() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("ProjectYX").join("proxy-cache")
+}
+
+#[cfg(test)]
+mod project_compat_tests {
+    //! The "Render" leg of the backward-compatibility chain (§20), at the
+    //! level this crate owns: a project written by an OLDER build must still
+    //! produce exportable segments, and track visibility rules must keep
+    //! working on it.
+    //!
+    //! The same JSON is used by `crates/yx-timeline/tests/project_compat.rs`,
+    //! so a change that breaks loading or breaks export shows up in one place
+    //! or the other.
+
+    use super::*;
+
+    const V_TRACK: &str = "11111111-1111-4111-8111-111111111111";
+    const A_TRACK: &str = "22222222-2222-4222-8222-222222222222";
+    const V_CLIP: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const A_CLIP: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    /// Every post-first-release field is absent, exactly as an older build
+    /// would have written it.
+    fn legacy_project_json(muted_audio: bool, hidden_video: bool) -> String {
+        format!(
+            r#"{{
+  "frame_rate": 30.0,
+  "width": 1920,
+  "height": 1080,
+  "tracks": [
+    {{
+      "id": "{V_TRACK}", "name": "V1", "kind": "video",
+      "muted": false, "locked": false,
+      "hidden": {hidden_video},
+      "clips": [{{
+        "id": "{V_CLIP}", "media_path": "C:/media/legacy.mp4",
+        "start": 0.0, "in_point": 0.5, "out_point": 3.5,
+        "role": "video", "linked_clip_id": "{A_CLIP}", "filters": []
+      }}]
+    }},
+    {{
+      "id": "{A_TRACK}", "name": "A1", "kind": "audio",
+      "muted": {muted_audio}, "locked": false, "hidden": false,
+      "clips": [{{
+        "id": "{A_CLIP}", "media_path": "C:/media/legacy.mp4",
+        "start": 0.0, "in_point": 0.5, "out_point": 3.5,
+        "role": "audio", "linked_clip_id": "{V_CLIP}", "filters": []
+      }}]
+    }}
+  ]
+}}"#
+        )
+    }
+
+    fn load(json: &str) -> Timeline {
+        serde_json::from_str(json).expect("legacy project must load")
+    }
+
+    fn proxies() -> ProxyManager {
+        let dir = std::env::temp_dir().join(format!("yx_compat_proxy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ProxyManager::new(dir)
+    }
+
+    #[test]
+    fn legacy_project_yields_exportable_video_and_audio_segments() {
+        let tl = load(&legacy_project_json(false, false));
+        let proxies = proxies();
+
+        let video = collect_export_segments(&tl, TrackKind::Video, &proxies);
+        assert_eq!(video.len(), 1, "legacy video clip must export");
+        assert_eq!(video[0].path, PathBuf::from("C:/media/legacy.mp4"));
+        assert_eq!(video[0].in_point, 0.5);
+        assert_eq!(video[0].out_point, 3.5);
+        assert_eq!(video[0].start, 0.0);
+        // Fields added after the first release must export at their defaults,
+        // not at zero — speed 0 would divide the timeline duration by zero.
+        assert_eq!(video[0].speed, 1.0, "speed must default to 1x for old projects");
+        assert!(!video[0].reverse);
+        assert_eq!(video[0].fade_in, 0.0);
+        assert_eq!(video[0].fade_out, 0.0);
+        assert!(video[0].filters.is_empty());
+        assert!(!video[0].is_image);
+
+        let audio = collect_export_segments(&tl, TrackKind::Audio, &proxies);
+        assert_eq!(audio.len(), 1, "legacy audio clip must export");
+        assert_eq!(audio[0].path, PathBuf::from("C:/media/legacy.mp4"));
+        assert_eq!(audio[0].in_point, 0.5);
+        assert_eq!(audio[0].out_point, 3.5);
+    }
+
+    #[test]
+    fn muted_and_hidden_tracks_are_still_excluded_from_export() {
+        // Protecting unrelated behaviour: the visibility rules must be
+        // unaffected by the compatibility work.
+        let proxies = proxies();
+
+        let muted = load(&legacy_project_json(true, false));
+        assert_eq!(
+            collect_export_segments(&muted, TrackKind::Audio, &proxies).len(),
+            0,
+            "a muted audio track must not export"
+        );
+        assert_eq!(
+            collect_export_segments(&muted, TrackKind::Video, &proxies).len(),
+            1,
+            "muting audio must not affect video export"
+        );
+
+        let hidden = load(&legacy_project_json(false, true));
+        assert_eq!(
+            collect_export_segments(&hidden, TrackKind::Video, &proxies).len(),
+            0,
+            "a hidden video track must not export"
+        );
+        assert_eq!(
+            collect_export_segments(&hidden, TrackKind::Audio, &proxies).len(),
+            1,
+            "hiding video must not affect audio export"
+        );
+    }
+
+    #[test]
+    fn empty_timeline_produces_no_segments_and_does_not_panic() {
+        // The "empty project" failure case: export must report "nothing to
+        // export", not panic or emit a zero-length segment.
+        let tl = Timeline::new_hd();
+        let proxies = proxies();
+        assert!(collect_export_segments(&tl, TrackKind::Video, &proxies).is_empty());
+        assert!(collect_export_segments(&tl, TrackKind::Audio, &proxies).is_empty());
+    }
 }
 
 #[cfg(test)]

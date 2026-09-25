@@ -13,6 +13,18 @@
 /build/
 /installer/msix/out/
 
+# Release artifacts — always produced into dist/ (ignored above). These patterns
+# are a safety net for a manual `makeappx` / Store upload left at the repo root;
+# the packages are hundreds of MB and must never be committed.
+*.msix
+*.msixbundle
+*.msixupload
+*.appx
+*.appxbundle
+*.appxupload
+*.blockmap
+*.sig
+
 # Tauri generated
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/WixTools/
@@ -30,6 +42,11 @@ pnpm-debug.log*
 .turbo/
 coverage/
 *.lcov
+.eslintcache
+*.pid
+
+# Local agent/scratch notes (same category as context_memory.txt below)
+.workbuddy-ai/
 
 # Env / secrets / certificates
 .env

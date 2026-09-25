@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn key_expr_interpolates_at_T() {
+    fn key_expr_interpolates_at_capital_t() {
         let e = key_expr(&[(0.0, 0.2), (1.0, 0.8)], "T");
         // Manually evaluate the expression at several T values.
         for (t, want) in [(-1.0, 0.2), (0.0, 0.2), (0.5, 0.5), (1.0, 0.8), (2.0, 0.8)] {

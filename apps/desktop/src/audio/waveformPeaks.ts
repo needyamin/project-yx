@@ -39,9 +39,32 @@ export function overviewFailedFor(src: string): boolean {
   return overviewFailed.has(src);
 }
 
+/**
+ * Fallback deadline for `yieldToUi`. rAF is the right primitive (it keeps the
+ * build frame-aligned and never competes with paint), but Chromium STARVES
+ * `requestAnimationFrame` while the window is occluded or minimized — the same
+ * starvation `dev/qa.ts` shims around. A build parked on a starved rAF never
+ * settles, and because the job manager holds a concurrency slot until a job
+ * settles, that would starve every other background job for as long as the
+ * window stayed hidden. In the normal case rAF fires in ~16 ms and this
+ * deadline never wins, so chunk pacing is unchanged.
+ */
+const YIELD_FALLBACK_MS = 250;
+
 function yieldToUi(): Promise<void> {
   return new Promise((resolve) => {
-    requestAnimationFrame(() => resolve());
+    let done = false;
+    let timer = 0;
+    let frame = 0;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer) window.clearTimeout(timer);
+      if (frame) window.cancelAnimationFrame(frame);
+      resolve();
+    };
+    timer = window.setTimeout(finish, YIELD_FALLBACK_MS);
+    frame = requestAnimationFrame(finish);
   });
 }
 

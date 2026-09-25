@@ -167,6 +167,16 @@ export function AdvancedAudioDialog({
   const [processed, setProcessed] = useState<{ path: string; url: string } | null>(null);
   const [processingPreview, setProcessingPreview] = useState(false);
   const processedAudioRef = useRef<HTMLAudioElement | null>(null);
+  /** Monotonic id for "Hear processed result". A render takes seconds, so a
+   * second press (or a filter change) while one is in flight used to let the
+   * OLDER result land last: it would overwrite `processed` with audio from the
+   * previous filter chain and play that. Only the newest request may apply its
+   * result — or clear the busy flag, which otherwise let a slow first request
+   * hide the spinner while a newer render was still running. */
+  const hearSeqRef = useRef(0);
+  /** Bumped to request playback once the new source has been COMMITTED to the
+   * element (see the effect below). */
+  const [playRequest, setPlayRequest] = useState(0);
   const vcTimer = useRef(0);
 
   const AUDIO_CHAIN_KINDS = new Set([
@@ -264,6 +274,20 @@ export function AdvancedAudioDialog({
     }, 260);
   }
 
+  /** Start the processed preview once React has COMMITTED the new source to
+   * the <audio> element.
+   *
+   * This replaced a hardcoded 120 ms delay. That delay was a guess at how long
+   * the commit would take: fire too early and `play()` starts the PREVIOUS
+   * render's audio (the user hears the wrong filter chain), too late and the
+   * UI just feels sluggish. An effect runs strictly after the commit, so the
+   * element's `src` is guaranteed to be the render we just asked for. `play()`
+   * buffers internally, so no readiness poll is needed. */
+  useEffect(() => {
+    if (!playRequest || !processed) return;
+    void processedAudioRef.current?.play().catch(() => undefined);
+  }, [playRequest, processed]);
+
   async function hearProcessed() {
     const filters = audioFilters
       .filter((f) => f.enabled && AUDIO_CHAIN_KINDS.has(f.kind))
@@ -276,6 +300,9 @@ export function AdvancedAudioDialog({
     playingRef.current = false;
     setPlaying(false);
     processedAudioRef.current?.pause();
+    // Supersede any in-flight render before awaiting: only this request may
+    // touch the preview state from here on.
+    const seq = ++hearSeqRef.current;
     setProcessingPreview(true);
     try {
       const path = await invoke<string>("render_audio_preview", {
@@ -284,16 +311,16 @@ export function AdvancedAudioDialog({
         duration: dur,
         filters,
       });
-      const url = convertFileSrc(path);
-      setProcessed({ path, url });
-      window.setTimeout(() => {
-        void processedAudioRef.current?.play().catch(() => undefined);
-      }, 120);
+      if (seq !== hearSeqRef.current) return; // superseded — discard
+      setProcessed({ path, url: convertFileSrc(path) });
+      setPlayRequest((n) => n + 1);
       onStatus("Playing the exact export sound of this clip");
     } catch (e) {
+      if (seq !== hearSeqRef.current) return;
       onStatus(String(e));
     } finally {
-      setProcessingPreview(false);
+      // A superseded request must not clear the flag the newer one set.
+      if (seq === hearSeqRef.current) setProcessingPreview(false);
     }
   }
 

@@ -32,6 +32,15 @@ pub enum TimelineError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
+    /// A duration-changing edit would collide with a neighbouring clip and the
+    /// current edit mode does not allow moving it. Reported instead of
+    /// silently overlapping (see the timeline invariants).
+    #[error("{0}")]
+    Conflict(String),
+    /// The edit produced a timeline that fails `validate()`. The editor rolls
+    /// the edit back before returning this, so a rejected edit is a no-op.
+    #[error("edit would leave the timeline invalid: {}", .0.join("; "))]
+    InvalidResult(Vec<String>),
 }
 
 /// What stream(s) a media file contributes when placed on the timeline.
@@ -102,6 +111,10 @@ pub struct Clip {
 
 fn default_clip_speed() -> f64 {
     1.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Clip {
@@ -657,10 +670,21 @@ pub enum EditCommand {
         clip_id: ClipId,
         reverse: bool,
     },
-    /// Set playback speed (0.25–4.0). Retimes timeline duration to `(out-in)/speed`.
+    /// Set playback speed (0.25–4.0).
+    ///
+    /// This is a **duration edit, not a property edit**: the timeline duration
+    /// becomes `(out-in)/speed`, so the space it frees or consumes has to be
+    /// resolved according to `edit_mode` (absolute positions vs. ripple vs.
+    /// overwrite), and a linked A/V partner must change rate with it or the
+    /// pair drifts apart.
     SetClipSpeed {
         clip_id: ClipId,
         speed: f64,
+        /// Apply the same rate to the linked partner. Defaults to true: a
+        /// linked pair whose halves run at different rates is desynchronised
+        /// by definition, which is never what the user asked for.
+        #[serde(default = "default_true")]
+        sync_linked: bool,
     },
     /// Slide source in/out by `delta` while keeping duration and timeline start fixed.
     SlipClip {
@@ -762,9 +786,21 @@ impl TimelineEditor {
     pub fn apply(&mut self, cmd: EditCommand) -> Result<EditResult, TimelineError> {
         self.push_undo();
         self.redo.clear();
-        let result = self.apply_inner(cmd);
+        // Invariant gate: an edit that leaves the model inconsistent is rolled
+        // back and reported instead of being applied. Duration-changing
+        // operations (a slow-down, an extending trim, a clip dropped on top of
+        // another) could previously overlap a neighbour silently — the model
+        // stayed serialisable, so nothing downstream noticed until the export
+        // or the UI misbehaved much later.
+        let result = self
+            .apply_inner(cmd)
+            .and_then(|res| match self.timeline.validate() {
+                issues if issues.is_empty() => Ok(res),
+                issues => Err(TimelineError::InvalidResult(issues)),
+            });
         if result.is_err() {
-            // Roll back the optimistic undo push.
+            // Roll back the optimistic undo push — a rejected edit must be a
+            // complete no-op, including the undo history.
             if let Some(prev) = self.undo.pop_back() {
                 self.timeline = prev;
             }
@@ -1283,22 +1319,17 @@ impl TimelineEditor {
                     secondary_clip_id: None,
                 })
             }
-            EditCommand::SetClipSpeed { clip_id, speed } => {
-                let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
-                if track.locked {
-                    return Err(TimelineError::TrackLocked);
-                }
-                let clip = &mut track.clips[idx];
-                clip.speed = if speed.is_finite() {
+            EditCommand::SetClipSpeed {
+                clip_id,
+                speed,
+                sync_linked,
+            } => {
+                let clamped = if speed.is_finite() {
                     speed.clamp(0.25, 4.0)
                 } else {
                     1.0
                 };
-                clip.clamp_fades();
-                Ok(EditResult {
-                    primary_clip_id: Some(clip_id),
-                    secondary_clip_id: None,
-                })
+                self.set_clip_speed(clip_id, clamped, sync_linked)
             }
             EditCommand::SlipClip {
                 clip_id,
@@ -1832,6 +1863,207 @@ impl TimelineEditor {
         Ok((dest_track_id, linked, placed))
     }
 
+    /// Name of the first clip on `track_id` that `[start, end)` would overlap,
+    /// or `None` when the range is free. Transition-covered overlaps are
+    /// ignored — those are deliberate (see `AddTransition`).
+    fn first_overlap_on(
+        &self,
+        track_id: TrackId,
+        clip_id: ClipId,
+        start: f64,
+        end: f64,
+    ) -> Option<String> {
+        let track = self.timeline.tracks.iter().find(|t| t.id == track_id)?;
+        track
+            .clips
+            .iter()
+            .find(|other| {
+                other.id != clip_id
+                    && !other
+                        .filters
+                        .iter()
+                        .any(|f| f.kind == FilterKind::Transition && f.enabled)
+                    && end > other.start + 1e-6
+                    && start < other.end() - 1e-6
+            })
+            .map(|c| c.media_path.clone())
+    }
+
+    /// Keep every transition's crossfade length inside the clips it joins.
+    ///
+    /// A speed change can shrink a clip below the crossfade it carried, which
+    /// would leave the transition referencing frames the clip no longer has.
+    /// Re-clamped with the same rule `AddTransition` applies at creation.
+    fn clamp_transitions_on_track(&mut self, track_id: TrackId) {
+        let Ok(track) = self.timeline.track_mut(track_id) else {
+            return;
+        };
+        // `clips` is start-sorted, so index i-1 is the predecessor.
+        let durations: Vec<f64> = track.clips.iter().map(|c| c.duration()).collect();
+        for i in 1..track.clips.len() {
+            let limit = (durations[i - 1] * 0.4).min(durations[i] * 0.4).max(0.0);
+            for f in track.clips[i].filters.iter_mut() {
+                if f.kind != FilterKind::Transition || !f.enabled {
+                    continue;
+                }
+                let current = f
+                    .params
+                    .get("duration")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                if current > limit {
+                    if let Some(obj) = f.params.as_object_mut() {
+                        obj.insert(
+                            "duration".to_string(),
+                            serde_json::json!((limit * 100.0).round() / 100.0),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply a playback-rate change as a **timeline operation**.
+    ///
+    /// A rate change alters the clip's timeline duration, so the space it frees
+    /// or consumes must be resolved according to `edit_mode`, and a linked A/V
+    /// partner must change rate with it. Treating it as a plain property write
+    /// (the previous behaviour) left an accidental gap when the clip shortened,
+    /// silently overlapped the next clip when it lengthened, and left the
+    /// linked audio running at the old rate — three separate ways to corrupt a
+    /// project from one slider.
+    fn set_clip_speed(
+        &mut self,
+        clip_id: ClipId,
+        speed: f64,
+        sync_linked: bool,
+    ) -> Result<EditResult, TimelineError> {
+        // 1. Read the current state of the clip and, when syncing, its partner.
+        let (track_id, linked, clip_start, old_dur, clip_name) = {
+            let (track, idx) = self.timeline.find_clip(clip_id)?;
+            if track.locked {
+                return Err(TimelineError::TrackLocked);
+            }
+            let c = &track.clips[idx];
+            (
+                track.id,
+                c.linked_clip_id,
+                c.start,
+                c.duration(),
+                c.media_path.clone(),
+            )
+        };
+        let partner = if sync_linked { linked } else { None };
+        let partner_state = match partner {
+            Some(p) => {
+                let (ptrack, pidx) = self.timeline.find_clip(p)?;
+                if ptrack.locked {
+                    return Err(TimelineError::TrackLocked);
+                }
+                let c = &ptrack.clips[pidx];
+                Some((p, ptrack.id, c.start, c.duration(), c.media_path.clone()))
+            }
+            None => None,
+        };
+
+        // 2. Apply the rate, capturing the resulting durations.
+        let new_dur = {
+            let (track, idx) = self.timeline.find_clip_mut(clip_id)?;
+            let c = &mut track.clips[idx];
+            c.speed = speed;
+            c.clamp_fades();
+            c.duration()
+        };
+        let partner_new_dur = match partner {
+            Some(p) => {
+                let (ptrack, pidx) = self.timeline.find_clip_mut(p)?;
+                let c = &mut ptrack.clips[pidx];
+                c.speed = speed;
+                c.clamp_fades();
+                Some(c.duration())
+            }
+            None => None,
+        };
+
+        // Every (track, clip, start, old duration, new duration, name) that was
+        // resized — the clip plus its synced partner.
+        let mut resized: Vec<(TrackId, ClipId, f64, f64, f64, String)> = vec![(
+            track_id,
+            clip_id,
+            clip_start,
+            old_dur,
+            new_dur,
+            clip_name,
+        )];
+        if let (Some((p, ptrack_id, pstart, pold, pname)), Some(pnew)) =
+            (partner_state, partner_new_dur)
+        {
+            resized.push((ptrack_id, p, pstart, pold, pnew, pname));
+        }
+
+        // 3. Resolve the freed / consumed space according to the edit mode.
+        match self.timeline.edit_mode {
+            EditMode::Normal => {
+                // Absolute positions: neighbours must NOT move. Shrinking is
+                // fine (it just frees space the user may fill deliberately), but
+                // growing into a neighbour is a conflict to report rather than
+                // an overlap to create silently.
+                for (tid, cid, start, old, new, name) in &resized {
+                    if *new > *old + 1e-9 {
+                        if let Some(other) =
+                            self.first_overlap_on(*tid, *cid, *start, *start + *new)
+                        {
+                            return Err(TimelineError::Conflict(format!(
+                                "slowing \"{name}\" to {speed}x needs {:.2}s more room and would overlap \"{other}\". Switch to Insert (ripple) mode, or move the following clips first.",
+                                *new - *old
+                            )));
+                        }
+                    }
+                }
+            }
+            EditMode::Insert => {
+                // Ripple: following clips on the SAME track absorb the change —
+                // they close the gap when the clip shortens and make room when
+                // it grows. Other tracks are deliberately untouched, so music
+                // and SFX stay where the user put them.
+                for (tid, _cid, start, old, new, _name) in &resized {
+                    let delta = *new - *old;
+                    if delta.abs() > 1e-9 {
+                        self.shift_clips_after(*tid, *start + *old - 1e-9, delta)?;
+                    }
+                }
+            }
+            EditMode::Overwrite => {
+                // Growing consumes whatever it now covers; shrinking leaves the
+                // gap, because there is nothing to overwrite. `except` keeps the
+                // resized clip out of its own overwrite range.
+                for (tid, cid, start, old, new, _name) in &resized {
+                    if *new > *old + 1e-9 {
+                        self.overwrite_range_except(
+                            *tid,
+                            *start + *old,
+                            *start + *new,
+                            Some(*cid),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // 4. Transitions must not reference frames the clip no longer has.
+        let mut touched: Vec<TrackId> = resized.iter().map(|r| r.0).collect();
+        touched.sort();
+        touched.dedup();
+        for tid in touched {
+            self.clamp_transitions_on_track(tid);
+        }
+
+        Ok(EditResult {
+            primary_clip_id: Some(clip_id),
+            secondary_clip_id: linked,
+        })
+    }
+
     /// Track of the partner's kind occupying the same row position as
     /// `dest_track_id` (V1↔A1, V2↔A2, …). Returns None when no usable match.
     fn mapped_partner_track(
@@ -2121,6 +2353,22 @@ impl TimelineEditor {
         range_start: f64,
         range_end: f64,
     ) -> Result<(), TimelineError> {
+        self.overwrite_range_except(track_id, range_start, range_end, None)
+    }
+
+    /// `overwrite_range` that leaves `except` alone.
+    ///
+    /// Needed whenever the clip being resized is still on the track: a clip
+    /// that has just grown overlaps its own consumed range, so without the
+    /// exclusion the overwrite would trim the very clip it is making room for
+    /// (a slow-down in overwrite mode shortened the clip back to its old end).
+    fn overwrite_range_except(
+        &mut self,
+        track_id: TrackId,
+        range_start: f64,
+        range_end: f64,
+        except: Option<ClipId>,
+    ) -> Result<(), TimelineError> {
         if range_end <= range_start {
             return Ok(());
         }
@@ -2141,6 +2389,7 @@ impl TimelineEditor {
             track
                 .clips
                 .iter()
+                .filter(|c| Some(c.id) != except)
                 .filter(|c| c.start < range_end - 1e-9 && c.end() > range_start + 1e-9)
                 .map(|c| c.id)
                 .collect()
@@ -2159,26 +2408,34 @@ impl TimelineEditor {
                 continue;
             };
 
+            // Branch conditions are deliberately strict about the boundary:
+            // a clip that merely STARTS at `range_start` (or ends at
+            // `range_end`) is not "spanning" the range. With the old loose
+            // conditions such a clip took the span branch and was split at its
+            // own start, producing a zero-length half and an InvalidRange
+            // error instead of a trim.
             if start >= range_start - 1e-9 && end <= range_end + 1e-9 {
                 // Fully inside the range — remove.
                 let _ = self.remove_clip_inner(clip_id, false);
-            } else if start < range_start + 1e-9 && end > range_end - 1e-9 {
-                // Spans the whole range — split at both edges, delete middle.
+            } else if start < range_start - 1e-9 && end > range_end + 1e-9 {
+                // Strictly spans the range — split at both edges, delete middle.
                 let (mid_id, _) = self.split_one(clip_id, range_start)?;
                 if range_end < end - 1e-9 {
                     let (_right_id, _) = self.split_one(mid_id, range_end)?;
                 }
                 let _ = self.remove_clip_inner(mid_id, false);
-            } else if start < range_start + 1e-9 && end > range_start + 1e-9 {
-                // Overlaps left: trim right edge to range_start.
+            } else if start < range_start - 1e-9 && end > range_start + 1e-9 {
+                // Starts before the range and ends inside it: trim the right edge.
                 let new_out = in_point + (range_start - start);
                 if new_out > in_point {
                     let _ = self.apply_trim_values(clip_id, in_point, new_out, false);
                 } else {
                     let _ = self.remove_clip_inner(clip_id, false);
                 }
-            } else if start < range_end - 1e-9 && end > range_end - 1e-9 {
-                // Overlaps right: trim left edge to range_end.
+            } else if start >= range_start - 1e-9 && end > range_end + 1e-9 {
+                // Starts at/inside the range and runs past its end: trim the
+                // left edge. This is also the correct home for a clip that
+                // starts exactly at `range_start`.
                 let offset = range_end - start;
                 let new_in = in_point + offset;
                 if new_in < out_point {
@@ -2360,38 +2617,83 @@ impl Timeline {
                     issues.push(format!("clip {name}: non-positive timeline duration"));
                 }
             }
+
+            // Same-track overlap. Clips on one track must not overlap — an
+            // overlap is only legitimate when the LATER clip carries an enabled
+            // Transition, because `AddTransition` deliberately slides a clip
+            // left over its predecessor to create the crossfade region.
+            //
+            // Without this check an overlap is invisible: the model stays
+            // serialisable, the UI just draws two clips on top of each other,
+            // and the corruption only surfaces much later (as a wrong export or
+            // a clip that cannot be selected). Sorted sweep, so O(n log n).
+            let mut sorted: Vec<&Clip> = track.clips.iter().collect();
+            sorted.sort_by(|a, b| {
+                a.start
+                    .partial_cmp(&b.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut max_end = f64::NEG_INFINITY;
+            let mut max_end_clip: Option<&Clip> = None;
+            for clip in sorted {
+                if clip.start < max_end - 1e-6 {
+                    let has_transition = clip
+                        .filters
+                        .iter()
+                        .any(|f| f.kind == FilterKind::Transition && f.enabled);
+                    if !has_transition {
+                        let prev = max_end_clip.map(|c| c.media_path.as_str()).unwrap_or("?");
+                        issues.push(format!(
+                            "track \"{}\": clip \"{}\" at {:.3}s overlaps \"{}\" (which ends at {:.3}s) by {:.3}s and has no transition",
+                            track.name,
+                            clip.media_path,
+                            clip.start,
+                            prev,
+                            max_end,
+                            max_end - clip.start,
+                        ));
+                    }
+                }
+                if clip.end() > max_end {
+                    max_end = clip.end();
+                    max_end_clip = Some(clip);
+                }
+            }
         }
-        // Link integrity: partner must exist, link must be mutual, roles must differ.
+        // Link integrity: partner must exist, link must be mutual, roles must
+        // differ. Indexed by id — the previous flat `find()` per clip made this
+        // pass O(n²), which is unaffordable now that `apply()` validates after
+        // every edit.
+        let mut by_id: std::collections::HashMap<ClipId, (&Clip, &Track)> =
+            std::collections::HashMap::new();
         for track in &self.tracks {
             for clip in &track.clips {
-                let Some(link) = clip.linked_clip_id else {
-                    continue;
-                };
-                let partner = self
-                    .tracks
-                    .iter()
-                    .flat_map(|t| t.clips.iter())
-                    .find(|c| c.id == link);
-                match partner {
-                    None => {
+                by_id.insert(clip.id, (clip, track));
+            }
+        }
+        for (_id, (clip, _track)) in by_id.iter() {
+            let Some(link) = clip.linked_clip_id else {
+                continue;
+            };
+            match by_id.get(&link) {
+                None => {
+                    issues.push(format!(
+                        "clip {}: linked partner {link} does not exist",
+                        clip.media_path
+                    ));
+                }
+                Some((p, _)) => {
+                    if p.linked_clip_id != Some(clip.id) {
                         issues.push(format!(
-                            "clip {}: linked partner {link} does not exist",
+                            "clip {}: link to {link} is not mutual",
                             clip.media_path
                         ));
                     }
-                    Some(p) => {
-                        if p.linked_clip_id != Some(clip.id) {
-                            issues.push(format!(
-                                "clip {}: link to {link} is not mutual",
-                                clip.media_path
-                            ));
-                        }
-                        if p.role == clip.role {
-                            issues.push(format!(
-                                "clip {}: linked to same-role clip",
-                                clip.media_path
-                            ));
-                        }
+                    if p.role == clip.role {
+                        issues.push(format!(
+                            "clip {}: linked to same-role clip",
+                            clip.media_path
+                        ));
                     }
                 }
             }
@@ -4043,7 +4345,7 @@ mod scale_tests {
         }
         assert!(ed.timeline.validate().is_empty(), "valid after moves");
         // Trim 50.
-        for (i, id) in ids.iter().skip(100).take(50).enumerate() {
+        for id in ids.iter().skip(100).take(50) {
             ed.apply(EditCommand::TrimClip {
                 clip_id: *id,
                 in_point: 0.5,

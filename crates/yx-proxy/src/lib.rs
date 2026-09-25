@@ -206,12 +206,30 @@ impl ProxyManager {
 
     /// Request cooperative cancellation of a queued/running job. The worker
     /// kills the ffmpeg child and marks the job Cancelled.
+    ///
+    /// A QUEUED job has not reached `run_job` yet, so it has no flag to set:
+    /// the request is registered in the same map and honoured by `run_job`
+    /// before it spawns ffmpeg. Previously a queued cancel was silently
+    /// dropped (the map is only populated once a job starts running), so the
+    /// transcode the caller just cancelled still ran to completion.
     pub fn cancel(&self, id: Uuid) -> bool {
-        if let Some(flag) = self.cancels.lock().get(&id) {
-            flag.store(true, Ordering::Relaxed);
-            return true;
+        {
+            let cancels = self.cancels.lock();
+            if let Some(flag) = cancels.get(&id) {
+                flag.store(true, Ordering::Relaxed);
+                return true;
+            }
         }
-        false
+        // Only known jobs may be cancelled; unknown ids stay a no-op.
+        if !self.inner.lock().contains_key(&id) {
+            return false;
+        }
+        // Locks are taken one at a time (never nested) so this cannot
+        // deadlock against run_job's inner-then-cancels acquisition.
+        self.cancels
+            .lock()
+            .insert(id, Arc::new(AtomicBool::new(true)));
+        true
     }
 
     fn run_job(&self, id: Uuid, policy: &PerformancePolicy) -> Result<(), ProxyError> {
@@ -222,13 +240,6 @@ impl ProxyManager {
             job.progress = 0.05;
             (job.source_path.clone(), job.proxy_path.clone())
         };
-        let cancel_flag = {
-            let mut cancels = self.cancels.lock();
-            let flag = cancels.remove(&id).unwrap_or_default();
-            cancels.insert(id, Arc::clone(&flag));
-            flag
-        };
-
         let scale = format!("scale=-2:{}:flags=fast_bilinear", policy.proxy.height);
         let bitrate = format!("{}k", policy.proxy.video_bitrate_kbps);
         let threads = policy.encode_threads.to_string();
@@ -239,6 +250,42 @@ impl ProxyManager {
         let tmp_path = proxy_path.with_extension("mp4.tmp");
         let _ = std::fs::remove_file(&tmp_path);
 
+        let cancel_flag = {
+            let mut cancels = self.cancels.lock();
+            // Reuse a flag that `cancel()` registered while this job was still
+            // queued — replacing it with a fresh (false) flag would silently
+            // discard that cancellation request.
+            Arc::clone(cancels.entry(id).or_default())
+        };
+        // Honour a cancel requested before the worker picked the job up.
+        if cancel_flag.load(Ordering::Relaxed) {
+            self.cancels.lock().remove(&id);
+            self.finish_job(
+                &id,
+                &tmp_path,
+                ProxyStatus::Cancelled,
+                "cancelled".to_string(),
+            );
+            return Err(ProxyError::Cancelled);
+        }
+
+        // A non-UTF-8 path must fail loudly: `to_str().unwrap_or_default()`
+        // silently substituted an empty argument, so ffmpeg was asked to read
+        // "" and the user saw a confusing decoder error instead of the real
+        // cause.
+        let source_arg = source.to_str().ok_or_else(|| {
+            ProxyError::Ffmpeg(format!(
+                "source path is not valid UTF-8: {}",
+                source.display()
+            ))
+        })?;
+        let tmp_arg = tmp_path.to_str().ok_or_else(|| {
+            ProxyError::Ffmpeg(format!(
+                "proxy output path is not valid UTF-8: {}",
+                tmp_path.display()
+            ))
+        })?;
+
         let mut child = KillOnDrop(
             command_ffmpeg()
                 .args([
@@ -246,7 +293,7 @@ impl ProxyManager {
                     "-nostats",
                     "-y",
                     "-i",
-                    source.to_str().unwrap_or_default(),
+                    source_arg,
                     "-vf",
                     &scale,
                     "-c:v",
@@ -263,7 +310,7 @@ impl ProxyManager {
                     "2",
                     "-movflags",
                     "+faststart",
-                    tmp_path.to_str().unwrap_or_default(),
+                    tmp_arg,
                 ])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -289,6 +336,10 @@ impl ProxyManager {
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Drop the flag too: the cancel path used to return before the
+                // cleanup below, leaking one entry per cancelled job for the
+                // lifetime of the process.
+                self.cancels.lock().remove(&id);
                 self.finish_job(
                     &id,
                     &tmp_path,
@@ -318,7 +369,17 @@ impl ProxyManager {
         let mut guard = self.inner.lock();
         let job = guard.get_mut(&id).ok_or(ProxyError::NotFound(id))?;
         if status.success() {
-            std::fs::rename(&tmp_path, &proxy_path)?;
+            // A rename failure (disk full, antivirus/AV lock, cache dir
+            // removed) must NOT leave the job in Running: `playback_path`
+            // only serves Ready/Skipped and `enqueue` only retries
+            // Failed/Cancelled, so a wedged Running job permanently disabled
+            // proxies for that source with no way to recover.
+            if let Err(err) = std::fs::rename(&tmp_path, &proxy_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                job.status = ProxyStatus::Failed;
+                job.error = Some(format!("could not finalize proxy: {err}"));
+                return Err(ProxyError::Io(err));
+            }
             job.status = ProxyStatus::Ready;
             job.progress = 1.0;
             job.error = None;
@@ -478,6 +539,41 @@ mod tests {
     fn cancel_unknown_job_returns_false() {
         let manager = ProxyManager::new(std::env::temp_dir());
         assert!(!manager.cancel(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn cancel_records_request_for_still_queued_job() {
+        let dir = std::env::temp_dir().join(format!("yx_proxy_qcancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = Arc::new(ProxyManager::new(&dir));
+        let source = dir.join("source.mp4");
+        let id = Uuid::new_v4();
+        manager.inner.lock().insert(
+            id,
+            ProxyJob {
+                id,
+                source_path: source.clone(),
+                proxy_path: dir.join(format!("{id}.proxy.mp4")),
+                status: ProxyStatus::Queued,
+                progress: 0.0,
+                error: None,
+                source_info: None,
+            },
+        );
+        // A queued job has not reached run_job yet, so no cancel flag exists.
+        // cancel() must register one anyway, otherwise the transcode the
+        // caller just cancelled runs to completion regardless.
+        assert!(manager.cancel(id), "queued jobs must be cancellable");
+        let flagged = manager
+            .cancels
+            .lock()
+            .get(&id)
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        assert!(flagged, "queued cancel must be recorded for run_job to honour");
+        // Unknown ids remain a no-op rather than silently registering flags.
+        assert!(!manager.cancel(Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -138,6 +138,9 @@ export type MediaInfo = {
   audio_codec: string | null;
   has_audio: boolean;
   has_video: boolean;
+  /** Container reports disagreeing nominal/average video rates (VFR). Such
+   * sources cannot be indexed by frame number — map time, not frames. */
+  is_variable_frame_rate: boolean;
 };
 
 export type LibraryItem = MediaInfo & { id: string; name: string };

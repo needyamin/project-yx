@@ -21,6 +21,11 @@ type QueueItem = {
   seq: number;
   run: (signal: AbortSignal) => Promise<void>;
   controller: AbortController;
+  /** Resolves once the job leaves the queue/running set for ANY reason
+   * (completed, failed, or cancelled) — including the case where the caller
+   * coalesced onto an already-in-flight job. */
+  settled: Promise<void>;
+  resolveSettled: () => void;
 };
 
 const CONCURRENCY = 2;
@@ -36,46 +41,43 @@ export class JobManager {
    * Enqueue (or coalesce) a job. Cancelling the returned handle aborts the
    * signal and drops the job if it has not started; a running job receives
    * the abort and is expected to stop its work cooperatively.
+   *
+   * `promise` settles when the work is actually done (or definitively
+   * abandoned) — never earlier. A coalesced request resolves with the job it
+   * joined, so callers can safely use it to observe completion.
    */
   enqueue(
     id: string,
     priority: JobPriority,
     run: (signal: AbortSignal) => Promise<void>,
-  ): { cancelled: boolean; promise: Promise<void> } {
+  ): { promise: Promise<void> } {
     const existing = this.inflight.get(id);
     if (existing) {
-      if (existing.priority <= priority) {
-        // Already queued/running at same or higher priority — keep it.
-        return { cancelled: false, promise: existing.controller.signal.aborted ? Promise.resolve() : Promise.resolve() };
-      }
-      // New request is more urgent: bump its priority in the queue.
-      existing.priority = priority;
+      // Already queued/running at the same or higher priority — join it.
+      // A more urgent request bumps the queued item in place; creating a
+      // second item for the same id (the old behaviour) left the first one
+      // queued as well, so the work ran twice.
+      if (existing.priority > priority) existing.priority = priority;
+      return { promise: existing.settled };
     }
     const controller = new AbortController();
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
     const item: QueueItem = {
       id,
       priority,
       seq: ++this.seqCounter,
       run,
       controller,
+      settled,
+      resolveSettled,
     };
     this.inflight.set(id, item);
     this.queue.push(item);
     this.pump();
-    return {
-      cancelled: false,
-      promise: new Promise<void>((resolve) => {
-        const check = () => {
-          if (item.controller.signal.aborted || !this.inflight.has(id)) {
-            resolve();
-          } else {
-            setTimeout(check, 50);
-          }
-        };
-        if (this.active.has(item)) resolve();
-        else setTimeout(check, 50);
-      }),
-    };
+    return { promise: settled };
   }
 
   /** Cancel a queued or running job by id. */
@@ -85,13 +87,13 @@ export class JobManager {
     item.controller.abort();
     this.queue = this.queue.filter((q) => q !== item);
     this.inflight.delete(id);
-    // Active jobs finish their current await, then see the aborted signal
-    // and must not enqueue follow-ups; slot frees on completion.
-    if (this.active.has(item)) {
-      // Allow a replacement to start immediately.
-      this.active.delete(item);
-      this.pump();
-    }
+    // A RUNNING job keeps its concurrency slot until it actually settles.
+    // Freeing the slot here (the old behaviour) started a replacement while
+    // the aborted job was still running, so cancelling during a batch of
+    // thumbnail/ffmpeg jobs RAISED peak concurrent work instead of lowering
+    // it — exactly what the cap exists to prevent. Cooperative abort ends
+    // the job promptly on its own.
+    if (!this.active.has(item)) item.resolveSettled();
   }
 
   cancelAll() {
@@ -108,6 +110,7 @@ export class JobManager {
       if (!item) return;
       if (item.controller.signal.aborted) {
         this.inflight.delete(item.id);
+        item.resolveSettled();
         continue;
       }
       this.active.add(item);
@@ -119,6 +122,7 @@ export class JobManager {
           if (this.inflight.get(item.id) === item) {
             this.inflight.delete(item.id);
           }
+          item.resolveSettled();
           this.pump();
         });
     }

@@ -36,3 +36,32 @@ cargo test -p yx-timeline bench -- --ignored --nocapture
 
 Times edit commands, undo snapshots, and IPC serialization at 100/500 clips
 with regression budgets that fail the test on order-of-magnitude regressions.
+
+## Recorded baselines (2026-09-25)
+
+Reference numbers so a future run has something to compare against. All are from
+the debug profile unless stated; re-measure before drawing conclusions, and do
+not run cargo/npm builds in parallel with a benchmark (machine load skews
+presented-frame counts — HEVC once read 56 % under load vs 99 % idle).
+
+| Measurement | Value | How it was taken |
+|---|---|---|
+| Engine edit ops @500 clips | move 0.105 ms, split+undo 0.194 ms, snapshot 0.09 ms | `cargo test -p yx-timeline bench -- --ignored` |
+| IPC payload @500 clips | 272 KB, ~10 ms serialize+deserialize (once per edit) | engine bench |
+| Per-frame covering-set scan (`updateUnderPlayhead`) | 0.029 ms @100 clips → **0.19 ms @3000 clips** (1.1 % of a 60 fps budget) | real helpers from `timeline/types.ts`, driven from Node |
+| `probe_media` | **117.42 ms** per probe (was 231.45 ms), 1 process (was 2) | 20 warm probes |
+| Magic Remove mask shift | **4K 9.71 ms/frame** (was 116.23); u8 plane 0.60 ms (was 58.24) | direct call on the real functions |
+| Frontend edit → paint @500 clips | 18 ms drag, 17.6 ms undo, 18.3 ms zoom, 16.6 ms scroll | `bench.html` (mock IPC) |
+| A/V drift over 60 s | 12.3 ms max | `bench.html` |
+| Presented frames | 4K30 99 %, 4K HEVC 99 %, 1080p60 ~78–92 % | `bench.html`, idle machine |
+
+**These are dev-harness numbers, not a hardware acceptance pass.** 4K / high-bitrate /
+long-duration behaviour on real target machines is still unverified — see
+[docs/QA-MATRIX.md](../docs/QA-MATRIX.md).
+
+## Related suites
+
+The performance work sits alongside correctness suites that also run against real
+media; see the root [README.md](../README.md#test-suites) for the full inventory.
+The audit write-ups are in [docs/QA-REPORT-2026-09-25.md](../docs/QA-REPORT-2026-09-25.md)
+and [docs/QA-REPORT-2026-09-25-SUBSYSTEMS.md](../docs/QA-REPORT-2026-09-25-SUBSYSTEMS.md).

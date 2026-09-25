@@ -42,6 +42,20 @@ pub struct MediaInfo {
     pub audio_codec: Option<String>,
     pub has_audio: bool,
     pub has_video: bool,
+    /// True when the container reports a nominal (`r_frame_rate`) and an
+    /// average (`avg_frame_rate`) video rate that disagree — the standard
+    /// ffprobe signal for variable-frame-rate media. VFR sources cannot be
+    /// indexed by frame number, so anything that maps frames to time must
+    /// use timestamps instead.
+    ///
+    /// `serde(default)`: `MediaInfo` is nested in `ProxyJob` and both derive
+    /// `Deserialize`. Adding a required field here would make any `MediaInfo`
+    /// serialized by an earlier build fail to load. Defaults to `false` (the
+    /// conservative "treat as constant rate" reading), matching the same
+    /// pattern the persisted timeline model uses for every field added after
+    /// the first release.
+    #[serde(default)]
+    pub is_variable_frame_rate: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -745,22 +759,31 @@ pub fn is_image_path(path: &Path) -> bool {
 
 pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
     ensure_ffmpeg()?;
-    let output = command_ffprobe()
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output()?;
+    let mut cmd = command_ffprobe();
+    cmd.args([
+        // `error` (not `quiet`): the failure path below reports
+        // `output.stderr`, and `quiet` guarantees it is empty — every
+        // unreadable/corrupt file produced the useless message
+        // "ffprobe failed: ". Errors only; the happy path prints nothing.
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ])
+    .arg(path);
+    // Bounded: a corrupt container or an unreachable path must surface as an
+    // error the UI can show, not as an import that never completes.
+    let output = run_bounded(&mut cmd, PROBE_TIMEOUT, "ffprobe")?;
 
     if !output.status.success() {
-        return Err(MediaError::ProbeFailed(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(MediaError::ProbeFailed(if detail.is_empty() {
+            format!("ffprobe exited with {}", output.status)
+        } else {
+            detail
+        }));
     }
 
     let raw: FfprobeJson = serde_json::from_slice(&output.stdout)?;
@@ -779,6 +802,7 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
         audio_codec: None,
         has_audio: false,
         has_video: false,
+        is_variable_frame_rate: false,
     };
 
     for stream in raw.streams.unwrap_or_default() {
@@ -788,9 +812,20 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
                 info.width = stream.width.unwrap_or(0);
                 info.height = stream.height.unwrap_or(0);
                 info.video_codec = stream.codec_name;
-                if let Some(rate) = stream.avg_frame_rate.as_deref() {
-                    info.frame_rate = parse_fraction(rate).unwrap_or(30.0);
+                let nominal = stream
+                    .r_frame_rate
+                    .as_deref()
+                    .and_then(parse_fraction)
+                    .filter(|r| *r > 0.0);
+                let average = stream
+                    .avg_frame_rate
+                    .as_deref()
+                    .and_then(parse_fraction)
+                    .filter(|r| *r > 0.0);
+                if let Some(rate) = average.or(nominal) {
+                    info.frame_rate = rate;
                 }
+                info.is_variable_frame_rate = frame_rate_is_variable(nominal, average);
                 if info.duration <= 0.0 {
                     if let Some(d) = stream.duration.as_ref().and_then(|d| d.parse().ok()) {
                         info.duration = d;
@@ -806,6 +841,18 @@ pub fn probe_media(path: &Path) -> Result<MediaInfo, MediaError> {
     }
 
     Ok(info)
+}
+
+/// VFR heuristic: a container is treated as variable-frame-rate when its
+/// nominal and average video rates disagree by more than half a frame per
+/// second. Fractional-rate CFR content (23.976, 29.97, 59.94) reports equal
+/// nominal/average values, so it is not misclassified; a zero or absent rate
+/// carries no signal and is never treated as VFR.
+fn frame_rate_is_variable(nominal: Option<f64>, average: Option<f64>) -> bool {
+    match (nominal, average) {
+        (Some(n), Some(a)) => (n - a).abs() > 0.5,
+        _ => false,
+    }
 }
 
 fn video_scale_chain(
@@ -1096,8 +1143,23 @@ pub fn build_timeline_export_args(
 
     // --- Video: black base + overlays at timeline starts ---
     if v_count > 0 {
+        // The base canvas rate IS the output rate (overlay follows the main
+        // input): a hardcoded 30 silently capped every 60fps export. Honor
+        // the requested fps, else the first real video source's rate ("source
+        // fps" exports), else 30.
+        let base_fps = req
+            .fps
+            .filter(|f| *f > 0.0)
+            .or_else(|| first_video_frame_rate(req))
+            .unwrap_or(30.0)
+            .max(1.0);
+        let fps_str = if (base_fps - base_fps.round()).abs() < 1e-6 {
+            format!("{}", base_fps.round() as i64)
+        } else {
+            format!("{base_fps:.6}")
+        };
         fc.push_str(&format!(
-            "color=c=black:s={w}x{h}:d={total:.6},format=yuv420p,setsar=1,fps=30[vbase];"
+            "color=c=black:s={w}x{h}:d={total:.6},format=yuv420p,setsar=1,fps={fps_str}[vbase];"
         ));
         let mut prev = "vbase".to_string();
         for (i, seg) in req.video.iter().enumerate() {
@@ -1199,6 +1261,24 @@ pub fn build_timeline_export_args(
     Ok(args)
 }
 
+/// Frame rate of the first non-image video segment's source ("source fps"
+/// exports have no explicit rate). Probe failures fall back to `None` so the
+/// caller's default applies; the once-per-export probe cost is negligible
+/// next to the encode itself.
+fn first_video_frame_rate(req: &TimelineExportRequest) -> Option<f64> {
+    let seg = req
+        .video
+        .iter()
+        .find(|s| !s.is_image && s.path.as_os_str().len() > 0)?;
+    let info = probe_media(&seg.path).ok()?;
+    let rate = info.frame_rate;
+    if rate.is_finite() && rate > 0.0 {
+        Some(rate)
+    } else {
+        None
+    }
+}
+
 fn inject_progress_flags(args: &mut Vec<String>) {
     // Before the final output path argument.
     if args.is_empty() {
@@ -1296,7 +1376,7 @@ pub fn export_file(req: &ExportRequest, policy: &PerformancePolicy) -> Result<()
 /// RAII guard that kills the ffmpeg child on drop (same pattern as
 /// magic.rs's FrameReader): error paths and cancellation must never leak a
 /// running encoder process holding the output file open.
-struct KillOnDrop(std::process::Child);
+pub(crate) struct KillOnDrop(std::process::Child);
 impl std::ops::Deref for KillOnDrop {
     type Target = std::process::Child;
     fn deref(&self) -> &std::process::Child {
@@ -1315,6 +1395,18 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// How long ffmpeg may stay completely silent (no `-progress` block) before
+/// it is considered wedged and killed. `-progress pipe:1` normally emits a
+/// block every ~0.5 s of wall time, but the stats callback only runs from the
+/// encode loop, so a single very expensive filter operation on 4K media can
+/// legitimately delay it. The budget is therefore deliberately generous: it
+/// only needs to be shorter than "forever" to turn a hung export from an
+/// unrecoverable app freeze into a reported error.
+const FFMPEG_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often the wait loop wakes to poll the cancel flag while ffmpeg is
+/// quiet. Small enough that a cancel feels instant, large enough to be free.
+const FFMPEG_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 fn run_ffmpeg_progress<F>(
     args: &[String],
     duration_secs: f64,
@@ -1324,10 +1416,32 @@ fn run_ffmpeg_progress<F>(
 where
     F: FnMut(f64),
 {
+    run_ffmpeg_progress_with_stall(args, duration_secs, cancel, FFMPEG_STALL_TIMEOUT, on_progress)
+}
+
+/// `run_ffmpeg_progress` with an explicit silence budget.
+///
+/// Split out so the stall path is testable: exercising it through the default
+/// 120 s budget would make the test suite wait two minutes. Both production
+/// callers go through `run_ffmpeg_progress`, which always passes
+/// `FFMPEG_STALL_TIMEOUT`.
+#[doc(hidden)]
+pub fn run_ffmpeg_progress_with_stall<F>(
+    args: &[String],
+    duration_secs: f64,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    stall_timeout: std::time::Duration,
+    on_progress: &mut F,
+) -> Result<(), MediaError>
+where
+    F: FnMut(f64),
+{
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
+    use std::time::Instant;
 
     // KillOnDrop guard: an early return (read error, cancel) must never leak
     // a running ffmpeg child holding the output file open. The guard is
@@ -1358,30 +1472,91 @@ where
         buf
     });
 
-    let reader = BufReader::new(stdout);
-    let mut last_emit = -1.0_f64;
-    for line in reader.lines().flatten() {
-        if let Some(flag) = cancel {
-            if flag.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(MediaError::Cancelled);
+    // Read ffmpeg's stdout on a dedicated thread and hand lines to this one
+    // over a channel. Blocking directly on the pipe would mean cancel and
+    // stall detection are only evaluated when ffmpeg happens to emit a line —
+    // a wedged encoder emits nothing, so the old loop blocked forever and
+    // `cancel_export` had no effect on it. A read *error* is reported instead
+    // of being flattened into EOF: if the reader stops draining while ffmpeg
+    // keeps writing, the pipe buffer fills and ffmpeg blocks forever, so
+    // `child.wait()` on a silently-truncated stream is a deadlock.
+    let (line_tx, line_rx) = mpsc::channel::<Result<String, String>>();
+    let reader_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let msg = match line {
+                Ok(l) => Ok(l),
+                Err(e) => Err(e.to_string()),
+            };
+            let fatal = msg.is_err();
+            if line_tx.send(msg).is_err() {
+                return;
+            }
+            if fatal {
+                return;
             }
         }
-        if let Some(ms) = line.strip_prefix("out_time_ms=") {
-            if let Ok(v) = ms.trim().parse::<f64>() {
-                if duration_secs > 0.01 {
-                    let pct = (v / 1_000_000.0 / duration_secs).clamp(0.0, 0.99);
-                    if (pct - last_emit).abs() >= 0.005 {
-                        last_emit = pct;
-                        on_progress(pct);
+    });
+
+    let mut last_emit = -1.0_f64;
+    let mut last_activity = Instant::now();
+    loop {
+        let received = line_rx.recv_timeout(FFMPEG_CANCEL_POLL);
+        // Poll cancellation on EVERY iteration — both while ffmpeg is talking
+        // and while it is silent. Checking it only on a timeout would miss a
+        // cancel during a dense burst of progress lines.
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MediaError::Cancelled);
+        }
+        match received {
+            Ok(Ok(line)) => {
+                last_activity = Instant::now();
+                if let Some(ms) = line.strip_prefix("out_time_ms=") {
+                    if let Ok(v) = ms.trim().parse::<f64>() {
+                        if duration_secs > 0.01 {
+                            let pct = (v / 1_000_000.0 / duration_secs).clamp(0.0, 0.99);
+                            if (pct - last_emit).abs() >= 0.005 {
+                                last_emit = pct;
+                                on_progress(pct);
+                            }
+                        }
                     }
+                } else if line.starts_with("progress=end") {
+                    on_progress(1.0);
                 }
             }
-        } else if line.starts_with("progress=end") {
-            on_progress(1.0);
+            Ok(Err(msg)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MediaError::FfmpegFailed(format!(
+                    "ffmpeg stdout read failed: {msg}"
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => break, // clean EOF
+            Err(RecvTimeoutError::Timeout) => {
+                if last_activity.elapsed() >= stall_timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr_text = stderr_handle.join().unwrap_or_default();
+                    let detail = stderr_text.trim();
+                    return Err(MediaError::FfmpegFailed(if detail.is_empty() {
+                        format!(
+                            "ffmpeg produced no output for {}s and was stopped (stalled)",
+                            stall_timeout.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "ffmpeg produced no output for {}s and was stopped (stalled): {detail}",
+                            stall_timeout.as_secs()
+                        )
+                    }));
+                }
+            }
         }
     }
+    drop(reader_handle); // already finished (channel disconnected)
 
     let status = child
         .wait()
@@ -1417,13 +1592,122 @@ fn bitrate_for_height(height: u32) -> String {
     format!("{}k", bitrate_kbps_for_height(height))
 }
 
+/// Deadline for a one-shot ffprobe/ffmpeg invocation whose output is needed
+/// before the caller can continue. Generous on purpose: it only has to be
+/// shorter than "forever" to turn an operation that never finishes into one
+/// that reports why.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Thumbnail extraction is a single-frame decode; anything near this bound
+/// means the media is unreadable rather than slow.
+pub const THUMBNAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Audio-preview render runs the full export effect chain over one clip, so it
+/// is legitimately slow on weak hardware — but it must still terminate.
+pub const AUDIO_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// A stream-copy remux does no encoding; it is bounded by disk speed only.
+pub const REMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run an ffmpeg/ffprobe invocation to completion **with a deadline**.
+///
+/// `Command::output()` waits forever. A wedged decoder, an unreadable path or
+/// a corrupt container therefore hangs the calling thread with no diagnostic —
+/// and every one of these call sites runs on a thread the UI is waiting on
+/// (probe during import, thumbnail generation, audio preview, recording
+/// finalize), so the user sees an operation that never finishes and never
+/// explains itself.
+///
+/// Both pipes are drained on their own threads before waiting: reading them
+/// only after the child exits deadlocks as soon as ffmpeg fills a pipe buffer.
+/// The child is killed on deadline expiry, so this can never leak a process.
+pub fn run_bounded(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output, MediaError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    /// Wait cadence. This is a deadline poll, not a synchronisation delay: it
+    /// bounds how late the kill lands, nothing else.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| MediaError::FfmpegFailed(format!("{what} spawn failed: {e}")))?;
+
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = out_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = err_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Killing the child closes both pipes, so the readers end.
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(MediaError::FfmpegFailed(format!(
+                        "{what} did not finish within {}s and was stopped",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(MediaError::FfmpegFailed(format!("{what} wait failed: {e}")));
+            }
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: out_handle.join().unwrap_or_default(),
+        stderr: err_handle.join().unwrap_or_default(),
+    })
+}
+
+/// Verify the bundled ffmpeg runs. The probe result is cached process-wide
+/// for the SUCCESS case only: every `probe_media` call used to spawn a full
+/// `ffmpeg -version` subprocess (two processes per probe — the common case
+/// during import and export), while a failure must stay uncached so a user
+/// who fixes their install does not have to restart the editor.
 fn ensure_ffmpeg() -> Result<(), MediaError> {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<()> = OnceLock::new();
+    if AVAILABLE.get().is_some() {
+        return Ok(());
+    }
     let ok = command_ffmpeg()
         .args(["-version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if ok {
+        let _ = AVAILABLE.set(());
         Ok(())
     } else {
         Err(MediaError::FfmpegMissing)
@@ -1523,7 +1807,7 @@ mod tests {
             output_path: PathBuf::from("out.mp4"),
             width: 1920,
             height: 1080,
-            fps: None,
+            fps: Some(60.0),
             codec: ExportCodec::H264,
             x264_preset: "fast".into(),
             crf: Some(18),
@@ -1544,6 +1828,48 @@ mod tests {
         assert!(joined.contains("[vout]"));
         assert!(joined.contains("[aout]"));
         assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+        // The base canvas rate IS the output rate: an explicit request wins.
+        assert!(joined.contains("fps=60"), "requested fps must reach the base canvas: {joined}");
+    }
+
+    #[test]
+    fn timeline_export_base_fps_falls_back_to_30_on_probe_failure() {
+        if ensure_ffmpeg().is_err() {
+            return;
+        }
+        // Fake path: the "source fps" probe cannot open it, so the canvas
+        // must land on the historical 30 rather than garbage.
+        let req = TimelineExportRequest {
+            video: vec![ExportSegment {
+                is_image: false,
+                path: PathBuf::from("definitely-missing.mp4"),
+                in_point: 0.0,
+                out_point: 3.0,
+                start: 0.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
+                reverse: false,
+                speed: 1.0,
+                filters: vec![],
+            }],
+            audio: vec![],
+            output_path: PathBuf::from("out.mp4"),
+            width: 1920,
+            height: 1080,
+            fps: None,
+            codec: ExportCodec::H264,
+            x264_preset: "fast".into(),
+            crf: Some(18),
+            video_bitrate: None,
+            audio_bitrate: "192k".into(),
+            fit: ExportFit::Contain,
+            encoder: VideoEncoder::Software,
+            match_source: true,
+        };
+        let args = build_timeline_export_args(&req, &test_policy()).expect("args");
+        let joined = args.join(" ");
+        assert!(joined.contains("fps=30"), "probe failure must fall back to 30: {joined}");
+        assert!(!joined.contains("fps=30.000000"), "fallback keeps the literal 30: {joined}");
     }
 
     #[test]
@@ -1830,6 +2156,38 @@ mod tests {
         let chain = build_audio_effect_chain(&seg);
         assert!(chain.contains("nf=-20"), "{chain}");
     }
+
+    #[test]
+    fn vfr_detection_flags_only_disagreeing_rates() {
+        // CFR, including fractional NTSC rates: nominal == average.
+        assert!(!frame_rate_is_variable(Some(30.0), Some(30.0)));
+        assert!(!frame_rate_is_variable(Some(23.976), Some(23.976)));
+        assert!(!frame_rate_is_variable(Some(29.97), Some(29.97)));
+        assert!(!frame_rate_is_variable(Some(59.94), Some(59.94)));
+        // VFR: the container's nominal rate overstates the delivered average
+        // (the classic phone/screen-recorder signature).
+        assert!(frame_rate_is_variable(Some(30.0), Some(24.5)));
+        assert!(frame_rate_is_variable(Some(60.0), Some(30.0)));
+        // Missing/zero rates carry no signal and must never be called VFR —
+        // a false positive would push CFR media down the timestamp path.
+        assert!(!frame_rate_is_variable(None, Some(30.0)));
+        assert!(!frame_rate_is_variable(Some(30.0), None));
+        assert!(!frame_rate_is_variable(None, None));
+        // Sub-half-fps jitter is measurement noise, not variable rate.
+        assert!(!frame_rate_is_variable(Some(30.0), Some(29.8)));
+    }
+
+    #[test]
+    fn parse_fraction_handles_ffprobe_forms() {
+        assert_eq!(parse_fraction("30/1"), Some(30.0));
+        assert_eq!(parse_fraction("30000/1001"), Some(30000.0 / 1001.0));
+        // ffprobe reports "0/0" for streams with no known rate — a division
+        // must not produce NaN, which would poison every downstream compare.
+        assert_eq!(parse_fraction("0/0"), None);
+        // A bare integer rate (no slash) is still a valid rate.
+        assert_eq!(parse_fraction("25"), Some(25.0));
+        assert_eq!(parse_fraction("garbage"), None);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1850,5 +2208,6 @@ struct FfStream {
     width: Option<u32>,
     height: Option<u32>,
     avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
     duration: Option<String>,
 }

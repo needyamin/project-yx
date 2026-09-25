@@ -14,6 +14,34 @@ import { jobs } from "../jobs/jobManager";
 const cache = new Map<string, string>();
 const failed = new Set<string>();
 
+/**
+ * Upper bound on memoized entries. Keys are per (file, 0.25 s bucket), so one
+ * hour of media produces ~14 400 of them — unbounded, the two collections grew
+ * for the whole session and never shrank (steady memory growth on long
+ * projects). Eviction is safe in both directions: the Rust side keeps the JPEG
+ * in its own on-disk cache, so a dropped URL re-resolves to a cheap disk hit
+ * rather than a re-encode, and a dropped failure mark merely allows a retry
+ * later instead of permanently blacklisting the file.
+ */
+const MAX_ENTRIES = 4000;
+
+function rememberUrl(key: string, value: string) {
+  cache.set(key, value);
+  if (cache.size > MAX_ENTRIES) {
+    // Map preserves insertion order — the first key is the oldest.
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+}
+
+function rememberFailure(key: string) {
+  failed.add(key);
+  if (failed.size > MAX_ENTRIES) {
+    const oldest = failed.values().next().value;
+    if (oldest !== undefined) failed.delete(oldest);
+  }
+}
+
 const bucket = (time: number) => Math.max(0, Math.round(time * 4) / 4);
 
 export function cacheKey(mediaPath: string, time: number): string {
@@ -60,11 +88,11 @@ export function requestThumbnail(
       } catch {
         return;
       }
-      cache.set(key, src);
+      rememberUrl(key, src);
       onReady(src);
     } catch (e) {
       // Missing/corrupt media: stop retry storms, leave the clip clean.
-      failed.add(key);
+      rememberFailure(key);
       throw e;
     }
   });
@@ -78,5 +106,5 @@ export function requestThumbnail(
 }
 
 export function markThumbnailFailed(mediaPath: string, time: number) {
-  failed.add(cacheKey(mediaPath, time));
+  rememberFailure(cacheKey(mediaPath, time));
 }

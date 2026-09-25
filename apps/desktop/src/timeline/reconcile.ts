@@ -16,6 +16,43 @@ import type { Clip, Timeline } from "./types";
  * pass. Cost is O(total clips) with small constants per edit.
  */
 
+/**
+ * Every `Clip` field `clipEqual` inspects. The comparison decides whether a
+ * clip's previous object reference may be reused for the fresh IPC payload,
+ * so a field that changes real content but is NOT compared here would be
+ * treated as "unchanged" — `reconcileTimeline` would hand back the stale
+ * object and the memoized ClipBlock would keep painting the old value.
+ *
+ * The assertions below make that a build failure instead of a silent UI bug:
+ * add a field to `Clip` and TypeScript rejects this file until the comparison
+ * (and this list) are updated too. Costs nothing at runtime.
+ */
+type ComparedClipKeys =
+  | "id"
+  | "media_path"
+  | "source_path"
+  | "start"
+  | "in_point"
+  | "out_point"
+  | "role"
+  | "linked_clip_id"
+  | "fade_in"
+  | "fade_out"
+  | "reverse"
+  | "speed"
+  | "filters";
+
+type UncomparedClipKeys = Exclude<keyof Clip, ComparedClipKeys>;
+
+/** `true` only while `ComparedClipKeys` covers every key of `Clip`. */
+export type ClipComparisonIsExhaustive = [UncomparedClipKeys] extends [never]
+  ? true
+  : { uncompared_clip_fields: UncomparedClipKeys };
+
+/** The assertion itself: assigning `true` fails to compile the moment a new
+ * `Clip` field is not covered above. Exported so it is not dead code. */
+export const CLIP_COMPARISON_IS_EXHAUSTIVE: ClipComparisonIsExhaustive = true;
+
 function normParams(p: unknown): Record<string, unknown> {
   return (p ?? {}) as Record<string, unknown>;
 }

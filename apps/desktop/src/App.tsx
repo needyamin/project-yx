@@ -87,6 +87,42 @@ function clipSpeed(clip: { speed?: number }): number {
   return Number.isFinite(raw) ? Math.min(4, Math.max(0.25, raw)) : 1;
 }
 
+/** Combined media-element rate for a clip's audio preview: clip speed ×
+ * pitch-filter preview rate. Export applies the same total tempo (atempo for
+ * speed, asetrate+atempo for pitch), so the element must run at the product
+ * or any speed ≠ 1 clip desyncs its own audio. */
+function audioPreviewRate(clip: { speed?: number; filters?: FilterInstance[] }): number {
+  const pitch = previewPitchRate((clip.filters ?? []) as FilterInstance[]);
+  return clipSpeed(clip) * Math.max(0.5, Math.min(2, pitch));
+}
+
+/** Set a media element's playbackRate only when it actually differs. */
+function setMediaRate(el: HTMLMediaElement, rate: number): void {
+  const r = Math.max(0.0625, Math.min(16, rate));
+  if (Math.abs(el.playbackRate - r) > 0.001) el.playbackRate = r;
+}
+
+/** Latched rate for elements whose source can swap under them. The media
+ * load algorithm resets playbackRate from defaultPlaybackRate on every
+ * load()/src change, and defaultPlaybackRate was never maintained - so a
+ * speed != 1 clip silently dropped back to 1x at every source swap: the
+ * element rolled at 1x while advance() divided its media clock by speed
+ * (playhead crawled/"stuck"), and the audio drift lock, comparing against
+ * that wrong clock, seek-stormed the A-track on every presented frame.
+ * Transient overrides (shuttle L) deliberately keep writing the raw
+ * playbackRate property and must NOT latch. */
+function setElementRate(el: HTMLMediaElement, rate: number): void {
+  const r = Math.max(0.0625, Math.min(16, rate));
+  if (Math.abs(el.defaultPlaybackRate - r) > 0.001) el.defaultPlaybackRate = r;
+  if (Math.abs(el.playbackRate - r) > 0.001) el.playbackRate = r;
+}
+
+/** Preview rate for the main video element: 1x for reverse (stepped), the
+ * clip speed otherwise. Keeps every rate site on one definition. */
+function clipVideoRate(clip: { reverse?: boolean; speed?: number }): number {
+  return clip.reverse ? 1 : clipSpeed(clip);
+}
+
 const MEDIA_EXTENSIONS = [
   "mp4",
   "mov",
@@ -180,6 +216,9 @@ function App() {
   const playheadRef = useRef(0);
   const playingRef = useRef(false);
   const reverseRafRef = useRef(0);
+  /** Shuttle (L) deliberately overrides the element rate for a transient
+   * fast pass; while set, advance()'s rate self-heal must not "repair" it. */
+  const shuttleRateRef = useRef(false);
   const movePlayheadRef = useRef<((t: number) => void) | null>(null);
   const previewModeRef = useRef<PreviewMode>("empty");
   const videoUnderRef = useRef<UnderPlayhead | null>(null);
@@ -645,10 +684,12 @@ function App() {
         audio2.src = wantAudio2Src;
         audio2.load();
       }
+      setMediaRate(audio2, audioPreviewRate(hit.clip));
       const want = Math.max(
         hit.clip.in_point,
         Math.min(
-          hit.clip.in_point + (playheadRef.current - hit.clip.start),
+          hit.clip.in_point +
+            (playheadRef.current - hit.clip.start) * clipSpeed(hit.clip),
           hit.clip.out_point - 0.01,
         ),
       );
@@ -666,9 +707,14 @@ function App() {
       const audioHit = audioUnderRef.current;
       if (!audio || !audioHit || !wantAudioSrc) return;
       const t = playheadRef.current;
+      setMediaRate(audio, audioPreviewRate(audioHit.clip));
       audio.currentTime = Math.max(
         audioHit.clip.in_point,
-        Math.min(audioHit.clip.in_point + (t - audioHit.clip.start), audioHit.clip.out_point - 0.01),
+        Math.min(
+          audioHit.clip.in_point +
+            (t - audioHit.clip.start) * clipSpeed(audioHit.clip),
+          audioHit.clip.out_point - 0.01,
+        ),
       );
     };
 
@@ -701,6 +747,10 @@ function App() {
           const target = previewTarget(hit.clip);
           video.currentTime =
             mediaTimeForClip(hit.clip, ph) - (target.path === previewPath ? target.shift : 0);
+          // Re-latch the rate: the media load algorithm resets playbackRate
+          // from defaultPlaybackRate on every src swap, and this handler can
+          // play() before ensureVideoPlaying repairs it (the two race).
+          setElementRate(video, clipVideoRate(hit.clip));
         }
         syncAudioLocal();
         syncAudio2();
@@ -736,6 +786,9 @@ function App() {
           if (Math.abs(video.currentTime - want) > 0.05) {
             video.currentTime = want;
           }
+          // Mirror onMeta: this branch runs on many timeline edits without
+          // touching the src, so the rate must be re-latched here too.
+          setElementRate(video, clipVideoRate(hit.clip));
         }
         if (shouldResume && video.paused) {
           void video
@@ -881,8 +934,16 @@ function App() {
     let lastWall = performance.now();
 
     /** Shared per-frame advance: map a media-file time to the timeline,
-     * keep A-track/overdub audio locked, and handle cuts / gaps / end. */
-    const advance = (mode: "video" | "audio", active: HTMLMediaElement, mediaTime: number) => {
+     * keep A-track/overdub audio locked, and handle cuts / gaps / end.
+     * `fromFrameClock` marks calls driven by a live presented-frame chain —
+     * audio drift correction is skipped for stale-clock fallback calls so a
+     * stalled video never yanks the (steadily playing) audio backwards. */
+    const advance = (
+      mode: "video" | "audio",
+      active: HTMLMediaElement,
+      mediaTime: number,
+      fromFrameClock: boolean,
+    ) => {
       const tl = timelineRef.current;
       // The covering clip is maintained by commitPlayhead's boundary
       // detection — no per-frame timeline scan needed here.
@@ -905,40 +966,83 @@ function App() {
       const shift =
         elSrc && convertFileSrcSafe(target.path) === elSrc ? target.shift : 0;
       const srcMedia = mediaTime + shift;
-      const reversed = mode === "video" && !!hit.clip.reverse;
-      const localMedia = reversed
-        ? hit.clip.out_point - srcMedia
-        : srcMedia - hit.clip.in_point;
+      // A content-reversed clip is owned by the stepped loop: the forward
+      // media clock must never drive it (the reverse mapping would walk the
+      // playhead backwards, or skip the clip and end playback).
+      if (mode === "video" && hit.clip.reverse) {
+        if (!reverseRafRef.current) startReverseStepper(hit.clip, shift);
+        return;
+      }
+      // Content-reversed VIDEO clips never reach here - they are handed to
+      // startReverseStepper above, so only the forward mapping applies.
+      const localMedia = srcMedia - hit.clip.in_point;
       const timelineTime = hit.clip.start + localMedia / speed;
       commitPlayhead(Math.max(hit.clip.start, timelineTime), false);
 
       // Keep A-track audio locked to the video clock (and the overdub layer
       // in every mode — the same timeline-time → media-time mapping applies).
+      // The element must RUN at the clip's speed × pitch rate and the
+      // correction target is a MEDIA time (timeline elapsed × speed) — the
+      // old formula omitted the speed factor, so speed ≠ 1 clips played their
+      // audio at the wrong rate while the drift check compared against the
+      // same wrong target and never fired.
       const audio = audioRef.current;
       const audioHit = audioUnderRef.current;
       // Overdub layer (voiceover on another track) follows the same clock.
       const audio2 = audio2Ref.current;
       const audioHit2 = audioUnder2Ref.current;
+      // In audio mode the element IS the clock (always fresh); in video mode
+      // only correct against a live presented-frame chain. Additionally the
+      // VIDEO element must actually run at the clip's speed before its clock
+      // may steer audio: right after a source swap the element briefly holds
+      // 1x while advance() still divides by speed, and correcting the A-track
+      // against that wrong clock seek-stormed it on every frame.
+      // Repair a stale element rate instead of only muting the lock below. A
+      // speed edit while playing changes no load-effect dependency, so nothing
+      // else re-latches it: pre-patch that state produced a per-frame audio
+      // seek storm, and muting alone would let audio drift unbounded instead.
+      // Shuttle (L) overrides the rate on purpose - never fight it.
+      if (
+        mode === "video" &&
+        Math.abs(active.playbackRate - speed) > 0.02 &&
+        !shuttleRateRef.current
+      ) {
+        setElementRate(active, clipVideoRate(hit.clip));
+      }
+      const videoRateOk =
+        mode !== "video" || Math.abs(active.playbackRate - speed) < 0.02;
+      const correctAudio = (mode === "audio" || fromFrameClock) && videoRateOk;
       if (audio2 && audioHit2) {
-        const want2 = audioHit2.clip.in_point + (timelineTime - audioHit2.clip.start);
+        const speed2 = clipSpeed(audioHit2.clip);
+        const want2 =
+          audioHit2.clip.in_point +
+          (timelineTime - audioHit2.clip.start) * speed2;
         const clamped2 = Math.max(
           audioHit2.clip.in_point,
           Math.min(want2, audioHit2.clip.out_point - 0.01),
         );
         if (audio2.getAttribute("src")) {
+          setMediaRate(audio2, audioPreviewRate(audioHit2.clip));
           if (audio2.paused) {
             if (playingRef.current) void audio2.play().catch(() => undefined);
-          } else if (Math.abs(audio2.currentTime - clamped2) > 0.12) {
+          } else if (
+            correctAudio &&
+            Math.abs(audio2.currentTime - clamped2) > 0.12
+          ) {
             audio2.currentTime = clamped2;
           }
         }
       }
       if (audio && audioHit && !audio.paused) {
-        const pitchRate = previewPitchRate(
-          (audioHit.clip.filters ?? []) as FilterInstance[],
-        );
-        if (Math.abs(pitchRate - 1) < 0.02) {
-          const want = audioHit.clip.in_point + (timelineTime - audioHit.clip.start);
+        const speed = clipSpeed(audioHit.clip);
+        const rate = audioPreviewRate(audioHit.clip);
+        setMediaRate(audio, rate);
+        // With a pitch filter the element time is NOT source media time
+        // (rate ≠ 1 shifts it) — drift correction only makes sense at pure
+        // speed, matching the old pitch-preview exemption.
+        if (correctAudio && Math.abs(rate - speed) < 0.02) {
+          const want =
+            audioHit.clip.in_point + (timelineTime - audioHit.clip.start) * speed;
           if (Math.abs(audio.currentTime - want) > 0.12) {
             audio.currentTime = Math.max(
               audioHit.clip.in_point,
@@ -975,11 +1079,24 @@ function App() {
           const isContinuousMedia =
             Math.abs(hit.clip.out_point - next.clip.in_point) < 0.05;
 
-          if (isSameMedia && isContiguousTimeline && isContinuousMedia) {
+          // A content-reversed neighbour is never "seamless": it needs the
+          // stepped loop, not the rolling element (invariant: reverse clips
+          // are stepper-owned - see startReverseStepper).
+          if (
+            isSameMedia &&
+            isContiguousTimeline &&
+            isContinuousMedia &&
+            !next.clip.reverse
+          ) {
             // Seamless continuous playback across the split point: the source
             // file is continuous, so the element keeps rolling. Commit the
             // mapped position — never jump the playhead backwards to the
             // boundary, which stuttered at every split.
+            // The element keeps rolling across the split, so its rate must be
+            // re-latched when the neighbour has a different speed (this branch
+            // never touched it: the whole next clip ran at the previous rate
+            // while advance() mapped with the new speed).
+            if (mode === "video") setElementRate(active, clipVideoRate(next.clip));
             if (active.ended) {
               // The file ended exactly at the boundary: restart into the
               // next clip's source range.
@@ -992,8 +1109,9 @@ function App() {
             }
             commitPlayhead(Math.max(next.clip.start, timelineTime), false);
             return;
-          } else if (isSameMedia && isContiguousTimeline) {
+          } else if (isSameMedia && isContiguousTimeline && !next.clip.reverse) {
             // Same media, in_point jumped: seek within the loaded file.
+            if (mode === "video") setElementRate(active, clipVideoRate(next.clip));
             try {
               active.currentTime = next.clip.in_point - nextTarget.shift;
             } catch {
@@ -1086,7 +1204,7 @@ function App() {
         !video.ended
       ) {
         if (performance.now() - lastFrameClockCommit >= 100) {
-          advance("video", video, video.currentTime);
+          advance("video", video, video.currentTime, false);
         }
         return;
       }
@@ -1101,7 +1219,7 @@ function App() {
         !audio.ended &&
         audio.getAttribute("src")
       ) {
-        advance("audio", audio, audio.currentTime);
+        advance("audio", audio, audio.currentTime, true);
         return;
       }
 
@@ -1147,7 +1265,7 @@ function App() {
         if (stopped || !playingRef.current || my !== chainId) return;
         if (previewModeRef.current === "video" && !v.paused) {
           lastFrameClockCommit = performance.now();
-          advance("video", v, meta.mediaTime);
+          advance("video", v, meta.mediaTime, true);
         }
         v.requestVideoFrameCallback(step);
       };
@@ -2120,11 +2238,7 @@ function App() {
       } catch {
         /* metadata not ready */
       }
-      try {
-        video.playbackRate = clip.reverse ? 1 : clipSpeed(clip);
-      } catch {
-        /* ignore */
-      }
+      setElementRate(video, clipVideoRate(clip));
       if (playingRef.current && video.paused) {
         void video
           .play()
@@ -2163,10 +2277,11 @@ function App() {
           el.src = src;
           el.load();
         }
+        setMediaRate(el, audioPreviewRate(hit.clip));
         const want = Math.max(
           hit.clip.in_point,
           Math.min(
-            hit.clip.in_point + (t - hit.clip.start),
+            hit.clip.in_point + (t - hit.clip.start) * clipSpeed(hit.clip),
             hit.clip.out_point - 0.01,
           ),
         );
@@ -2401,6 +2516,9 @@ function App() {
       if (playingRef.current) {
         if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
         if (audioRef.current && !audioRef.current.paused) audioRef.current.pause();
+        // See pauseForRegionTool: release the reverse chain or the loop stalls.
+        cancelAnimationFrame(reverseRafRef.current);
+        reverseRafRef.current = 0;
         playingRef.current = false;
         setPlaying(false);
       }
@@ -2594,6 +2712,11 @@ function App() {
     if (playingRef.current) {
       if (videoRef.current && !videoRef.current.paused) videoRef.current.pause();
       if (audioRef.current && !audioRef.current.paused) audioRef.current.pause();
+      // Release the reverse stepper's rAF chain: a non-zero reverseRafRef
+      // makes the ONE playback loop bail forever, so the playhead would stay
+      // frozen when playback resumes (the picture would still roll).
+      cancelAnimationFrame(reverseRafRef.current);
+      reverseRafRef.current = 0;
       playingRef.current = false;
       setPlaying(false);
     }
@@ -3006,13 +3129,21 @@ function App() {
     if (next) setTimeline(normalizeTimeline(next));
   }
 
+  /** Retime a clip.
+   *
+   * The engine treats this as a DURATION edit, not a property write: the space
+   * the clip frees or consumes is resolved by the project's edit mode (absolute
+   * positions keep neighbours put, Insert ripples them, Overwrite consumes
+   * them), and the linked A/V partner is retimed with it — a pair whose halves
+   * run at different rates is desynchronised by definition.
+   *
+   * A conflict (slowing a clip into its neighbour while in absolute-position
+   * mode) comes back as an error and is surfaced in the status bar rather than
+   * silently overlapping the neighbour. */
   async function setClipSpeed(clipId: string, speed: number) {
     const next = await engineEdit<Timeline>(
       "set_clip_speed",
-      {
-        clipId,
-        speed,
-      },
+      { clipId, speed, syncLinked: true },
       { onError: (e) => setStatus(String(e)) },
     );
     if (next) setTimeline(normalizeTimeline(next));
@@ -4092,9 +4223,82 @@ function App() {
     [],
   );
 
+  /** Stepped reverse playback of a content-reversed clip: the timeline
+   * advances forward at 1x while the media is seek-stepped BACKWARD (HTML5
+   * media cannot play backwards). Owns reverseRafRef until the clip ends.
+   *
+   * Extracted from togglePlay so every entry point uses the same loop - a
+   * reverse clip reached by a boundary crossing (or by toggling Reverse on
+   * the clip that is playing) must be stepped, never rolled forward: the
+   * forward clock would walk the playhead backwards or skip the clip and
+   * end the session.
+   *
+   * Seeks are bounded: skipped while one is already in flight (the previous
+   * unconditional per-rAF write restarted the decoder's seek every frame, so
+   * the picture advanced at the seek rate, ~7-15 fps), gated by half a
+   * visible step, and re-issued if a seek wedges for >600 ms. */
+  function startReverseStepper(clip: Clip, shift: number) {
+    const video = videoRef.current;
+    if (!video) return;
+    cancelAnimationFrame(reverseRafRef.current);
+    const audio = audioRef.current;
+    const wall0 = performance.now();
+    const ph0 = playheadRef.current;
+    const speed = clipSpeed(clip);
+    // Half a project frame is the smallest visible step; the frame rate comes
+    // from the timeline, never a hardcoded 30. The picture delta is in MEDIA
+    // seconds, so the threshold scales with the clip speed.
+    const seekEps = (1 / (timelineRef.current?.frame_rate || 30)) * 0.5 * speed;
+    let lastSeekAt = 0;
+    const step = () => {
+      if (!playingRef.current) return;
+      const elapsed = (performance.now() - wall0) / 1000;
+      const nextPh = ph0 + elapsed;
+      const end = clip.start + clipTimelineDuration(clip);
+      if (nextPh >= end - 0.02) {
+        commitPlayhead(end, true);
+        // Land on the committed boundary frame: without this the monitor can
+        // stay on the last COMPLETED seek instead of the clip's last frame.
+        try {
+          if (!video.seeking) video.currentTime = mediaTimeForClip(clip, end) - shift;
+        } catch {
+          /* metadata not ready */
+        }
+        cancelAnimationFrame(reverseRafRef.current);
+        reverseRafRef.current = 0;
+        playingRef.current = false;
+        setPlaying(false);
+        audio?.pause();
+        return;
+      }
+      commitPlayhead(nextPh, false);
+      const want = mediaTimeForClip(clip, nextPh) - shift;
+      const now = performance.now();
+      if ((!video.seeking || now - lastSeekAt > 600) && Math.abs(video.currentTime - want) >= seekEps) {
+        lastSeekAt = now;
+        try {
+          video.currentTime = want;
+        } catch {
+          /* metadata not ready */
+        }
+      }
+      applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
+      reverseRafRef.current = requestAnimationFrame(step);
+    };
+    // Ordering matters (invariant 4): playingRef must be true BEFORE the
+    // deliberate element pause, or the pause event stops the session.
+    playingRef.current = true;
+    setPlaying(true);
+    video.pause();
+    if (audio && audio.paused && audio.getAttribute("src")) {
+      void audio.play().catch(() => undefined);
+    }
+    reverseRafRef.current = requestAnimationFrame(step);
+  }
   function togglePlay() {
     const video = videoRef.current;
     const audio = audioRef.current;
+    shuttleRateRef.current = false;
 
     const stopPlayback = () => {
       cancelAnimationFrame(reverseRafRef.current);
@@ -4141,43 +4345,13 @@ function App() {
       const needsStepped = !!hit.clip.reverse;
 
       if (needsStepped) {
-        const clip = hit.clip;
-        const shift = target.shift;
-        const wall0 = performance.now();
-        const ph0 = playheadRef.current;
-        const step = () => {
-          if (!playingRef.current) return;
-          const elapsed = (performance.now() - wall0) / 1000;
-          const nextPh = ph0 + elapsed;
-          const end = clip.start + clipTimelineDuration(clip);
-          if (nextPh >= end - 0.02) {
-            commitPlayhead(end, true);
-            cancelAnimationFrame(reverseRafRef.current);
-            reverseRafRef.current = 0;
-            playingRef.current = false;
-            setPlaying(false);
-            audio?.pause();
-            return;
-          }
-          commitPlayhead(nextPh, false);
-          video.currentTime = mediaTimeForClip(clip, nextPh) - shift;
-          applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
-          reverseRafRef.current = requestAnimationFrame(step);
-        };
-        playingRef.current = true;
-        setPlaying(true);
-        video.pause();
-        if (timelineAudioSrc && audio) void audio.play().catch(() => undefined);
-        reverseRafRef.current = requestAnimationFrame(step);
+        // Reversed content is stepped, never rolled (see startReverseStepper).
+        startReverseStepper(hit.clip, target.shift);
         return;
       }
 
-      const speed = clipSpeed(hit.clip);
-      try {
-        video.playbackRate = speed;
-      } catch {
-        /* ignore */
-      }
+      // Latched: a later src swap on this element restores the same rate.
+      setElementRate(video, clipVideoRate(hit.clip));
       void video.play().catch(() => undefined);
       playingRef.current = true;
       setPlaying(true);
@@ -4193,7 +4367,8 @@ function App() {
         const want = Math.max(
           audioHit2.clip.in_point,
           Math.min(
-            audioHit2.clip.in_point + (playheadRef.current - audioHit2.clip.start),
+            audioHit2.clip.in_point +
+              (playheadRef.current - audioHit2.clip.start) * clipSpeed(audioHit2.clip),
             audioHit2.clip.out_point - 0.01,
           ),
         );
@@ -4238,20 +4413,9 @@ function App() {
     videoRef.current?.pause();
     audioRef.current?.pause();
     audio2Ref.current?.pause();
-    if (videoRef.current) {
-      try {
-        videoRef.current.playbackRate = 1;
-      } catch {
-        /* ignore */
-      }
-    }
-    if (audioRef.current) {
-      try {
-        audioRef.current.playbackRate = 1;
-      } catch {
-        /* ignore */
-      }
-    }
+    shuttleRateRef.current = false;
+    if (videoRef.current) setElementRate(videoRef.current, 1);
+    if (audioRef.current) setElementRate(audioRef.current, 1);
   }
 
   /** Clear every clip from every track (engine command; one undo step).
@@ -4328,18 +4492,36 @@ function App() {
     audio2Ref.current?.pause();
     const wall0 = performance.now();
     const ph0 = ph;
+    // Media-second threshold (see startReverseStepper): the visible step is in
+    // media time, so it scales with the clip speed.
+    const seekEps = (1 / (timelineRef.current?.frame_rate || 30)) * 0.5 * clipSpeed(clip);
+    let lastSeekAt = 0;
     const step = () => {
       if (!playingRef.current) return;
       const elapsed = (performance.now() - wall0) / 1000;
       const nextPh = Math.max(clip.start, ph0 - elapsed);
       commitPlayhead(nextPh, false);
-      try {
-        video.currentTime = mediaTimeForClip(clip, nextPh) - target.shift;
-      } catch {
-        /* ignore */
+      // Same stepped-seek policy as startReverseStepper: never queue a seek on
+      // top of an in-flight one, ignore sub-half-frame nudges, and re-issue if
+      // a seek wedges (otherwise the granted guard freezes the picture).
+      const want = mediaTimeForClip(clip, nextPh) - target.shift;
+      const now = performance.now();
+      if ((!video.seeking || now - lastSeekAt > 600) && Math.abs(video.currentTime - want) >= seekEps) {
+        lastSeekAt = now;
+        try {
+          video.currentTime = want;
+        } catch {
+          /* ignore */
+        }
       }
       applyPreviewFades(nextPh, clip, audioUnderRef.current?.clip ?? null);
       if (nextPh <= clip.start + 0.02) {
+        // Land on the boundary frame (the last completed seek may be stale).
+        try {
+          if (!video.seeking) video.currentTime = mediaTimeForClip(clip, clip.start) - target.shift;
+        } catch {
+          /* ignore */
+        }
         reverseRafRef.current = 0;
         stopPlayback();
         return;
@@ -4359,6 +4541,9 @@ function App() {
     const next = Math.min(4, (video?.playbackRate ?? 1) * 2);
     try {
       if (video) video.playbackRate = next;
+      // Transient override: keep writing the raw property (never latch) and
+      // tell advance()'s rate self-heal to leave it alone.
+      shuttleRateRef.current = true;
     } catch {
       /* ignore */
     }
@@ -4374,6 +4559,7 @@ function App() {
   const seekTimeline = useCallback(
     (t: number, immediate = true) => {
       const next = Math.max(0, t);
+      shuttleRateRef.current = false;
       commitPlayhead(next, immediate);
       const tl = timelineRef.current;
       const videoHit = tl ? clipAtPlayhead(tl, next, "video") : null;
@@ -4392,11 +4578,7 @@ function App() {
         } catch {
           /* ignore */
         }
-        try {
-          video.playbackRate = videoHit.clip.reverse ? 1 : clipSpeed(videoHit.clip);
-        } catch {
-          /* ignore */
-        }
+        setElementRate(video, clipVideoRate(videoHit.clip));
       } else if (videoRef.current && !videoRef.current.paused) {
         videoRef.current.pause();
       }
@@ -4408,7 +4590,10 @@ function App() {
           audio.load();
         }
         try {
-          audio.currentTime = audioHit.clip.in_point + (next - audioHit.clip.start);
+          setMediaRate(audio, audioPreviewRate(audioHit.clip));
+          audio.currentTime =
+            audioHit.clip.in_point +
+            (next - audioHit.clip.start) * clipSpeed(audioHit.clip);
         } catch {
           /* ignore */
         }
@@ -4427,7 +4612,8 @@ function App() {
           const want = Math.max(
             audioHit2.clip.in_point,
             Math.min(
-              audioHit2.clip.in_point + (next - audioHit2.clip.start),
+              audioHit2.clip.in_point +
+                (next - audioHit2.clip.start) * clipSpeed(audioHit2.clip),
               audioHit2.clip.out_point - 0.01,
             ),
           );
@@ -4462,11 +4648,9 @@ function App() {
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    const filters = (audioUnderPlayhead?.clip.filters ?? []) as FilterInstance[];
-    const rate = Math.max(0.5, Math.min(2, previewPitchRate(filters)));
-    if (Math.abs(audio.playbackRate - rate) > 0.001) {
-      audio.playbackRate = rate;
-    }
+    // Rate = clip speed × pitch preview (matches the playback loop's owner).
+    const rate = audioUnderPlayhead ? audioPreviewRate(audioUnderPlayhead.clip) : 1;
+    setMediaRate(audio, rate);
   }, [monitorPitchKey, audioUnderPlayhead]);
 
   // Keep monitor opacity / volume in sync with playhead fades: driven by the
@@ -4511,19 +4695,19 @@ function App() {
       } catch {
         /* ignore */
       }
-      try {
-        video.playbackRate = vHit.clip.reverse ? 1 : clipSpeed(vHit.clip);
-      } catch {
-        /* ignore */
-      }
+      setElementRate(video, clipVideoRate(vHit.clip));
     } else if (!vHit && video && !video.paused) {
       video.pause();
     }
 
     if (aHit && audio) {
+      setMediaRate(audio, audioPreviewRate(aHit.clip));
       const wantA = Math.max(
         aHit.clip.in_point,
-        Math.min(aHit.clip.in_point + (ph - aHit.clip.start), aHit.clip.out_point - 0.01),
+        Math.min(
+          aHit.clip.in_point + (ph - aHit.clip.start) * clipSpeed(aHit.clip),
+          aHit.clip.out_point - 0.01,
+        ),
       );
       try {
         if (Math.abs(audio.currentTime - wantA) > 0.05) {

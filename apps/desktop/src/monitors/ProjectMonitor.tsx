@@ -9,7 +9,7 @@ import {
   type FilterInstance,
 } from "../effects/effects";
 import { subscribeBinDrag } from "../bin/binDrag";
-import { usePlayheadTime } from "../playback/playbackClock";
+import { playbackClock, usePlayheadTime } from "../playback/playbackClock";
 import { TextPresetPicker, type TextPresetParams } from "./TextPresets";
 import { ImagePicker, type MonitorImageItem } from "./ImagePicker";
 import { MagicRemoveOverlay } from "./MagicRemove";
@@ -2296,10 +2296,12 @@ const MonitorTransportTime = memo(function MonitorTransportTime({
  * Video layers play in sync with the main clock (muted — their audio lives
  * on the linked audio track); images are static. Per-clip filters, fades
  * and transform are applied exactly like the export composites them.
- * The playhead arrives via the playback clock subscription: this tiny
- * component updates at the clock's throttled rate while its parent stays
- * stable during playback. Memoized: monitor-only re-renders (drags) skip
- * layer reconciliation. */
+ * The component does NOT subscribe to React playhead state: stacked layers
+ * re-rendering at the clock's 20 Hz rate multiplied against N+1 parallel
+ * video decodes and janked the whole window (timeline included). Fades and
+ * drift corrections are imperative DOM writes / bounded-interval seeks, so
+ * playback re-renders nothing here. Memoized: monitor-only re-renders
+ * (drags) skip layer reconciliation. */
 const MonitorLayer = memo(function MonitorLayer({
   layer,
   playing,
@@ -2312,41 +2314,96 @@ const MonitorLayer = memo(function MonitorLayer({
   onMediaSize: (clipId: string, w: number, h: number) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const playhead = usePlayheadTime();
+  // NO usePlayheadTime() subscription here. Every stacked layer re-rendering
+  // (and re-running its sync effect) at the clock's 20 Hz rate was the
+  // decode/commit storm behind the "timeline lags when one clip goes under
+  // another" report: the extra re-renders competed with N+1 parallel video
+  // decodes on the same UI thread. Fades/dissolve instead follow the
+  // project pattern for playhead-driven styles: imperative DOM writes from
+  // a clock subscription (see movePlayheadLine in TimelinePanel).
   const { clip, src, isImage } = layer;
 
-  const style = useMemo(() => {
-    const s = previewVideoStyle(
-      (clip.filters ?? []) as FilterInstance[],
-      clipFadeGain(clip, playhead),
-    );
-    // Cross-dissolve fade-in for overlay layers — matches the export's
-    // alpha fade on the incoming segment.
-    const tr = (clip.filters ?? []).find((f) => f.kind === "transition" && f.enabled);
-    if (tr) {
-      const p = (tr.params ?? {}) as Record<string, unknown>;
-      const d = typeof p.duration === "number" && Number.isFinite(p.duration) ? p.duration : 0.5;
-      const local = playhead - clip.start;
-      if (local < d) s.opacity *= Math.max(0.04, local / d);
-    }
-    return s;
-  }, [clip, playhead]);
+  // Static per-clip style: filters, transform, object-view-box. NO fade gain
+  // here - fades are applied imperatively so playback never re-renders React.
+  const staticStyle = useMemo(
+    () =>
+      previewVideoStyle(
+        (clip.filters ?? []) as FilterInstance[],
+        1,
+      ),
+    [clip],
+  );
 
-  // Seek to the right frame the moment ANY load stage reports readiness —
+  /** Live fade/dissolve opacity for timeline time t (WYSIWYG with export).
+   * Cheap on purpose: fade gain x transform opacity x transition alpha only.
+   * The per-tick subscription must not rebuild CSS filter strings (that is
+   * staticStyle's job), or playback allocates per layer per publish. */
+  const layerOpacity = useCallback(
+    (t: number): number => {
+      let o = clipFadeGain(clip, t);
+      for (const f of clip.filters ?? []) {
+        if (!f.enabled) continue;
+        if (f.kind === "transform") {
+          const p = (f.params ?? {}) as Record<string, unknown>;
+          const v = p.opacity;
+          if (typeof v === "number" && Number.isFinite(v)) o *= Math.max(0, v);
+        } else if (f.kind === "transition") {
+          const p = (f.params ?? {}) as Record<string, unknown>;
+          const d = typeof p.duration === "number" && Number.isFinite(p.duration) ? p.duration : 0.5;
+          const local = t - clip.start;
+          if (local < d) o *= Math.max(0.04, local / d);
+        }
+      }
+      return o;
+    },
+    [clip],
+  );
+
+  const videoElRef = useRef<HTMLVideoElement | null>(null);
+  const imgElRef = useRef<HTMLImageElement | null>(null);
+
+  // Imperative fade updates: subscribe to the clock and write opacity
+  // directly on the layer element (~us per publish, zero React work).
+  // The subscription is tiny and the write is skipped when the value did
+  // not change, so idle stretches cost nothing.
+  const lastOpacityRef = useRef(-1);
+  /** Last published clock value: lets the follow subscription detect a
+   * BACKWARD pass (J reverse) with no new App-level state or prop. */
+  const lastClockRef = useRef(playbackClock.get());
+  useEffect(() => {
+    const el = () => videoElRef.current ?? imgElRef.current;
+    const apply = (t: number) => {
+      const node = el();
+      if (!node) return;
+      const o = layerOpacity(t);
+      if (Math.abs(o - lastOpacityRef.current) > 0.001) {
+        lastOpacityRef.current = o;
+        node.style.opacity = String(o);
+      }
+    };
+    apply(playbackClock.get());
+    return playbackClock.subscribe(apply);
+  }, [layerOpacity]);
+
+  // Seek to the right frame the moment ANY load stage reports readiness -
   // a paused layer video that never seeks paints black instead of content.
   const seekNow = useCallback(() => {
     const v = videoRef.current;
     if (!v || v.readyState < 1) return;
     if (v.videoWidth > 0) onMediaSize(clip.id, v.videoWidth, v.videoHeight);
-    const want = mediaTimeForClip(clip, playhead);
+    const want = mediaTimeForClip(clip, playbackClock.get());
     try {
-      if (Math.abs(v.currentTime - want) > 0.05) v.currentTime = want;
+      if (Math.abs(v.currentTime - want) > 0.05 && !v.seeking) v.currentTime = want;
     } catch {
       /* metadata not ready */
     }
-  }, [clip, playhead, onMediaSize]);
+  }, [clip, onMediaSize]);
 
-  // Layer video sync: load once, resync on drift, follow play/pause.
+  // Layer video sync: load once, follow play/pause, self-heal drift on a
+  // LONG interval (1 s) with a 0.5 s tolerance and a seeking guard. The old
+  // per-tick drift check (20 Hz, 0.35 s) turned one slow overlay decode into
+  // a seek storm: every 50 ms another seek stalled the decoder further, and
+  // the whole window (timeline playhead included) janked.
   useEffect(() => {
     const v = videoRef.current;
     if (isImage || !v) return;
@@ -2355,36 +2412,121 @@ const MonitorLayer = memo(function MonitorLayer({
       v.src = src;
       v.load();
     }
-    const want = mediaTimeForClip(clip, playhead);
-    if (v.readyState >= 1 && Math.abs(v.currentTime - want) > 0.35) {
+    // Always own the layer's rate (and latch defaultPlaybackRate, which
+    // load() restores): the old `clip.speed && !clip.reverse` guard left a
+    // stale rate behind when a speed was cleared or reverse was toggled
+    // (element kept rolling at the old rate -> drift at old+new speed).
+    const rawSpeed = clip.speed;
+    const rate = clip.reverse
+      ? 1
+      : Number.isFinite(rawSpeed)
+        ? Math.min(4, Math.max(0.25, rawSpeed as number))
+        : 1;
+    if (Math.abs(v.defaultPlaybackRate - rate) > 0.001) v.defaultPlaybackRate = rate;
+    if (Math.abs(v.playbackRate - rate) > 0.001) v.playbackRate = rate;
+    if (playing && !clip.reverse) {
+      // Landing on the clip: snap to the current frame first, then roll.
+      const want = mediaTimeForClip(clip, playbackClock.get());
+      try {
+        if (v.readyState >= 1 && Math.abs(v.currentTime - want) > 0.12 && !v.seeking) {
+          v.currentTime = want;
+        }
+      } catch {
+        /* metadata not ready */
+      }
+      if (v.paused && !v.ended) void v.play().catch(() => undefined);
+    } else {
+      if (!v.paused) v.pause();
+      // Paused: show the exact frame under the playhead (scrub follow).
+      const want = mediaTimeForClip(clip, playbackClock.get());
+      try {
+        if (v.readyState >= 1 && Math.abs(v.currentTime - want) > 0.05 && !v.seeking) {
+          v.currentTime = want;
+        }
+      } catch {
+        /* metadata not ready */
+      }
+    }
+  }, [isImage, src, clip, playing]);
+
+  // Paused scrub follow + stepped BACKWARD follow. Overlay media can never
+  // play backward (HTML5 restriction), so whenever the timeline moves
+  // backward - a J reverse pass, or a content-reversed clip - the element
+  // stays paused and follows by bounded seeks (the seeking guard makes the
+  // decoder, not the clock rate, the limiter; the 120 ms gate bounds
+  // attempts to ~8/s). Without the direction check, a FORWARD overlay kept
+  // rolling forward during a reverse pass while the 1 s self-heal slammed it
+  // back ~1 s every second.
+  useEffect(() => {
+    if (isImage) return;
+    let lastSeekAt = 0;
+    return playbackClock.subscribe((t) => {
+      const prev = lastClockRef.current;
+      lastClockRef.current = t;
+      const backward = t < prev - 1e-4;
+      const stepped = !playing || !!clip.reverse || backward;
+      const v = videoRef.current;
+      if (!v) return;
+      if (stepped) {
+        if (!v.paused) v.pause();
+      } else if (playing && v.paused && !v.ended && v.readyState >= 1 && !v.seeking) {
+        // Recover after a settled backward tick (guarded, so it can never
+        // restart an exhausted or not-yet-ready element).
+        void v.play().catch(() => undefined);
+      }
+      if (!stepped || v.seeking || v.readyState < 1) return;
+      const want = mediaTimeForClip(clip, t);
+      if (playing) {
+        const now = performance.now();
+        if (now - lastSeekAt < 120) return;
+        if (Math.abs(v.currentTime - want) <= 0.04) return;
+        lastSeekAt = now;
+      } else if (Math.abs(v.currentTime - want) <= 0.05) {
+        return;
+      }
       try {
         v.currentTime = want;
       } catch {
         /* metadata not ready */
       }
-    }
-    if (clip.speed && !clip.reverse) {
-      v.playbackRate = Math.min(4, Math.max(0.25, clip.speed));
-    }
-    if (playing) {
-      if (v.paused) void v.play().catch(() => undefined);
-    } else if (!v.paused) {
-      v.pause();
-    }
-  }, [isImage, src, clip, playhead, playing]);
+    });
+  }, [playing, isImage, clip]);
+
+  // Periodic self-heal while playing: every 1 s, correct only a REAL drift
+  // (> 0.5 s) between the layer's media clock and the authoritative
+  // playhead. Never per-tick; the seeking guard never queues overlap seeks.
+  useEffect(() => {
+    if (!playing || isImage) return;
+    const id = window.setInterval(() => {
+      const v = videoRef.current;
+      if (!v || v.paused || v.seeking || v.readyState < 1) return;
+      const want = mediaTimeForClip(clip, playbackClock.get());
+      try {
+        if (Math.abs(v.currentTime - want) > 0.5) {
+          v.currentTime = want;
+        }
+      } catch {
+        /* metadata not ready */
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [playing, isImage, clip]);
 
   const layerStyle = {
-    filter: style.filter,
-    transform: style.transform,
-    opacity: style.opacity,
-    ...(style.objectViewBox ? ({ objectViewBox: style.objectViewBox } as Record<string, string>) : {}),
-    objectFit: style.objectFit ?? undefined,
+    filter: staticStyle.filter,
+    transform: staticStyle.transform,
+    opacity: layerOpacity(playbackClock.get()),
+    ...(staticStyle.objectViewBox
+      ? ({ objectViewBox: staticStyle.objectViewBox } as Record<string, string>)
+      : {}),
+    objectFit: staticStyle.objectFit ?? undefined,
   } as React.CSSProperties;
 
   if (isImage) {
     return (
       <img
         ref={(el) => {
+          imgElRef.current = el;
           registerEl(clip.id, el);
         }}
         className="monitor-layer"
@@ -2403,6 +2545,7 @@ const MonitorLayer = memo(function MonitorLayer({
   return (
     <video
       ref={(el) => {
+        videoElRef.current = el;
         videoRef.current = el;
         registerEl(clip.id, el);
       }}

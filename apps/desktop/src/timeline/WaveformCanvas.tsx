@@ -46,8 +46,13 @@ export const WaveformCanvas = memo(function WaveformCanvas({
     const handle = jobs.enqueue(`wave:${src}`, urgent ? 2 : 3, async (signal) => {
       await loadOverviewPeaks(src, { signal });
     });
+    // Gate on the data actually being cached, not merely on the job settling:
+    // a coalesced request joins another clip's in-flight build, and a
+    // cancelled one settles without producing peaks. Flipping `ready` early
+    // would run the draw effect once with no overview and then never again
+    // (the effect's deps do not change afterwards), leaving the clip blank.
     void handle.promise.then(() => {
-      if (!signalAborted(handle)) setReady(true);
+      if (getCachedOverview(src)) setReady(true);
     });
     return () => jobs.cancel(`wave:${src}`);
   }, [src, urgent]);
@@ -97,7 +102,3 @@ export const WaveformCanvas = memo(function WaveformCanvas({
     />
   );
 });
-
-function signalAborted(handle: { cancelled: boolean }): boolean {
-  return handle.cancelled;
-}

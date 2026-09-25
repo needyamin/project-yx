@@ -8,6 +8,12 @@
  *   /qa.html            — one clean clip (tools opened through the real UI)
  *   /qa.html?seed=blur  — blurregion filter enabled at boot (autosave case)
  *   /qa.html?seed=all   — blurregion (animated) + chromakey at boot
+ *   /qa.html?seed=overlap - V2 overlay clip covering V1 for 2s (PiP stack)
+ *   /qa.html?seed=reverse - V1 clip plays backward (stepped reverse stepper)
+ *   /qa.html?seed=reverse-overlap - V2 overlay is a reverse clip (stepped
+ *                                   overlay follow; must NOT play forward)
+ *   /qa.html?seed=speedcut - adjacent same-media clips at 1x then 2x (guards
+ *                            the seamless same-media rate re-latch)
  *
  * When the pane is hidden, Chromium starves requestAnimationFrame and
  * ResizeObserver callbacks (they are frame-tied). The app's gestures and
@@ -24,6 +30,7 @@ import ReactDOM from "react-dom/client";
 import { installMockTauri } from "./mockTauri";
 import { playbackClock } from "../playback/playbackClock";
 import { isImagePath } from "../timeline/types";
+import type { Clip } from "../timeline/types";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const w = window as unknown as { __errs: string[]; __qa: Record<string, any> };
@@ -94,13 +101,102 @@ const MEDIA_DIR = encodeURI("/@fs/Y:/Project YX/benchmark/media");
 const MEDIA_URL =
   new URLSearchParams(location.search).get("media") === "cross"
     ? "http://localhost:1422/qa_green.mp4"
-    : `${MEDIA_DIR}/qa_green.mp4`;
+    : `${MEDIA_DIR}/qa_green_av.mp4`;
 
 // Pre-seed state BEFORE the app boots — get_boot_info returns this
 // timeline, reproducing "app reopens with filters from the last session".
 const timeline = installMockTauri({ clips: 1, mediaUrls: [MEDIA_URL] });
 const seed = new URLSearchParams(location.search).get("seed");
 const clip = timeline.tracks[0].clips[0];
+if (seed === "speed") {
+  // ?seed=speed — 2× clip with linked audio: exercises the drift-lock path.
+  clip.speed = 2;
+  const linked = timeline.tracks[2].clips[0];
+  if (linked) linked.speed = 2;
+}
+if (seed === "split") {
+  // ?seed=split — one AV pair split at 2s: exercises the boundary continuation.
+  const v0 = timeline.tracks[0].clips[0];
+  const a0 = timeline.tracks[2].clips[0];
+  const mk = (id: string, base: Clip, start: number, inP: number): Clip => ({
+    ...base, id, start, in_point: inP, out_point: 4,
+  });
+  timeline.tracks[0].clips = [
+    { ...v0, out_point: 2 },
+    mk("v0b", v0, 2, 2),
+  ];
+  timeline.tracks[2].clips = [
+    { ...a0, out_point: 2 },
+    mk("a0b", a0, 2, 2),
+  ];
+  timeline.tracks[0].clips[1].linked_clip_id = "a0b";
+  timeline.tracks[2].clips[1].linked_clip_id = "v0b";
+}
+/**
+ * Dev-only QA seed for the "timeline lags when one clip goes under another"
+ * report (2026-09-23). Boots the real App with a two-video-track project:
+ * a base clip on V1 and an overlay clip on V2 overlapping it for 2s, plus
+ * linked A/V audio. Reproduces the MonitorLayer stack (PiP preview path)
+ * so playback/scrub over the overlap can be measured without real media.
+ *
+ *   /qa.html?seed=overlap
+ *
+ * The overlay uses the same media URL as the base (mock backend, honest
+ * IPC cost); the point is the composite stack + clock plumbing, not decode.
+ */
+if (seed === "overlap") {
+  // Second video track already exists in the mock (tracks[1] = "v2").
+  const v0 = timeline.tracks[0].clips[0];
+  const a0 = timeline.tracks[2].clips[0];
+  // Base: V1 0..4s (unchanged). Overlay: V2 2..4s covers the second half.
+  const overlay: Clip = {
+    ...v0,
+    id: "v0-overlap",
+    start: 2,
+    linked_clip_id: null,
+    // Clone the filter array: a shallow spread would share it with the base
+    // V1 clip, so pushing the Transform below also re-filtered the base.
+    filters: [...(v0.filters ?? [])],
+  };
+  timeline.tracks[1].clips = [overlay];
+  // Give the overlay a Transform filter (typical PiP intent) so the static
+  // style path + imperative opacity path are both exercised.
+  overlay.filters.push({
+    id: "qa-overlap-tf",
+    kind: "transform",
+    enabled: true,
+    params: { x: 0.4, y: 0.35, scale: 0.35, rotation: 0, opacity: 1 },
+  });
+  // Linked partner for the base so the live-drag preview path also runs.
+  void a0;
+}
+
+if (seed === "reverse") {
+  // ?seed=reverse - the base clip plays backward (stepped reverse stepper in
+  // togglePlay): exercises the seeking guard + half-frame step threshold and
+  // invariant 4 (the deliberate element pause must not end the session).
+  clip.reverse = true;
+}
+if (seed === "reverse-overlap") {
+  // ?seed=reverse-overlap - V2 overlay clip is reversed over the forward V1
+  // clip: exercises the stepped overlay follow (a reverse layer must never be
+  // play()ed forward, and must not jump 1-3s every self-heal tick).
+  const v0 = timeline.tracks[0].clips[0];
+  timeline.tracks[1].clips = [
+    { ...v0, id: "v0-rev-overlay", reverse: true, linked_clip_id: null },
+  ];
+}
+if (seed === "speedcut") {
+  // ?seed=speedcut - adjacent SAME-media clips (continuous out->in) at 1x then
+  // 2x: the seamless same-media boundary keeps the element rolling, so its
+  // rate must be re-latched or the whole second clip runs at 1x while the
+  // mapper divides by 2.
+  const v0 = timeline.tracks[0].clips[0];
+  timeline.tracks[0].clips = [
+    { ...v0, id: "v0a", out_point: 2, speed: 1 },
+    { ...v0, id: "v0b", start: 2, in_point: 2, out_point: 4, speed: 2 },
+  ];
+}
 if (!isImagePath(clip.media_path)) {
   if (seed === "blur" || seed === "all") {
     clip.filters.push({
